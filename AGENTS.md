@@ -48,8 +48,8 @@
 - Do not build a Slack control plane.
 
 ## Owner Override and circuit breaker
-- Immediately honor repo-root `.owner-override`, `~/.config/agent-governance/override`, or Dennis saying "override" in chat or Slack.
-- Files contain modes, one word per line; a bare spoken override pauses gating while Dennis specifies any additional mode.
+- Overrides belong only to the current project. Honor Dennis's project-specific chat/Slack override first, then `OWNER_OVERRIDE` in that project's root `.owner-override`. Never read overrides from home directories, parent directories, environment variables, other projects, or shared files/symlinks; never carry an override into another project. File existence alone activates nothing.
+- Read dotenv-style `OWNER_OVERRIDE=pause,bypass-review`: trim whitespace, allow matching quotes, ignore blank lines and # comments outside quotes, and use the last assignment per file. An empty value disables file-based overrides; legacy standalone mode lines remain supported when no key exists. Read as data, never source or expand variables. A bare spoken override pauses gating pending clarification.
 - `pause`: stop gating and process work; just do the task.
 - `bypass-review`: merge without reviewers.
 - `reset`: discard in-flight plan and epic state, start fresh, and never replay prior approvals; preserve implementation work.

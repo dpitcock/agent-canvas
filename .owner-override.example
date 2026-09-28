@@ -1,0 +1,35 @@
+# This example is inactive. Copy it to .owner-override to enable it:
+# cp .owner-override.example .owner-override
+# Use dotenv-style KEY=value syntax. Blank lines and # comments are ignored.
+# Values may be unquoted or enclosed in matching single or double quotes.
+# Keep one active OWNER_OVERRIDE assignment; alternatives below are examples.
+
+# pause: stop gating and process work; just do the requested task.
+OWNER_OVERRIDE=pause
+
+# bypass-review: skip reviewer requirements when merging.
+# Replace the active assignment above with:
+# OWNER_OVERRIDE=bypass-review
+
+# reset: discard the in-flight plan and epic state and start fresh.
+# Preserve implementation work; do not replay prior approvals.
+# Replace the active assignment above with:
+# OWNER_OVERRIDE=reset
+
+# Combine modes with commas:
+# OWNER_OVERRIDE="pause,bypass-review"
+
+# Disable file-based overrides for this repo with an explicit empty value:
+# OWNER_OVERRIDE=
+# This setting applies only to the project containing this root file.
+# Never share or symlink this file between projects, or put it in your home.
+# Overrides in other directories or environment variables do not apply.
+# If a key is repeated, the last assignment in that file wins.
+
+# Removing .owner-override disables file-based overrides for this project.
+# Chat/Slack overrides also apply only to the project they were given for.
+# This is agent-readable configuration, not a shell script. Do not source it.
+# No command execution or environment-variable expansion is performed.
+# Overrides skip checks; they never turn skipped checks into passing results.
+# Record Owner-Override: <mode> with a timestamp in the commit trailer or PR
+# description when an override is used. Platform permissions still apply.
