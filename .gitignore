@@ -2,3 +2,4 @@
 /.agents/skills/addy-*/
 /.owner-override
 /skills/addyosmani-agent-skills/
+__pycache__/
