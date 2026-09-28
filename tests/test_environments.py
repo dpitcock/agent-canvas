@@ -58,6 +58,89 @@ class EnvironmentInstall(unittest.TestCase):
             self.assertIn("cline: true", (target / "config/workspace-config.yml").read_text())
             self.assertTrue(cline.is_symlink())
 
+
+    def test_upstream_alias_install_and_legacy_omission_survive_upgrade(self):
+        for include_alias in (True, False):
+            with self.subTest(include_alias=include_alias), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                source = self.source(base, "  codex: true\n  cline: false\n")
+                target = base / "project"
+                def download(destination, revision):
+                    self.pack(destination, revision)
+                    (destination / ".opencode").mkdir()
+                    if include_alias:
+                        (destination / ".opencode/skills").symlink_to("../skills/")
+                _, actions = installer.install(target, source=source, home=base / "home",
+                                               skills=True, downloader=download)
+                self.assertFalse(any(a.startswith("FAILED") for a in actions))
+                self.assertTrue((target / ".agents/skills/addy-example").is_symlink())
+                pack = target / "skills/addyosmani-agent-skills"
+                provenance = installer.read_state(target)["adapters"]["pack"]
+                # Record a real project resolution before exercising upgrades.
+                example = target / ".owner-override.example"
+                example.write_text("Project preference\n")
+                (source / ".owner-override.example").write_text("New default\n")
+                installer.upgrade(target, source=source, home=base / "home", apply=True)
+                installer.upgrade(target, source=source, home=base / "home", apply=True,
+                                  resolve=[".owner-override.example"], reason="Keep prior decision")
+                resolutions = installer.read_state(target)["resolutions"]
+                before_pack = snapshot(pack)
+                config = target / "config/workspace-config.yml"
+                config.write_text(config.read_text().replace("cline: false", "cline: true"))
+                before_state = (target / installer.STATE).read_bytes()
+                installer.upgrade(target, source=source, home=base / "home")
+                self.assertEqual((target / installer.STATE).read_bytes(), before_state)
+                installer.upgrade(target, source=source, home=base / "home", apply=True)
+                self.assertTrue((target / ".cline/skills/example").is_symlink())
+                self.assertEqual(snapshot(pack), before_pack)
+                self.assertEqual(installer.read_state(target)["adapters"]["pack"], provenance)
+                self.assertEqual(installer.read_state(target)["resolutions"], resolutions)
+                if not include_alias:
+                    (pack / ".opencode/skills").symlink_to("../skills")
+                before = snapshot(target)
+                installer.install(target, source=source, home=base / "home", apply=True, skills=True,
+                                  downloader=lambda *_: self.fail("Must preserve existing pack"))
+                installer.upgrade(target, source=source, home=base / "home", apply=True)
+                self.assertEqual(snapshot(target), before)
+
+    def test_invalid_alias_blocks_new_discovery_without_changing_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = self.source(base, "  codex: true\n  cline: false\n")
+            target = base / "project"
+            installer.install(target, source=source, home=base / "home", skills=True, downloader=self.pack)
+            provenance = installer.read_state(target)["adapters"]["pack"]
+            pack = target / "skills/addyosmani-agent-skills"
+            (pack / ".opencode").mkdir()
+            alias = pack / ".opencode/skills"
+            alias.symlink_to("../../outside")
+            config = target / "config/workspace-config.yml"
+            config.write_text(config.read_text().replace("cline: false", "cline: true"))
+            installer.upgrade(target, source=source, home=base / "home", apply=True)
+            self.assertFalse((target / ".cline/skills/example").exists())
+            state = installer.read_state(target)
+            self.assertEqual(state["adapters"]["pack"], provenance)
+            self.assertTrue(any("symlinks" in item for item in state["adapters"]["pending"]))
+            self.assertEqual(str(alias.readlink()), "../../outside")
+
+    def test_previously_failed_pack_is_not_silently_adopted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = self.source(base)
+            target = base / "project"
+            installer.install(target, source=source, home=base / "home")
+            pack = target / "skills/addyosmani-agent-skills"
+            self.pack(pack, "unused")
+            (pack / ".opencode").mkdir()
+            (pack / ".opencode/skills").symlink_to("../skills")
+            before = snapshot(pack)
+            installer.install(target, source=source, home=base / "home", skills=True, apply=True,
+                              downloader=lambda *_: self.fail("Must preserve untracked pack"))
+            installer.upgrade(target, source=source, home=base / "home", apply=True)
+            self.assertEqual(snapshot(pack), before)
+            self.assertNotIn("pack", installer.read_state(target)["adapters"])
+            self.assertFalse((target / ".agents/skills/addy-example").exists())
+
     def test_enabling_disabling_and_modified_link_preservation(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
