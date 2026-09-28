@@ -15,6 +15,33 @@ def snapshot(root):
 
 
 class UpgradeSmoke(unittest.TestCase):
+    def test_reverted_preview_refreshes_handoff_without_changing_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = self.source(base)
+            target = base / "project"
+            installer.install(target, source=source, home=base / "home")
+            example = target / ".owner-override.example"
+            example.write_text("# Project customization\n")
+            upstream = source / ".owner-override.example"
+            original = upstream.read_text()
+            upstream.write_text("# Conflicting release\n")
+            followup = target / "INSTALL-FOLLOWUP.md"
+            followup.write_text(followup.read_text() + "\nKeep my notes.\n")
+            installer.upgrade(target, source=source)
+            self.assertIn("CONFLICT .owner-override.example", followup.read_text())
+            upstream.write_text(original)
+            before = snapshot(target)
+            installer.upgrade(target, source=source, apply=True)
+            after = snapshot(target)
+            self.assertEqual({k: v for k, v in before.items() if k != "INSTALL-FOLLOWUP.md"},
+                             {k: v for k, v in after.items() if k != "INSTALL-FOLLOWUP.md"})
+            self.assertNotIn("CONFLICT .owner-override.example", followup.read_text())
+            self.assertIn("Pending files: none.", followup.read_text())
+            self.assertIn("Keep my notes.", followup.read_text())
+            installer.upgrade(target, source=source, apply=True)
+            self.assertEqual(after, snapshot(target))
+
     def source(self, base):
         source = base / "package"
         for name in installer.MANAGED:
