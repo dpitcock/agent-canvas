@@ -11,16 +11,16 @@
 
 ## Lanes
 - Authoring: toolkit tests, internal scripts, docs, and tooling use one short task description, direct implementation, and focused verification.
-- When a PR is opened, Staff Engineer is its sole reviewer. Local work without a PR needs no review; governance repair remains exempt.
-- Shipped: templates, adopter policy, distributed bootstrap, and CI configuration are strict, versioned, and reviewed at the PR.
+- For this toolkit repository (`repo_role: toolkit-authoring`), Staff Engineer is the sole PR reviewer for authoring and shipped changes, using the Staff Engineer GitHub App (`staff` role). This reviewer selection takes precedence over the general role requirements below; do not add Principal, Code Reviewer, AppSec, or QA approvals here. Local work without a PR needs none; governance repair remains exempt.
+- Shipped: templates, adopter policy, distributed bootstrap, and CI configuration are strict, versioned, and reviewed at the PR. Installed application projects retain the general environment/risk review rules below; the toolkit-only reviewer exception is not included in their generated lanes.
 - Classify by what adopters receive; a shipped bootstrap script stays shipped even under `scripts/`.
 - CODEOWNERS separates paths for ownership; it does not implement role approvals or authorize a merge.
 
 ## Scope, risk, and environment
 - Tier 1: small, isolated, low risk. Tier 2: bounded, moderate scope or risk. Tier 3: broad or high risk.
 - Assess scope × risk and `target_environment` (local/dev/production) in the task description; no assessment artifact or gate.
-- Local work may use direct commits without review. Every PR, regardless of target environment, uses Staff Engineer only, subject to Owner Override and the governance-repair exemption. `approvals_required` records this single role.
-- Auth, secrets, schema, payment, or user-data changes escalate to Tier 3 regardless of environment; Staff Engineer covers the relevant security and test evidence in the PR review. Specialist advice may inform the work but adds no reviewer or approval requirement.
+- Local: direct commit, no reviewers. Dev: Code Reviewer only. Production: the project's `approvals_required`.
+- Auth, secrets, schema, payment, or user-data changes escalate to Tier 3 regardless of environment; use relevant Staff/AppSec/QA expertise at the PR.
 - Local authoring does not require a PR; publishing shipped changes uses the shipped PR lane.
 
 ## Planning
@@ -29,17 +29,17 @@
 - Future work stays as brief outcome descriptions with known dependencies, not task lists; expand it when it becomes current.
 - Each active epic declares granular tasks, merge gates, and the test evidence its PRs will carry.
 - Undetailed future work never blocks current work; moving between phases introduces no additional approval gate.
-- No Principal or other planning approval is required. Staff Engineer reviews the delivered change at the PR.
+- Principal approval occurs once, at the PR; involve Principal afterward only for exceptions. No other planning approvals.
 - Routine authoring keeps its short task description; do not create a formal plan or Principal review for it.
-- Route subsequent implementation concerns to Staff Engineer; consult specialists only when useful, without additional approvals.
-- Staff Engineer reviews the PR against its declared test evidence; no separate QA approval is required.
+- Route subsequent implementation concerns to Staff Engineer, AppSec, or QA as relevant.
+- QA does not participate in planning; QA reviews the PR against its declared test evidence when required.
 - No approval is required before opening a PR. Plan revisions never invalidate completed work.
 - Prefer subagents for substantial work: delegate bounded research, implementation, or verification tasks within the current phase or epic. Keep trivial, tightly coupled, or strictly sequential work inline. Subagents do not introduce extra reviews, approvals, or planning documents. The developer owns integration and the final result.
 
 ## Reviews and tests
 - Reviews attach only to PR opened, marked ready, or explicit re-request events; never commits or task completion.
 - Do not duplicate a review for an unchanged PR merely because it was marked ready.
-- Staff Engineer is the only PR reviewer, using the Staff Engineer GitHub App (`staff` role) in a fresh read-only context and returning a verdict; the developer merges. Do not request separate Code Reviewer, Principal, AppSec, or QA approvals.
+- Reviewers are the `dpitcock-*` GitHub Apps, operating in fresh read-only contexts and returning verdicts; the developer merges.
 - Run focused tests of changed behavior, without nested test runners; do not test governance machinery for its own sake.
 - If a step exceeds 15 minutes, post a heartbeat and report its status; never wait silently or kill it merely for elapsed time.
 
