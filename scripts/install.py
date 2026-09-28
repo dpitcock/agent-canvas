@@ -94,11 +94,19 @@ def merge_text(base, local, incoming):
     return "".join(lines), False
 
 
-def upgrade_followup(root, actions, pending, source=SOURCE):
+def upgrade_followup(root, actions, pending, source=SOURCE, *, state=None, preserve_current=False):
     path = root / "INSTALL-FOLLOWUP.md"
     safe_destination(root, path)
     old = path.read_text() if path.exists() else "# Agent Canvas installation follow-up\n"
+    marker = f"<!-- agent-canvas:proposal:{digest([str(source), state])} -->"
+    if BEGIN in old or END in old:
+        if old.count(BEGIN) != 1 or old.count(END) != 1 or old.index(BEGIN) >= old.index(END):
+            raise ValueError("Upgrade section markers are damaged; preserve follow-up notes and repair the markers")
+        current = old[old.index(BEGIN):old.index(END)]
+        if preserve_current and marker in current:
+            return
     block = f"""{BEGIN}
+{marker}
 ## Current upgrade
 
 Toolkit source: `{source}`. Run the installer from this source; do not replace it with an archived version.
@@ -109,11 +117,9 @@ Pending files: {', '.join('`' + name + '`' for name in sorted(pending)) or 'none
 
 ### Prompt to run for this upgrade
 
-> Recheck this project's files and .agent-canvas/state.json. Preserve previous resolution notes and customizations; do not reopen unchanged decisions. Compare each pending file's baseline, current project contents, and proposed incoming contents. Preview-only proposals come from the current toolkit source and are not yet saved as baselines. My project workflow and Owner Override win. Merge compatible changes; ask me only about unresolved material conflicts. Do not read or alter active override files, install duplicate skills, or add approval gates. After resolving a pending file, record the choice with `python3 /path/to/agent-canvas/scripts/install.py /path/to/project --upgrade --apply --resolve FILE --reason "Why this resolution was chosen"`. This records a decision; it does not require approval to work. Leave unresolved files pending. If a skill reference changes, compare the installed pack/plugin version and reconcile explicitly; the upgrader does not update installed skills. Keep my notes outside these marked lines.
+> Recheck this project's files and .agent-canvas/state.json. Preserve previous resolution notes and customizations; do not reopen unchanged decisions. Compare each pending file's baseline, current project contents, and proposed incoming contents. Preview-only proposals come from the current toolkit source and are not yet saved as baselines. My project workflow and Owner Override win. Merge compatible changes; ask me only about unresolved material conflicts. Read Owner Override only from this project's root .owner-override when it is a regular, non-symlink file; read it as data, never source or expand it. Never read overrides from home, parent directories, environment variables, other projects, or shared files/symlinks. Do not alter active override files, install duplicate skills, or add approval gates. After resolving a pending file, record the choice with `python3 /path/to/agent-canvas/scripts/install.py /path/to/project --upgrade --apply --resolve FILE --reason "Why this resolution was chosen"`. This records a decision; it does not require approval to work. Leave unresolved files pending. If a skill reference changes, compare the installed pack/plugin version and reconcile explicitly; the upgrader does not update installed skills. Keep my notes outside these marked lines.
 {END}"""
     if BEGIN in old or END in old:
-        if old.count(BEGIN) != 1 or old.count(END) != 1 or old.index(BEGIN) >= old.index(END):
-            raise ValueError("Upgrade section markers are damaged; preserve follow-up notes and repair the markers")
         updated = old[:old.index(BEGIN)] + block + old[old.index(END) + len(END):]
     else:
         updated = old.rstrip() + "\n\n" + block + "\n"
@@ -177,11 +183,13 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE):
                 actions.append(f"{'UPDATE' if apply else 'WOULD UPDATE'} {name}\n{diff}")
     state["package_version"] = version
     if not writes and json.dumps(state, sort_keys=True) == original_state:
-        return apply, actions or ["NO CHANGES: prior decisions and local customizations preserved"]
+        actions = actions or ["NO CHANGES: prior decisions and local customizations preserved"]
+        upgrade_followup(root, actions, state["pending"], source=source, state=state, preserve_current=True)
+        return apply, actions
     if not actions:
         actions.append("RECONCILED: current files preserved; baseline or pending records updated")
     # Prepare the handoff before changing tracked files; malformed markers cannot partially apply an upgrade.
-    upgrade_followup(root, actions, state["pending"], source=source)
+    upgrade_followup(root, actions, state["pending"], source=source, state=state)
     if apply:
         for name, text in writes.items():
             path = root / name
@@ -377,7 +385,7 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
                 state["baselines"][name] = None
                 state["pending"][name] = dict(incoming=incoming)
         save_state(root, state)
-        upgrade_followup(root, ["TRACKING: package baseline saved; reconcile any pending files"], state["pending"], source=source)
+        upgrade_followup(root, ["TRACKING: package baseline saved; reconcile any pending files"], state["pending"], source=source, state=state)
     return active, actions
 
 
