@@ -147,6 +147,16 @@ python3 scripts/install.py /path/to/my-new-project --skills
 
 Skill downloads are opt-in. The installer downloads the whole pack at the selected `.ref` commit, preserves shared references, and creates discovery links. It does not run upstream installers or tests. If a pack already exists, it is preserved for source/version checks in the follow-up. Superpowers uses the supported installation for each assistant, as explained below; enabling an environment does not install a plugin. Failed installs report an error; any earlier safe additions remain for a later run.
 
+### Upstream OpenCode link compatibility
+
+At Agent Canvas commit `51fb8201055d9590d7a865bfef447bde973f0e79`, the fingerprint check rejected the tracked `.opencode/skills -> ../skills` symlink in pinned Osmani pack `2686b620fc1fed2e8f60c704839c766b8594c6b6`, reporting `ValueError: Skill pack contains symlinks; reconcile manually`. This affected `--skills` installation and subsequent upgrade validation of a pack containing that link.
+
+The installer now accepts only that relative link, with literal target `../skills/` (the spelling stored upstream) or `../skills`, and only when its target is the pack's real, existing `skills` directory. It preserves the upstream link but never traverses or hashes it; the skill and reference files are hashed at their original paths. Other symlinks, including alternate targets, escaping links, broken links, cycles, and symlinked target directories, remain rejected. Git metadata directories remain excluded from content hashing; symlinks encountered at their boundaries are rejected too. This exception does not enable an OpenCode adapter.
+
+Existing installations that omitted only this unused link and recorded the resulting fingerprint (the Capitol Deal workaround) need no migration or reinstall. Their fingerprints and resolution notes remain valid; leaving the link absent is supported. Upgrade preview and apply neither restore the link nor replace the pack, and changes to regular skill/reference content still require reconciliation.
+
+If an older attempt failed before recording pack provenance, it may have left the downloaded pack on disk. Updating the toolkit and rerunning installation will preserve that pack, not silently trust it. Use `INSTALL-FOLLOWUP.md` to verify its source, pinned revision, and contents and explicitly reconcile the missing provenance. Preserve existing fingerprints and resolution history; do not replace them merely to suppress an error. Prefer the updated installer for new installations. The older archive workaround was to omit only `.opencode/skills`, keep every regular skill/reference file unchanged, and record the verified revision, resulting regular-file fingerprint, and exception in the project's installation record and follow-up notes.
+
 ## Upgrade without losing your decisions
 
 Think of an upgrade as comparing three instruction cards: the old package defaults, your project's edited card, and the new package defaults. A change you already resolved belongs to your project; it should not become the same question every time you update.

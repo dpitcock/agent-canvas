@@ -63,13 +63,22 @@ def agentic_envs(config):
 
 def pack_fingerprint(pack):
     """Fingerprint regular local pack content; never traverse pack symlinks."""
+    if pack.is_symlink():
+        raise ValueError("Skill pack contains symlinks; reconcile manually")
     entries = {}
     for base, dirs, files in os.walk(pack, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d != ".git")
         for name in dirs + files:
             path = Path(base) / name
             if path.is_symlink():
-                raise ValueError("Skill pack contains symlinks; reconcile manually")
+                # The pinned upstream pack includes this OpenCode discovery alias.
+                # Validate without traversing it, and omit it from the file digest
+                # so archives that previously omitted the alias retain their hash.
+                if (path.relative_to(pack).as_posix() != ".opencode/skills"
+                        or os.readlink(path) not in {"../skills", "../skills/"}
+                        or (pack / "skills").is_symlink()
+                        or not (pack / "skills").is_dir()):
+                    raise ValueError("Skill pack contains symlinks; reconcile manually")
+        dirs[:] = sorted(d for d in dirs if d != ".git" and not (Path(base) / d).is_symlink())
         for name in sorted(files):
             path = Path(base) / name
             if not path.is_file():
