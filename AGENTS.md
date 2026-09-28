@@ -46,7 +46,8 @@
 ## Communication
 - Use one environment-neutral project Slack channel named by `slack_channel_name`. Send authorized posts as Agent Alert through the available Slack plugin or connector, prefixed with `[agentic_env][role]`, such as `[codex][Developer]` or `[cline][Staff Engineer]`. Identify the actual running environment; clarify if unknown, never infer it from the enabled-environments list.
 - Never guess a channel. If the configured channel is missing, ask the owner before creating it. If Slack access or channel details are unavailable, record the setup action in `INSTALL-FOLLOWUP.md` and continue independent work. Configuration changes do not create or rename channels; Slack setup never blocks development.
-- End each turn with one Proceed or ranked-Choose action item, except the final completed turn.
+- Continue through the authorized scope without requesting routine confirmation. Commit each completed task after focused verification, then continue to the next task within that scope. Open a PR when the authorized epic is complete.
+- End the turn only when the authorized scope is complete or progress requires owner guidance, authorization, or resolution of a blocker. Continue independent work while blocked work waits. Progress updates do not require a response; task completion and commits are not stop points within an authorized epic.
 - Do not build a Slack control plane.
 
 ## Owner Override and circuit breaker

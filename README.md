@@ -411,7 +411,9 @@ If a PR exceeds two review rounds, the same fix is attempted three times, proces
 
 ## Slack and reviewer connections
 
-Authorized Slack posts use **Agent Alert**, go to the shared project channel, and start with the actual environment and role: `[codex][Developer]` or `[cline][Staff Engineer]`. If the running environment is unknown, clarify it; do not guess from `agentic_envs`. Non-final turns end with a Proceed or ranked-Choose action item. A step taking over 15 minutes gets a heartbeat and status report; it is not silently abandoned or killed merely for taking time.
+Authorized Slack posts use **Agent Alert**, go to the shared project channel, and start with the actual environment and role: `[codex][Developer]` or `[cline][Staff Engineer]`. If the running environment is unknown, clarify it; do not guess from `agentic_envs`. A step taking over 15 minutes gets a heartbeat and status report; it is not silently abandoned or killed merely for taking time.
+
+Continue through the authorized scope without requesting routine confirmation. Commit each completed task after focused verification, then continue to the next task within that scope. Open a PR when the authorized epic is complete. End the turn only when the authorized scope is complete or progress requires owner guidance, authorization, or resolution of a blocker; continue independent work while blocked work waits. Progress updates do not require a response. Task completion and commits are not stop points within an authorized epic.
 
 Use the available Slack plugin or connector, including the ChatGPT Slack connector when working there. If the configured channel is missing, ask the owner before creating it. If Slack access or channel details are missing, put the setup action in `INSTALL-FOLLOWUP.md` and continue working. Slack setup never blocks development.
 
