@@ -82,9 +82,69 @@ Reviews attach to PR opening, marking ready, or an explicit re-request. They do 
 
 For this toolkit, internal docs, tests, scripts, and tooling use the light **authoring lane**. Templates, adopter policy, distributed bootstrap, and CI configuration use the **shipped lane**: versioned changes reviewed at the PR. A bootstrap script shipped to others stays shipped even if it lives in `scripts/`.
 
-## Install in a new repository
+## Quick install
 
-These instructions target Codex on macOS/Linux. Have Git and Codex available. You do not need this repository's Node dependencies to use the new workflow.
+Use Python 3.9 or newer on macOS/Linux. No Python packages or Node dependencies are needed. Git is needed only when downloading skills. Run these commands from your copy of `agent-canvas`; the target can be anywhere on your machine.
+
+For a new project:
+
+```sh
+python3 scripts/install.py /path/to/my-new-project --workspace my-new-project
+```
+
+The installer creates the folder if needed, adds the rules and settings, adds ignore entries, and writes `INSTALL-FOLLOWUP.md`. It does not initialize Git, commit changes, or create a GitHub repository. Use your usual project generator or Git setup separately.
+
+For an existing project, run the same command:
+
+```sh
+python3 scripts/install.py /path/to/existing-project
+```
+
+**Existing projects get a preview first.** The only file written during preview is `INSTALL-FOLLOWUP.md`, which contains the inventory, proposed actions, and a ready-to-run prompt. A folder with only `.git` is treated as a new project.
+
+Read the preview, then apply safe additions when ready:
+
+```sh
+python3 scripts/install.py /path/to/existing-project --apply
+```
+
+The output labels work as **ADD**, **WOULD ADD**, **REUSE**, **SKIP**, or **DECIDE**. `--apply` adds missing files and ignore entries; it never replaces an existing AGENTS.md, config, version reference, or skill. Missing fields in an existing config are left for the follow-up merge, so project-specific settings remain intact. CODEOWNERS, other agents, hooks, CI, Git history, and application code are untouched.
+
+### Finish the conflicts with your agent
+
+Open the target project in Codex, open `INSTALL-FOLLOWUP.md`, and paste its **Prompt to run** into chat. The prompt asks your agent to:
+
+1. Recheck current files and enabled plugins, rather than trusting an old snapshot.
+2. Propose a merge that preserves project details and puts your workflow and Owner Override first.
+3. Reuse matching skills and ask about version differences or unresolved conflicts.
+4. Apply agreed changes and record what is done, so the next session does not repeat it.
+
+The installer checks local agent instructions, skill files, rule files, and standard user skill directories. It cannot discover every app-managed plugin or understand conflicting prose. Existing skills therefore defer automatic skill downloads—even if their folder names differ. Use the follow-up to decide whether anything is actually missing. An existing follow-up file is preserved, including your edits and completed resolutions; the agent rescans live files when using it.
+
+### Installer options
+
+| Option | Meaning |
+| --- | --- |
+| `--apply` | Add missing files in an existing project after preview. |
+| `--workspace NAME` | Project name for a new config; defaults to the target folder name. |
+| `--environment local\|dev\|production` | Intended environment for a new config; defaults to `local`. |
+| `--repo-role application\|toolkit-authoring` | Defaults to `application`, adapting the copied lane rules for an app. |
+| `--slack-channel NAME` | Known channel for a new config; defaults to empty, never guessed. |
+| `--skills` | Also download pinned Osmani skills when no existing skills are detected. Check app plugins first. |
+
+Options do not overwrite values in existing config files. The copied owner and reviewer wording still names Dennis and the `dpitcock-*` Apps; the follow-up asks you to confirm or adapt these.
+
+To include Osmani on a machine/project without an existing installation:
+
+```sh
+python3 scripts/install.py /path/to/my-new-project --skills
+```
+
+Skill downloads are opt-in. The installer downloads the whole pack at the selected `.ref` commit, preserves shared references, and creates discovery links. It does not run upstream installers or tests. If a pack already exists, it is preserved for source/version checks in the follow-up. Superpowers remains a single Codex plugin installation, as explained below. Failed installs report an error; any earlier safe additions remain for a later run.
+
+## Manual setup in a new repository
+
+Prefer doing it yourself? These steps are equivalent to the basic file setup above. Have Git and Codex available.
 
 1. Create your project folder and initialize Git, or use your usual project generator. Open that folder in Codex.
 2. From this toolkit, copy `AGENTS.md`, `config/workspace-config.yml`, and `skills/addyosmani-agent-skills.ref` into the same relative locations in your project. Create `config/` and `skills/` if needed.
@@ -106,7 +166,7 @@ Add these lines without replacing your other ignore rules:
 
 The downloaded skills and discovery links are local installation files. Commit the small rules, config, and version reference; teammates repeat the skill installation on their machines.
 
-## Install in an existing project
+## Manual setup in an existing project
 
 Keep the code, history, tests, CI, and existing work. There is no reset or migration ceremony.
 
@@ -230,12 +290,26 @@ config/workspace-config.yml            # Project settings
 .github/CODEOWNERS                     # Ownership example
 .gitignore                            # Local installation exclusions
 skills/addyosmani-agent-skills.ref      # Selected upstream version
+scripts/install.py                     # Additive installer
+tests/test_install.py                   # One offline installer smoke test
 skills/addyosmani-agent-skills/         # Ignored local dependency
 .agents/skills/addy-*/                  # Ignored discovery links
 ```
+
+Installed projects also receive `INSTALL-FOLLOWUP.md`. You do not need to copy the installer or its smoke test into the target project.
 
 Superpowers is supplied by the installed Codex plugin, with no second repository-local copy. The Osmani download retains upstream files and reference material, but this setup exposes only its skills; it does not register its hooks or CI. Your root rulebook controls how those skills are used. Local downloads and discovery links are recreated during installation, not distributed with the workflow files.
 
 The removed legacy implementation is preserved in a separate permanent archive outside this repository. That archive is historical evidence, not an installation source or an active instruction directory.
 
 Read [POSTMORTEM.txt](POSTMORTEM.txt) for why the workflow was simplified. The active starting points are this README, `AGENTS.md`, and `config/workspace-config.yml`.
+
+## Check the installer
+
+From this toolkit's root:
+
+```sh
+python3 -m unittest discover -s tests -p test_install.py -v
+```
+
+This single smoke test uses disposable folders and a tiny local skill fixture. It checks safe file installation, existing-project preview, preservation, repeat runs, skill duplication avoidance, and symlink handling. It makes no network requests and starts no subprocess CLIs or nested test runners. It does not test governance approvals or verify a live GitHub download.

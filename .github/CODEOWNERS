@@ -5,6 +5,7 @@
 
 # Shipped: the selected skill version used by fresh installations.
 /skills/addyosmani-agent-skills.ref @dpitcock
+/scripts/install.py @dpitcock
 # Add explicit shipped-path entries when introducing new distributed code.
 
 # Governance repair is authoring; ownership never gates Dennis's edits.
