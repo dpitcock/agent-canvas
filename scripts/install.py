@@ -2,6 +2,8 @@
 """Install Agent Canvas additively; leave semantic conflicts for the project owner."""
 
 import argparse
+import difflib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,7 +13,182 @@ import tempfile
 
 SOURCE = Path(__file__).resolve().parents[1]
 IGNORE = ("/.owner-override", "/.agents/skills/addy-*/", "/skills/addyosmani-agent-skills/")
-SKIP = {".git", "node_modules", ".venv", "venv", "__pycache__", ".npm-cache"}
+SKIP = {".git", ".agent-canvas", "node_modules", ".venv", "venv", "__pycache__", ".npm-cache"}
+MANAGED = ("AGENTS.md", "config/workspace-config.yml", ".owner-override.example",
+           "skills/addyosmani-agent-skills.ref")
+STATE = ".agent-canvas/state.json"
+BEGIN = "<!-- agent-canvas:upgrade:start -->"
+END = "<!-- agent-canvas:upgrade:end -->"
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def read_state(root):
+    path = root / STATE
+    safe_destination(root, path)
+    if not path.exists():
+        return None
+    try:
+        state = json.loads(path.read_text())
+        assert state["schema_version"] == 1
+        assert isinstance(state["options"], dict)
+        assert set(state["options"]) == {"workspace", "environment", "role", "slack"}
+        assert all(isinstance(v, str) for v in state["options"].values())
+        assert state["options"]["environment"] in {"local", "dev", "production"}
+        assert state["options"]["role"] in {"application", "toolkit-authoring"}
+        assert isinstance(state["baselines"], dict) and set(state["baselines"]) <= set(MANAGED)
+        assert all(v is None or isinstance(v, str) for v in state["baselines"].values())
+        assert isinstance(state["pending"], dict) and set(state["pending"]) <= set(MANAGED)
+        assert all(isinstance(v, dict) and isinstance(v["incoming"], str) for v in state["pending"].values())
+        assert isinstance(state["resolutions"], list)
+        return state
+    except (ValueError, KeyError, TypeError, AssertionError) as error:
+        raise ValueError(f"Cannot read upgrade history in {path}; preserve it and repair or restore it") from error
+
+
+def save_state(root, state):
+    path = root / STATE
+    safe_destination(root, path)
+    text = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    if path.exists() and path.read_text() == text:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
+        out.write(text)
+        temporary = Path(out.name)
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def merge_text(base, local, incoming):
+    """Conservative line merge. None means deletion/absence, not an empty file."""
+    if local == incoming or incoming == base:
+        return local, False
+    if local == base:
+        return incoming, False
+    if base is None or local is None:
+        return local, True
+    lines = base.splitlines(keepends=True)
+
+    def changes(text):
+        other = text.splitlines(keepends=True)
+        return [(i, j, other[a:b]) for tag, i, j, a, b in
+                difflib.SequenceMatcher(a=lines, b=other, autojunk=False).get_opcodes() if tag != "equal"]
+
+    ours, theirs = changes(local), changes(incoming)
+    for i, j, replacement in ours:
+        for a, b, new in theirs:
+            if (i, j, replacement) == (a, b, new):
+                continue
+            # Insertions at a changed region's boundary are ambiguous: defer.
+            overlaps = max(i, a) < min(j, b) or (i == j and a <= i <= b) or (a == b and i <= a <= j)
+            if overlaps:
+                return local, True
+    edits = ours + [change for change in theirs if change not in ours]
+    for i, j, replacement in sorted(edits, key=lambda change: (change[0], change[1]), reverse=True):
+        lines[i:j] = replacement
+    return "".join(lines), False
+
+
+def upgrade_followup(root, actions, pending, source=SOURCE):
+    path = root / "INSTALL-FOLLOWUP.md"
+    safe_destination(root, path)
+    old = path.read_text() if path.exists() else "# Agent Canvas installation follow-up\n"
+    block = f"""{BEGIN}
+## Current upgrade
+
+Toolkit source: `{source}`. Run the installer from this source; do not replace it with an archived version.
+
+{chr(10).join('- ' + action.split(chr(10))[0] for action in actions)}
+
+Pending files: {', '.join('`' + name + '`' for name in sorted(pending)) or 'none'}.
+
+### Prompt to run for this upgrade
+
+> Recheck this project's files and .agent-canvas/state.json. Preserve previous resolution notes and customizations; do not reopen unchanged decisions. Compare each pending file's baseline, current project contents, and proposed incoming contents. Preview-only proposals come from the current toolkit source and are not yet saved as baselines. My project workflow and Owner Override win. Merge compatible changes; ask me only about unresolved material conflicts. Do not read or alter active override files, install duplicate skills, or add approval gates. After resolving a pending file, record the choice with `python3 /path/to/agent-canvas/scripts/install.py /path/to/project --upgrade --apply --resolve FILE --reason "Why this resolution was chosen"`. This records a decision; it does not require approval to work. Leave unresolved files pending. If a skill reference changes, compare the installed pack/plugin version and reconcile explicitly; the upgrader does not update installed skills. Keep my notes outside these marked lines.
+{END}"""
+    if BEGIN in old or END in old:
+        if old.count(BEGIN) != 1 or old.count(END) != 1 or old.index(BEGIN) >= old.index(END):
+            raise ValueError("Upgrade section markers are damaged; preserve follow-up notes and repair the markers")
+        updated = old[:old.index(BEGIN)] + block + old[old.index(END) + len(END):]
+    else:
+        updated = old.rstrip() + "\n\n" + block + "\n"
+    if updated != old:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(updated)
+
+
+def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE):
+    root = Path(target).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError("Install the project first; upgrade target must exist")
+    for name in (*MANAGED, STATE, "INSTALL-FOLLOWUP.md"):
+        path = root / name
+        safe_destination(root, path)
+        if path.exists() and not path.is_file():
+            raise ValueError(f"Expected file: {path}")
+    state = read_state(root)
+    original_state = json.dumps(state, sort_keys=True)
+    if resolve and (not reason.strip() or not state):
+        raise ValueError("Recording resolutions requires a saved pending conflict and a nonempty --reason")
+    options = state["options"] if state else dict(workspace=root.name, environment="local", role="application", slack="")
+    files = render_files(source, **options)
+    version = digest(files)
+    if state is None:
+        state = dict(schema_version=1, options=options, baselines={}, pending={}, resolutions=[])
+    for name in resolve:
+        if name not in MANAGED or name not in state["pending"]:
+            raise ValueError(f"No pending conflict to resolve: {name}")
+        if state["pending"][name]["incoming"] != files[name]:
+            raise ValueError(f"Package changed since this conflict was recorded: {name}; preview/apply the new proposal first")
+    actions, writes = [], {}
+    for name, incoming in files.items():
+        path = root / name
+        local = path.read_text() if path.exists() else None
+        known = name in state["baselines"] and state["baselines"][name] is not None
+        base = state["baselines"].get(name)
+        if name in resolve:
+            result, conflict = local, False
+            state["resolutions"].append(dict(file=name, package_version=version, reason=reason.strip(),
+                                              chosen_digest=digest(local)))
+            actions.append(f"RESOLVED {name}: keep current project contents; {reason.strip()}")
+        elif not known:
+            result, conflict = (incoming, False) if local is None else (local, local != incoming)
+        else:
+            result, conflict = merge_text(base, local, incoming)
+        # A ref update is a dependency decision; never silently update the declaration while leaving the installed pack behind.
+        if name.endswith(".ref") and local is not None and incoming != base and local != incoming and name not in resolve:
+            conflict = True
+        if conflict:
+            state["pending"][name] = dict(incoming=incoming)
+            state["baselines"].setdefault(name, None)
+            actions.append(f"CONFLICT {name}: preserve local file; {'overlapping changes' if known else 'no historical baseline'}")
+        else:
+            state["baselines"][name] = incoming
+            state["pending"].pop(name, None)
+            if result != local:
+                writes[name] = result
+                diff = "".join(difflib.unified_diff((local or "").splitlines(True), (result or "").splitlines(True),
+                                                     fromfile=name, tofile=name + " (proposed)"))
+                actions.append(f"{'UPDATE' if apply else 'WOULD UPDATE'} {name}\n{diff}")
+    state["package_version"] = version
+    if not writes and json.dumps(state, sort_keys=True) == original_state:
+        return apply, actions or ["NO CHANGES: prior decisions and local customizations preserved"]
+    if not actions:
+        actions.append("RECONCILED: current files preserved; baseline or pending records updated")
+    # Prepare the handoff before changing tracked files; malformed markers cannot partially apply an upgrade.
+    upgrade_followup(root, actions, state["pending"], source=source)
+    if apply:
+        for name, text in writes.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        save_state(root, state)
+    return apply, actions
 
 
 def inventory(root):
@@ -59,6 +236,30 @@ def download_skills(destination, revision):
         checkout.rename(destination)
 
 
+def render_files(source, *, workspace, environment, role, slack):
+    rules = (source / "AGENTS.md").read_text()
+    if role == "application":
+        start, end = rules.index("## Lanes"), rules.index("## Scope, risk, and environment")
+        rules = rules[:start] + (
+            "## Lanes\n"
+            "- Internal docs, tests, and tooling use a short task description and focused verification.\n"
+            "- Product changes follow the scope, risk, and target-environment rules below.\n"
+            "- Distributed templates, adopter policy, bootstrap, and CI changes are versioned and reviewed at the PR.\n"
+            "- CODEOWNERS routes ownership; it neither implements role approvals nor authorizes merging.\n\n"
+        ) + rules[end:]
+    config = (source / "config/workspace-config.yml").read_text()
+    for key, value in {"workspace": workspace, "target_environment": environment,
+                       "repo_role": role, "slack_channel_name": slack}.items():
+        config, count = re.subn(r"^" + key + r":.*$", lambda match: key + ": " + json.dumps(value),
+                               config, flags=re.MULTILINE)
+        if count != 1:
+            raise ValueError(f"Expected one {key} field in package config")
+    files = {"AGENTS.md": rules, "config/workspace-config.yml": config,
+             ".owner-override.example": (source / ".owner-override.example").read_text(),
+             "skills/addyosmani-agent-skills.ref": (source / "skills/addyosmani-agent-skills.ref").read_text()}
+    return files
+
+
 def install(target, *, apply=False, skills=False, workspace=None, environment="local",
             role="application", slack="", source=SOURCE, home=None, downloader=download_skills):
     root = Path(target).expanduser().resolve()
@@ -74,29 +275,13 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
             global_skills.extend(str(p) for p in parent.glob("*/SKILL.md"))
     # A script cannot identify equivalent renamed skills reliably. Defer instead of duplicating.
     has_skills = any(p.endswith("SKILL.md") for p in discovered) or bool(global_skills)
-    rules = (source / "AGENTS.md").read_text()
-    if role == "application":
-        start, end = rules.index("## Lanes"), rules.index("## Scope, risk, and environment")
-        rules = rules[:start] + (
-            "## Lanes\n"
-            "- Internal docs, tests, and tooling use a short task description and focused verification.\n"
-            "- Product changes follow the scope, risk, and target-environment rules below.\n"
-            "- Distributed templates, adopter policy, bootstrap, and CI changes are versioned and reviewed at the PR.\n"
-            "- CODEOWNERS routes ownership; it neither implements role approvals nor authorizes merging.\n\n"
-        ) + rules[end:]
-    config = (
-        f"workspace: {json.dumps(workspace or root.name)}\n"
-        "approvals_required:\n  code_reviewer: true\n  appsec: true\n  qa: true\n"
-        f"target_environment: {environment}\nrepo_role: {role}\n"
-        f"slack_channel_name: {json.dumps(slack)}\n"
-    )
-    files = {"AGENTS.md": rules, "config/workspace-config.yml": config,
-             ".owner-override.example": (source / ".owner-override.example").read_text(),
-             "skills/addyosmani-agent-skills.ref": (source / "skills/addyosmani-agent-skills.ref").read_text()}
-    for name in [*files, ".gitignore", "INSTALL-FOLLOWUP.md", "skills/addyosmani-agent-skills", ".agents/skills"]:
+    options = dict(workspace=workspace or root.name, environment=environment, role=role, slack=slack)
+    files = render_files(source, **options)
+    prior_state = read_state(root)
+    for name in [*files, STATE, ".gitignore", "INSTALL-FOLLOWUP.md", "skills/addyosmani-agent-skills", ".agents/skills"]:
         path = root / name
         safe_destination(root, path)
-        if name in [*files, ".gitignore", "INSTALL-FOLLOWUP.md"] and path.exists() and not path.is_file():
+        if name in [*files, STATE, ".gitignore", "INSTALL-FOLLOWUP.md"] and path.exists() and not path.is_file():
             raise ValueError(f"Expected file; preserving existing path: {path}")
     actions = []
     for name, content in files.items():
@@ -181,6 +366,18 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
         with followup.open("x") as out:
             out.write(prompt)
         actions.append("ADD INSTALL-FOLLOWUP.md (ready-to-run conflict-resolution prompt)")
+    if active and prior_state is None:
+        state = dict(schema_version=1, package_version=digest(files), options=options,
+                     baselines={}, pending={}, resolutions=[])
+        for name, incoming in files.items():
+            local = (root / name).read_text()
+            if local == incoming:
+                state["baselines"][name] = incoming
+            else:
+                state["baselines"][name] = None
+                state["pending"][name] = dict(incoming=incoming)
+        save_state(root, state)
+        upgrade_followup(root, ["TRACKING: package baseline saved; reconcile any pending files"], state["pending"], source=source)
     return active, actions
 
 
@@ -188,19 +385,34 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", type=Path, help="new or existing project directory")
     parser.add_argument("--apply", action="store_true", help="apply safe additions in an existing project")
+    parser.add_argument("--upgrade", action="store_true", help="preview a three-way update using saved project baselines")
+    parser.add_argument("--resolve", action="append", default=[], metavar="FILE", help="record current contents as the resolution of a pending managed file")
+    parser.add_argument("--reason", default="", help="why the pending conflict was resolved this way")
     parser.add_argument("--skills", action="store_true", help="download pinned Osmani pack; only if no existing skills were detected and you have checked app plugins")
     parser.add_argument("--workspace")
-    parser.add_argument("--environment", choices=("local", "dev", "production"), default="local")
-    parser.add_argument("--repo-role", choices=("application", "toolkit-authoring"), default="application")
-    parser.add_argument("--slack-channel", default="", help="actual known channel; default is empty")
+    parser.add_argument("--environment", choices=("local", "dev", "production"), help="initial environment; default local")
+    parser.add_argument("--repo-role", choices=("application", "toolkit-authoring"), help="initial role; default application")
+    parser.add_argument("--slack-channel", help="actual known channel; default is empty")
     args = parser.parse_args()
+    if args.upgrade and args.skills:
+        parser.error("--upgrade does not download skills; reconcile skill versions separately")
+    if args.upgrade and any(value is not None for value in (args.workspace, args.environment, args.repo_role, args.slack_channel)):
+        parser.error("upgrades reuse recorded installation options; edit project settings directly instead of passing initial-install options")
+    if (args.resolve or args.reason) and not args.upgrade:
+        parser.error("--resolve and --reason require --upgrade")
+    if args.resolve and not args.apply:
+        parser.error("use --apply to record a resolution; preview remains available without --resolve")
     try:
-        active, actions = install(args.target, apply=args.apply, skills=args.skills,
-                                  workspace=args.workspace, environment=args.environment,
-                                  role=args.repo_role, slack=args.slack_channel)
+        if args.upgrade:
+            active, actions = upgrade(args.target, apply=args.apply, resolve=args.resolve,
+                                      reason=args.reason, source=SOURCE)
+        else:
+            active, actions = install(args.target, apply=args.apply, skills=args.skills,
+                                      workspace=args.workspace, environment=args.environment or "local",
+                                      role=args.repo_role or "application", slack=args.slack_channel or "")
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
-        parser.exit(1, f"Installation stopped: {error}\nEarlier safe additions may remain; existing files were not replaced.\n")
-    print("Safe additions applied." if active else "PREVIEW: only INSTALL-FOLLOWUP.md is added; use --apply for safe additions.")
+        parser.exit(1, f"Installer stopped: {error}\nEarlier changes may remain; inspect the project before retrying.\n")
+    print("Safe changes applied." if active else "PREVIEW: only INSTALL-FOLLOWUP.md is updated; use --apply for safe changes.")
     print("\n".join(actions))
     print("Run the prompt in INSTALL-FOLLOWUP.md to resolve remaining integration decisions.")
     if any(action.startswith("FAILED") for action in actions):
