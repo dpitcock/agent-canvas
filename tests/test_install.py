@@ -34,7 +34,7 @@ class InstallSmoke(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0], (installer.SOURCE / "skills/addyosmani-agent-skills.ref").read_text().strip())
             self.assertIn('workspace: ' + json.dumps('my "app"'), (fresh / "config/workspace-config.yml").read_text())
-            self.assertIn("repo_role: application", (fresh / "config/workspace-config.yml").read_text())
+            self.assertIn('repo_role: "application"', (fresh / "config/workspace-config.yml").read_text())
             self.assertTrue((fresh / ".agents/skills/addy-example/SKILL.md").is_file())
             self.assertEqual((fresh / ".owner-override.example").read_bytes(),
                              (installer.SOURCE / ".owner-override.example").read_bytes())
@@ -98,7 +98,7 @@ class InstallSmoke(unittest.TestCase):
             # Installing another project must not inherit an override from the
             # source toolkit, a sibling project, a parent, the home, or the env.
             source = base / "toolkit-source"
-            for name in ("AGENTS.md", ".owner-override.example", "skills/addyosmani-agent-skills.ref"):
+            for name in ("AGENTS.md", ".owner-override.example", "skills/addyosmani-agent-skills.ref", "config/workspace-config.yml"):
                 destination = source / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes((installer.SOURCE / name).read_bytes())

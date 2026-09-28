@@ -92,7 +92,7 @@ For a new project:
 python3 scripts/install.py /path/to/my-new-project --workspace my-new-project
 ```
 
-The installer creates the folder if needed, adds the rules and settings, adds ignore entries, and writes `INSTALL-FOLLOWUP.md`. It does not initialize Git, commit changes, or create a GitHub repository. Use your usual project generator or Git setup separately.
+The installer creates the folder if needed, adds the rules and settings, adds ignore entries, and writes `INSTALL-FOLLOWUP.md`. It also saves a small installation record in `.agent-canvas/state.json`, so later upgrades can tell package defaults apart from your changes. It does not initialize Git, commit changes, or create a GitHub repository. Use your usual project generator or Git setup separately.
 
 For an existing project, run the same command:
 
@@ -108,7 +108,7 @@ Read the preview, then apply safe additions when ready:
 python3 scripts/install.py /path/to/existing-project --apply
 ```
 
-The output labels work as **ADD**, **WOULD ADD**, **REUSE**, **SKIP**, or **DECIDE**. `--apply` adds missing files and ignore entries; it never replaces an existing AGENTS.md, config, version reference, or skill. Missing fields in an existing config are left for the follow-up merge, so project-specific settings remain intact. CODEOWNERS, other agents, hooks, CI, Git history, and application code are untouched.
+The output labels work as **ADD**, **WOULD ADD**, **REUSE**, **SKIP**, or **DECIDE**. Normal installation with `--apply` adds missing files and ignore entries; it never replaces an existing AGENTS.md, config, version reference, or skill. Missing fields in an existing config are left for the follow-up merge, so project-specific settings remain intact. Differing files are recorded as pending conflicts. CODEOWNERS, other agents, hooks, CI, Git history, and application code are untouched. Replacing package defaults later requires the explicit `--upgrade` mode below.
 
 ### Finish the conflicts with your agent
 
@@ -126,6 +126,9 @@ The installer checks local agent instructions, skill files, rule files, and stan
 | Option | Meaning |
 | --- | --- |
 | `--apply` | Add missing files in an existing project after preview. |
+| `--upgrade` | Preview package updates against the saved defaults and your current files. Combine with `--apply` to apply safe changes. |
+| `--resolve PATH` | With `--upgrade --apply`, record a pending file's current contents as the chosen resolution. Repeat for multiple files. |
+| `--reason TEXT` | Explain a recorded resolution so future sessions retain the decision. |
 | `--workspace NAME` | Project name for a new config; defaults to the target folder name. |
 | `--environment local\|dev\|production` | Intended environment for a new config; defaults to `local`. |
 | `--repo-role application\|toolkit-authoring` | Defaults to `application`, adapting the copied lane rules for an app. |
@@ -141,6 +144,55 @@ python3 scripts/install.py /path/to/my-new-project --skills
 ```
 
 Skill downloads are opt-in. The installer downloads the whole pack at the selected `.ref` commit, preserves shared references, and creates discovery links. It does not run upstream installers or tests. If a pack already exists, it is preserved for source/version checks in the follow-up. Superpowers remains a single Codex plugin installation, as explained below. Failed installs report an error; any earlier safe additions remain for a later run.
+
+## Upgrade without losing your decisions
+
+Think of an upgrade as comparing three instruction cards: the old package defaults, your project's edited card, and the new package defaults. A change you already resolved belongs to your project; it should not become the same question every time you update.
+
+First update your separate toolkit clone to the version you want. For example, from a clean `agent-canvas` clone on its main branch:
+
+```sh
+git pull --ff-only
+python3 scripts/install.py /path/to/existing-project --upgrade
+```
+
+This previews the upgrade. Read the proposed changes and the refreshed upgrade section in the project's `INSTALL-FOLLOWUP.md`, then apply safe changes:
+
+```sh
+python3 scripts/install.py /path/to/existing-project --upgrade --apply
+```
+
+| What changed? | What the upgrade does |
+| --- | --- |
+| Only the package changed a part | Apply the package change. |
+| Only your project changed a part | Keep your change. |
+| Each changed different lines | Combine the changes. |
+| Both changed the same part | Leave the file for you and your agent to reconcile. |
+| You deleted a managed file | Preserve the deletion; flag a conflicting package change if needed. |
+| Nothing new happened | Leave the files and recorded decisions alone. |
+
+Only four files are managed this way: `AGENTS.md`, `config/workspace-config.yml`, `.owner-override.example`, and `skills/addyosmani-agent-skills.ref`. Your active `.owner-override`, unrelated agents, application files, and other project files stay untouched.
+
+### Resolve once, remember next time
+
+Use the prompt in `INSTALL-FOLLOWUP.md` to work through new or pending conflicts with your coding agent. Existing prose and earlier decisions are retained; the installer refreshes only its marked upgrade section. After you edit a pending file into the form you want, record that decision:
+
+```sh
+python3 scripts/install.py /path/to/existing-project --upgrade --apply \
+  --resolve AGENTS.md --reason 'Keep project convention'
+```
+
+Use project-relative paths. Repeat `--resolve` to record several pending files with the same reason. This records your resolution; it is not a review or approval gate. The next upgrade preserves that choice unless a new package change overlaps it. Unresolved files remain pending.
+
+The installer can combine text, but it cannot prove that two instructions mean compatible things. Read merged instructions and use the follow-up prompt for conflicts in meaning.
+
+### Keep the small installation record
+
+Commit `.agent-canvas/state.json` alongside your workflow files. It contains the record format version, a package version derived from file contents, original installation options, saved package defaults, pending conflicts, and append-only resolution notes. These let upgrades preserve customizations while moving the saved defaults forward. Keep secrets out of managed configuration and resolution notes; this record is project data, not a credential store.
+
+An older or manually installed project may have no record. In that case, the installer does not guess which edits were yours. Run `--upgrade --apply` to establish the current package proposals, then reconcile differing files and record their resolutions. Future upgrades can use that baseline.
+
+Run upgrades from your updated toolkit clone; the installer does not update a copy of itself inside the target project. Skill-pack updates are separate, explicit follow-up decisions. An upgrade may update the `.ref` proposal, but never downloads or replaces a skill pack. `--skills` cannot be combined with `--upgrade`.
 
 ## Manual setup in a new repository
 
@@ -310,13 +362,14 @@ config/workspace-config.yml            # Project settings
 .github/CODEOWNERS                     # Ownership example
 .gitignore                            # Local installation exclusions
 skills/addyosmani-agent-skills.ref      # Selected upstream version
-scripts/install.py                     # Additive installer
+scripts/install.py                     # Installer and opt-in upgrade mode
 tests/test_install.py                   # One offline installer smoke test
+tests/test_upgrade.py                   # Focused offline upgrade checks
 skills/addyosmani-agent-skills/         # Ignored local dependency
 .agents/skills/addy-*/                  # Ignored discovery links
 ```
 
-Installed projects also receive `INSTALL-FOLLOWUP.md`. You do not need to copy the installer or its smoke test into the target project.
+Installed projects also receive `INSTALL-FOLLOWUP.md` and, on an applied installation, `.agent-canvas/state.json`. You do not need to copy the installer or its tests into the target project.
 
 Superpowers is supplied by the installed Codex plugin, with no second repository-local copy. The Osmani download retains upstream files and reference material, but this setup exposes only its skills; it does not register its hooks or CI. Your root rulebook controls how those skills are used. Local downloads and discovery links are recreated during installation, not distributed with the workflow files.
 
@@ -329,7 +382,7 @@ Read [POSTMORTEM.txt](POSTMORTEM.txt) for why the workflow was simplified. The a
 From this toolkit's root:
 
 ```sh
-python3 -m unittest discover -s tests -p test_install.py -v
+python3 -m unittest discover -s tests -v
 ```
 
-This single smoke test uses disposable folders and a tiny local skill fixture. It checks safe file installation, existing-project preview, preservation, repeat runs, skill duplication avoidance, and symlink handling. It makes no network requests and starts no subprocess CLIs or nested test runners. It does not test governance approvals or verify a live GitHub download.
+These focused checks use disposable folders and local fixtures. They cover safe installation, existing-project preview, preservation, repeat runs, skill duplication avoidance, and symlink handling, plus upgrades that retain customizations and recorded resolutions while surfacing new conflicts. They make no network requests and start no subprocess CLIs or nested test runners. They do not test governance approvals or verify a live GitHub download.
