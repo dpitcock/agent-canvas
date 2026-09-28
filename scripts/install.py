@@ -91,6 +91,7 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
         f"slack_channel_name: {json.dumps(slack)}\n"
     )
     files = {"AGENTS.md": rules, "config/workspace-config.yml": config,
+             ".owner-override.example": (source / ".owner-override.example").read_text(),
              "skills/addyosmani-agent-skills.ref": (source / "skills/addyosmani-agent-skills.ref").read_text()}
     for name in [*files, ".gitignore", "INSTALL-FOLLOWUP.md", "skills/addyosmani-agent-skills", ".agents/skills"]:
         path = root / name

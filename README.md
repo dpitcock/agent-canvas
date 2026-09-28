@@ -147,14 +147,14 @@ Skill downloads are opt-in. The installer downloads the whole pack at the select
 Prefer doing it yourself? These steps are equivalent to the basic file setup above. Have Git and Codex available.
 
 1. Create your project folder and initialize Git, or use your usual project generator. Open that folder in Codex.
-2. From this toolkit, copy `AGENTS.md`, `config/workspace-config.yml`, and `skills/addyosmani-agent-skills.ref` into the same relative locations in your project. Create `config/` and `skills/` if needed.
+2. From this toolkit, copy `AGENTS.md`, `.owner-override.example`, `config/workspace-config.yml`, and `skills/addyosmani-agent-skills.ref` into the same relative locations in your project. Create `config/` and `skills/` if needed.
 3. Customize the settings and owner-specific wording using the next section.
 4. Add the ignore entries below to your project's `.gitignore`.
 5. Install the skills using the instructions below, then start a new chat in the project.
 
 Copy only the fresh-install files below. The old gate scripts, tests, epic templates, policy validators, and workflow documents have been removed. Do not restore the archived `init-project.sh` or `install-skills.sh`; they install the previous workflow.
 
-The fresh-install files are exactly `AGENTS.md`, `config/workspace-config.yml`, and `skills/addyosmani-agent-skills.ref`, plus the ignore entries below. CODEOWNERS is optional ownership configuration. Install the skill packs separately; do not copy old `.agents/` entries or `skills/upstream/`. This repository's downloaded Osmani checkout is a local dependency, not part of the files to distribute.
+The fresh-install files are exactly `AGENTS.md`, `.owner-override.example`, `config/workspace-config.yml`, and `skills/addyosmani-agent-skills.ref`, plus the ignore entries below. CODEOWNERS is optional ownership configuration. Install the skill packs separately; do not copy old `.agents/` entries or `skills/upstream/`. This repository's downloaded Osmani checkout is a local dependency, not part of the files to distribute.
 
 Add these lines without replacing your other ignore rules:
 
@@ -260,7 +260,9 @@ The developer should select relevant skills, implement, and report what changed 
 
 ## When the process gets in the way
 
-Say `override pause`, `override bypass-review`, or `override reset` in chat or Slack. You can also put modes, one word per line, in `.owner-override` at the repository root or `~/.config/agent-governance/override` for your user-wide override.
+Say `override pause`, `override bypass-review`, or `override reset` in the current project's chat or Slack context. For a file-based override, use dotenv-style `KEY=value` syntax in `.owner-override` at that project's root only.
+
+**Overrides never cross project boundaries.** Do not read them from home or parent directories, environment variables, or another project. Do not share or symlink override files. When switching projects, do not carry over an earlier chat/Slack override. There is no global override or fallback location.
 
 | Mode | Meaning |
 | --- | --- |
@@ -268,7 +270,24 @@ Say `override pause`, `override bypass-review`, or `override reset` in chat or S
 | `bypass-review` | Skip reviewer requirements for the merge. |
 | `reset` | Discard the in-flight plan/epic state and start fresh; keep implementation work. |
 
-For example, a repository-local override file can contain just `pause`. Remove that line or file when you want normal workflow behavior again. A bare “override” in chat pauses gating while you clarify the mode.
+The installer copies the commented [.owner-override.example](.owner-override.example), but never creates or changes an active `.owner-override`. To activate the example:
+
+```sh
+cp .owner-override.example .owner-override
+```
+
+Its active setting is `OWNER_OVERRIDE=pause`. Edit that value to select another mode, or combine modes:
+
+```dotenv
+# Skip process work and reviewer requirements.
+OWNER_OVERRIDE="pause,bypass-review"
+```
+
+Blank lines, surrounding whitespace, and `#` comments outside quotes are ignored. Single or double quotes are optional; comma-separated values enable multiple modes. Use one assignment; if repeated, the last assignment in the file wins. Explicit owner instructions for this project in chat/Slack take priority, followed by this project's root file.
+
+Set `OWNER_OVERRIDE=` or remove the root `.owner-override` to disable file-based overrides for this project. A blank or comment-only file activates nothing by itself. There is no fallback to another location. Older standalone mode lines still work in this project's root file when there is no `OWNER_OVERRIDE` key.
+
+This is a convention the agent reads under `AGENTS.md`, not an operating-system environment loader or an enforcement program. The file is never sourced as shell code; commands and variable references are not expanded. A bare “override” in chat pauses gating while you clarify the mode.
 
 Overrides need no governance approval. Record the mode and timestamp in the commit trailer or PR description; skipped checks must never be reported as passed. Existing platform access controls still apply.
 
@@ -284,6 +303,7 @@ The Slack connection and `dpitcock-*` reviewer Apps must be configured separatel
 
 ```text
 AGENTS.md                              # Your workflow and overrides
+.owner-override.example                 # Commented dotenv-style example; inactive
 README.md                              # Setup and usage
 POSTMORTEM.txt                         # Historical explanation only
 config/workspace-config.yml            # Project settings

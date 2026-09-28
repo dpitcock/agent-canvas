@@ -1,9 +1,11 @@
 """One offline smoke test: no subprocesses, network, or nested runners."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("installer", Path(__file__).resolve().parents[1] / "scripts/install.py")
 installer = importlib.util.module_from_spec(spec)
@@ -34,6 +36,9 @@ class InstallSmoke(unittest.TestCase):
             self.assertIn('workspace: ' + json.dumps('my "app"'), (fresh / "config/workspace-config.yml").read_text())
             self.assertIn("repo_role: application", (fresh / "config/workspace-config.yml").read_text())
             self.assertTrue((fresh / ".agents/skills/addy-example/SKILL.md").is_file())
+            self.assertEqual((fresh / ".owner-override.example").read_bytes(),
+                             (installer.SOURCE / ".owner-override.example").read_bytes())
+            self.assertFalse((fresh / ".owner-override").exists())
             self.assertIn("Prompt to run", (fresh / "INSTALL-FOLLOWUP.md").read_text())
             before = {p.relative_to(fresh): p.read_bytes() for p in fresh.rglob("*") if p.is_file()}
             installer.install(fresh, apply=True, skills=True, home=home, downloader=local_pack)
@@ -46,6 +51,8 @@ class InstallSmoke(unittest.TestCase):
             (existing / "config/workspace-config.yml").write_text("workspace: keep-me\n")
             (existing / ".gitignore").write_text("custom-ignore")
             (existing / "app.py").write_text("print('preserve')\n")
+            (existing / ".owner-override").write_text('OWNER_OVERRIDE="pause"\n')
+            (existing / ".owner-override.example").write_text("# Project-specific example\n")
             custom = existing / ".agents/skills/renamed"
             custom.mkdir(parents=True)
             (custom / "SKILL.md").write_text("---\nname: planning-and-task-breakdown\n---\n")
@@ -59,6 +66,8 @@ class InstallSmoke(unittest.TestCase):
             self.assertEqual((existing / "AGENTS.md").read_text(), "Project-specific rules\n")
             self.assertEqual((existing / "config/workspace-config.yml").read_text(), "workspace: keep-me\n")
             self.assertEqual((existing / "app.py").read_bytes(), original[Path("app.py")])
+            self.assertEqual((existing / ".owner-override").read_bytes(), original[Path(".owner-override")])
+            self.assertEqual((existing / ".owner-override.example").read_bytes(), original[Path(".owner-override.example")])
             self.assertTrue((existing / ".gitignore").read_text().startswith("custom-ignore\n"))
 
             linked = base / "linked"
@@ -85,6 +94,40 @@ class InstallSmoke(unittest.TestCase):
             _, actions = installer.install(base / "with-global-skills", skills=True, home=home, downloader=local_pack)
             self.assertEqual(len(calls), 1)
             self.assertTrue(any(action.startswith("DECIDE skill installation") for action in actions))
+
+            # Installing another project must not inherit an override from the
+            # source toolkit, a sibling project, a parent, the home, or the env.
+            source = base / "toolkit-source"
+            for name in ("AGENTS.md", ".owner-override.example", "skills/addyosmani-agent-skills.ref"):
+                destination = source / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes((installer.SOURCE / name).read_bytes())
+
+            def snapshot(path):
+                return {p.relative_to(path): p.read_bytes() for p in path.rglob("*") if p.is_file()}
+
+            baseline = base / "clean-project"
+            with patch.dict(os.environ, {"OWNER_OVERRIDE": ""}):
+                installer.install(baseline, source=source, home=home, workspace="isolation-test")
+            baseline_files = snapshot(baseline)
+            foreign_overrides = [source / ".owner-override", base / ".owner-override",
+                                 home / ".config/agent-governance/override"]
+            for path in foreign_overrides:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('OWNER_OVERRIDE="pause,bypass-review,reset" # foreign override\n')
+            isolated = base / "isolated-project"
+            original_open = Path.open
+
+            def reject_foreign_reads(path, *args, **kwargs):
+                self.assertNotIn(path, foreign_overrides + [existing / ".owner-override"])
+                return original_open(path, *args, **kwargs)
+
+            with patch.dict(os.environ, {"OWNER_OVERRIDE": "pause,bypass-review,reset"}):
+                with patch.object(Path, "open", reject_foreign_reads):
+                    installer.install(isolated, source=source, home=home, workspace="isolation-test")
+            self.assertEqual(snapshot(isolated), baseline_files)
+            self.assertFalse((isolated / ".owner-override").exists())
+            self.assertEqual((existing / ".owner-override").read_bytes(), original[Path(".owner-override")])
 
 
 if __name__ == "__main__":
