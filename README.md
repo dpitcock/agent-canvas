@@ -64,7 +64,7 @@ A **project** is the whole goal. A **phase** is a big stage. An **epic** is a us
 
 For smaller projects, skip phases: **Project → Epic → Task**. Routine fixes may need only a short task description. Detail only the current phase, or current epic when there are no phases. Expand future work when you reach it. Finishing one phase does not create another approval gate.
 
-Each active epic says what must work, what checks will prove it, and what must be true before merging. Principal approval happens once at the PR for planned delivery; Principal returns only for exceptions. QA checks the PR's declared test evidence, not the planning process. Routine authoring needs no formal plan or Principal review.
+Each active epic says what must work, what checks will prove it, and what must be true before merging. Staff Engineer is the sole PR reviewer and checks the declared test evidence. No Principal planning approval or separate QA approval is required. Routine authoring needs no formal plan.
 
 ## How much review?
 
@@ -72,13 +72,13 @@ First consider scope and risk: Tier 1 is small and low risk; Tier 2 is bounded b
 
 | Target environment | Normal review expectation |
 | --- | --- |
-| `local` — your machine | Direct commits; no reviewers. |
-| `dev` — development environment | Code Reviewer only. |
-| `production` — live use | The roles in the project's `approvals_required`. |
+| `local` — your machine | Direct commits need no review; PRs use Staff Engineer only. |
+| `dev` — development environment | Staff Engineer only. |
+| `production` — live use | Staff Engineer only. |
 
-Authentication, secrets, database schema, payments, and user data raise the work to Tier 3 even locally. Bring relevant expertise to the PR. You can always open a PR before approval.
+Authentication, secrets, database schema, payments, and user data raise the work to Tier 3 even locally. Staff Engineer covers the relevant security and test evidence at the PR. Specialist advice may help implementation, but does not create another reviewer or approval requirement. You can always open a PR before approval.
 
-Reviews attach to PR opening, marking ready, or an explicit re-request. They do not fire on every commit or completed task. Marking an unchanged PR ready does not require repeating a valid review. Reviewers work read-only and return a verdict; the developer merges.
+Reviews attach to PR opening, marking ready, or an explicit re-request. They do not fire on every commit or completed task. Marking an unchanged PR ready does not require repeating a valid review. Staff Engineer works in a fresh read-only context and returns a verdict; the developer merges. Owner Override and the governance-repair exemption still apply. Do not request separate Code Reviewer, Principal, AppSec, or QA approvals.
 
 For this toolkit, internal docs, tests, scripts, and tooling use the light **authoring lane**. Templates, adopter policy, distributed bootstrap, and CI configuration use the **shipped lane**: versioned changes reviewed at the PR. A bootstrap script shipped to others stays shipped even if it lives in `scripts/`.
 
@@ -135,7 +135,7 @@ The installer checks local agent instructions, skill files, rule files, and stan
 | `--slack-channel NAME` | Known channel for a new config; defaults to empty, never guessed. |
 | `--skills` | Also download pinned Osmani skills when no existing skills are detected. Check app plugins first. |
 
-Options do not overwrite values in existing config files. The copied owner and reviewer wording still names Dennis and the `dpitcock-*` Apps; the follow-up asks you to confirm or adapt these.
+Options do not overwrite values in existing config files. The copied owner and reviewer wording still names Dennis and the Staff Engineer GitHub App; the follow-up asks you to confirm or adapt these.
 
 To include Osmani on a machine/project without an existing installation:
 
@@ -240,11 +240,9 @@ agentic_envs:
   codex: true
   cline: true
   claude_code: false # Reserved; adapter not yet implemented.
-# Applies to production PRs; local authoring requires no reviewers.
+# Sole reviewer for PRs in every environment; local work without a PR needs none.
 approvals_required:
-  code_reviewer: true
-  appsec: true
-  qa: true
+  staff_engineer: true
 target_environment: local
 repo_role: toolkit-authoring
 slack_channel_name: ws-agent-canvas
@@ -252,12 +250,12 @@ slack_channel_name: ws-agent-canvas
 
 - **workspace:** your project name.
 - **agentic_envs:** assistants to configure for this project. This package supports Codex and Cline; `claude_code: false` reserves a future adapter. The list does not identify the assistant currently speaking.
-- **approvals_required:** roles required for production PRs. AppSec checks security; QA checks that the declared behavior and evidence hold up. This list does not require them for ordinary local work.
+- **approvals_required:** `staff_engineer: true` selects the sole PR reviewer for every environment. Local work without a PR needs no review. This is workflow guidance, not automatic GitHub enforcement.
 - **target_environment:** `local`, `dev`, or `production`, based on the intended use of the change—not merely where the agent runs.
 - **repo_role:** `toolkit-authoring` describes this repository. For an application, use a descriptive value such as `application` and adapt the toolkit-specific lane wording in `AGENTS.md` to your product. This is agent-readable configuration, not a new validated schema.
 - **slack_channel_name:** one project channel shared by all assistants, such as `ws-my-project`. Leave it empty if unknown. Each authorized post identifies its actual environment and role. Existing channel values are preserved; editing this setting does not create or rename a Slack channel.
 
-The copied rulebook names Dennis as owner and `dpitcock-*` Apps as reviewers. Keep those for Dennis's projects, or replace them with your actual owner and review arrangement. Required roles must have real reviewers when you reach that PR; do not invent approvals. Local work does not wait for that setup.
+The copied rulebook names Dennis as owner and the Staff Engineer GitHub App as sole reviewer. Keep those for Dennis's projects, or replace them with your actual owner and review arrangement. The Staff Engineer review must be real when required; do not invent approvals. Local work does not wait for that setup.
 
 ## Install the skills
 
@@ -403,7 +401,7 @@ Authorized Slack posts use **Agent Alert**, go to the shared project channel, an
 
 Use the available Slack plugin or connector, including the ChatGPT Slack connector when working there. If the configured channel is missing, ask the owner before creating it. If Slack access or channel details are missing, put the setup action in `INSTALL-FOLLOWUP.md` and continue working. Slack setup never blocks development.
 
-The Slack connection and `dpitcock-*` reviewer Apps must be configured separately. These files do not deploy either integration. If a needed connection is unavailable, report it honestly in chat and continue independent work. Do not invent a channel, send as someone else, or build a control plane to finish setup.
+The Slack connection and Staff Engineer reviewer App must be configured separately. These files do not deploy either integration. If a needed connection is unavailable, report it honestly in chat and continue independent work. Do not invent a channel, send as someone else, or build a control plane to finish setup.
 
 ## Clean install layout
 

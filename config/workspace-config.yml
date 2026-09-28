@@ -3,11 +3,9 @@ agentic_envs:
   codex: true
   cline: true
   claude_code: false # Reserved; adapter not yet implemented.
-# Applies to production PRs; local authoring requires no reviewers.
+# Sole reviewer for PRs in every environment; local work without a PR needs none.
 approvals_required:
-  code_reviewer: true
-  appsec: true
-  qa: true
+  staff_engineer: true
 target_environment: local
 repo_role: toolkit-authoring
 slack_channel_name: ws-agent-canvas
