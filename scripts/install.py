@@ -25,6 +25,159 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+ADAPTERS = {"codex": ".agents/skills", "cline": ".cline/skills"}
+
+
+def agentic_envs(config):
+    """Read a strict YAML block: two-space keys and literal true/false only."""
+    result, in_block, seen = {}, False, False
+    for raw in config.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if re.match(r"^[\"']?agentic_envs[\"']?\s*:", line) and not line.startswith("agentic_envs:"):
+            raise ValueError("Use the unquoted agentic_envs: block key")
+        if line.startswith("agentic_envs:"):
+            if seen or line != "agentic_envs:":
+                raise ValueError("agentic_envs must be one YAML block mapping")
+            in_block = seen = True
+            continue
+        if not in_block:
+            continue
+        if not line.startswith((" ", "\t")):
+            in_block = False
+            continue
+        match = re.fullmatch(r"  ([a-z_]+): (true|false)", line)
+        if not match:
+            raise ValueError("agentic_envs requires two-space keys and literal true/false values")
+        key, value = match.groups()
+        if key not in {*ADAPTERS, "claude_code"} or key in result:
+            raise ValueError(f"Unknown or duplicate agentic_envs key: {key}")
+        if key == "claude_code" and value == "true":
+            raise ValueError("claude_code adapter is not supported yet; keep it false")
+        result[key] = value == "true"
+    if seen and not result:
+        raise ValueError("agentic_envs must contain at least one environment")
+    return result if seen else {"codex": True}
+
+
+def pack_fingerprint(pack):
+    """Fingerprint regular local pack content; never traverse pack symlinks."""
+    entries = {}
+    for base, dirs, files in os.walk(pack, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if d != ".git")
+        for name in dirs + files:
+            path = Path(base) / name
+            if path.is_symlink():
+                raise ValueError("Skill pack contains symlinks; reconcile manually")
+        for name in sorted(files):
+            path = Path(base) / name
+            if not path.is_file():
+                raise ValueError("Skill pack contains a non-regular file")
+            entries[str(path.relative_to(pack))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digest(entries)
+
+
+def adapter_plan(root, environments, state, home=None):
+    """Plan discovery changes; only mutate links whose exact targets we own."""
+    adapter = state.setdefault("adapters", {"links": {}, "pending": []})
+    home = Path.home() if home is None else Path(home)
+    owned = adapter["links"]
+    pending, operations, actions = [], [], []
+    pack = root / "skills/addyosmani-agent-skills"
+    manifests = []
+    if any(environments.get(env) for env in ADAPTERS):
+        try:
+            safe_destination(root, pack)
+            provenance = adapter.get("pack")
+            if not provenance or not pack.is_dir() or pack_fingerprint(pack) != provenance["fingerprint"]:
+                raise ValueError("Osmani pack is absent, untracked, or modified; verify its source/version manually before linking")
+            ref = root / "skills/addyosmani-agent-skills.ref"
+            safe_destination(root, ref)
+            if ref.read_text().strip() != provenance["revision"]:
+                raise ValueError("Osmani reference differs from recorded pack version; reconcile manually")
+            manifests = sorted((pack / "skills").glob("*/SKILL.md"))
+            if not manifests:
+                raise ValueError("Osmani pack has no skills")
+        except (OSError, ValueError) as error:
+            pending.append(str(error))
+    for env, directory in ADAPTERS.items():
+        parent = root / directory
+        try:
+            safe_destination(root, parent)
+            if parent.exists() and not parent.is_dir():
+                raise ValueError(f"Not a directory: {directory}")
+        except ValueError as error:
+            pending.append(str(error))
+            continue
+        enabled = environments.get(env, False)
+        for relative, expected in list(owned.items()):
+            if str(Path(relative).parent) != directory or enabled:
+                continue
+            link = root / relative
+            if link.is_symlink() and os.readlink(link) == expected:
+                operations.append(("remove", link, None))
+                actions.append(f"REMOVE {relative}: environment disabled")
+                del owned[relative]
+            elif link.exists() or link.is_symlink():
+                pending.append(f"{relative}: modified owned link preserved; environment disabled")
+            else:
+                del owned[relative]
+        if not enabled or not manifests:
+            continue
+        # Cline also loads these locations; renamed equivalents need manual reconciliation.
+        if env == "cline" and any((root / path).exists() for path in (".claude/skills", ".clinerules/skills")):
+            pending.append("cline: alternate skill directory exists; reconcile duplicate discovery before adding links")
+            continue
+        global_dirs = (home / ".cline/skills",) if env == "cline" else (home / ".agents/skills", home / ".codex/skills")
+        if any(directory.is_dir() and any(directory.glob("*/SKILL.md")) for directory in global_dirs):
+            pending.append(f"{env}: global skills exist; reconcile equivalent skills before adding links")
+            continue
+        unowned = [p for p in parent.iterdir() if str(p.relative_to(root)) not in owned] if parent.is_dir() else []
+        if any(p.is_dir() or p.is_symlink() for p in unowned):
+            pending.append(f"{env}: untracked skills exist; reconcile renamed duplicates before adding links")
+            continue
+        for manifest in manifests:
+            if env == "cline":
+                frontmatter = manifest.read_text().split("---", 2)
+                match = re.search(r"(?m)^name:\s*[\"']?([a-zA-Z0-9_-]+)[\"']?\s*$", frontmatter[1]) if len(frontmatter) == 3 and not frontmatter[0].strip() else None
+                if not match or match.group(1) != manifest.parent.name:
+                    pending.append(f"cline: {manifest.parent.name} frontmatter name must match its directory; preserved for reconciliation")
+                    continue
+            name = ("addy-" if env == "codex" else "") + manifest.parent.name
+            link = parent / name
+            relative = str(link.relative_to(root))
+            expected = os.path.relpath(manifest.parent, parent)
+            if link.is_symlink() and os.readlink(link) == expected and owned.get(relative) == expected:
+                continue
+            if link.exists() or link.is_symlink():
+                pending.append(f"{relative}: existing or modified entry preserved")
+                continue
+            operations.append(("add", link, expected))
+            owned[relative] = expected
+            actions.append(f"ADD {relative}: {env} skill discovery")
+    adapter["pending"] = sorted(set(pending))
+    actions.extend("DECIDE adapter: " + item for item in adapter["pending"])
+    return operations, actions
+
+
+def apply_adapters(operations):
+    for operation, link, target in operations:
+        if operation == "remove":
+            link.unlink()
+        else:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(target, target_is_directory=True)
+            if link.parent.name == "skills" and link.parent.parent.name == ".cline":
+                root = link.parent.parent.parent
+                ignore = root / ".gitignore"
+                safe_destination(root, ignore)
+                old = ignore.read_text() if ignore.exists() else ""
+                entry = "/.cline/skills/" + link.name
+                if entry not in old.splitlines():
+                    ignore.write_text(old + ("\n" if old and not old.endswith("\n") else "") + entry + "\n")
+
+
 def read_state(root):
     path = root / STATE
     safe_destination(root, path)
@@ -43,6 +196,18 @@ def read_state(root):
         assert isinstance(state["pending"], dict) and set(state["pending"]) <= set(MANAGED)
         assert all(isinstance(v, dict) and isinstance(v["incoming"], str) for v in state["pending"].values())
         assert isinstance(state["resolutions"], list)
+        if "adapters" in state:
+            adapter = state["adapters"]
+            assert isinstance(adapter, dict) and isinstance(adapter["links"], dict)
+            assert isinstance(adapter["pending"], list) and all(isinstance(item, str) for item in adapter["pending"])
+            for name, target in adapter["links"].items():
+                assert isinstance(name, str) and isinstance(target, str) and name == str(Path(name))
+                assert str(Path(name).parent) in ADAPTERS.values() and Path(name).name not in {".", ".."}
+                expected = Path("../../skills/addyosmani-agent-skills/skills") / Path(target).name
+                assert target == str(expected) and Path(target).name not in {".", ".."}
+            if "pack" in adapter:
+                assert re.fullmatch(r"[0-9a-f]{64}", adapter["pack"]["fingerprint"])
+                assert re.fullmatch(r"[0-9a-fA-F]{40}", adapter["pack"]["revision"])
         return state
     except (ValueError, KeyError, TypeError, AssertionError) as error:
         raise ValueError(f"Cannot read upgrade history in {path}; preserve it and repair or restore it") from error
@@ -113,11 +278,13 @@ Toolkit source: `{source}`. Run the installer from this source; do not replace i
 
 {chr(10).join('- ' + action.split(chr(10))[0] for action in actions)}
 
+Adapter decisions: {"; ".join((state or {}).get("adapters", {}).get("pending", [])) or "none"}.
+
 Pending files: {', '.join('`' + name + '`' for name in sorted(pending)) or 'none'}.
 
 ### Prompt to run for this upgrade
 
-> Recheck this project's files and .agent-canvas/state.json. Preserve previous resolution notes and customizations; do not reopen unchanged decisions. Compare each pending file's baseline, current project contents, and proposed incoming contents. Preview-only proposals come from the current toolkit source and are not yet saved as baselines. My project workflow and Owner Override win. Merge compatible changes; ask me only about unresolved material conflicts. Read Owner Override only from this project's root .owner-override when it is a regular, non-symlink file; read it as data, never source or expand it. Never read overrides from home, parent directories, environment variables, other projects, or shared files/symlinks. Do not alter active override files, install duplicate skills, or add approval gates. After resolving a pending file, record the choice with `python3 /path/to/agent-canvas/scripts/install.py /path/to/project --upgrade --apply --resolve FILE --reason "Why this resolution was chosen"`. This records a decision; it does not require approval to work. Leave unresolved files pending. If a skill reference changes, compare the installed pack/plugin version and reconcile explicitly; the upgrader does not update installed skills. Keep my notes outside these marked lines.
+> Recheck this project's files and .agent-canvas/state.json. Preserve previous resolution notes and customizations; do not reopen unchanged decisions. Compare each pending file's baseline, current project contents, and proposed incoming contents. Preview-only proposals come from the current toolkit source and are not yet saved as baselines. My project workflow and Owner Override win. Merge compatible changes; ask me only about unresolved material conflicts. Read Owner Override only from this project's root .owner-override when it is a regular, non-symlink file; read it as data, never source or expand it. Never read overrides from home, parent directories, environment variables, other projects, or shared files/symlinks. Do not alter active override files, install duplicate skills, or add approval gates. After resolving a pending file, record the choice with `python3 /path/to/agent-canvas/scripts/install.py /path/to/project --upgrade --apply --resolve FILE --reason "Why this resolution was chosen"`. This records a decision; it does not require approval to work. Leave unresolved files pending. If a skill reference changes, compare the installed pack/plugin version and reconcile explicitly; the upgrader does not update installed skills. For Slack use an available plugin or connector and the configured project channel. Ask the owner before creating a missing channel; without access record the setup action here and continue work. Prefix posts with [actual agentic_env][role]; never guess the environment. Keep my notes outside these marked lines.
 {END}"""
     if BEGIN in old or END in old:
         updated = old[:old.index(BEGIN)] + block + old[old.index(END) + len(END):]
@@ -128,11 +295,11 @@ Pending files: {', '.join('`' + name + '`' for name in sorted(pending)) or 'none
         path.write_text(updated)
 
 
-def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE):
+def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=None):
     root = Path(target).expanduser().resolve()
     if not root.is_dir():
         raise ValueError("Install the project first; upgrade target must exist")
-    for name in (*MANAGED, STATE, "INSTALL-FOLLOWUP.md"):
+    for name in (*MANAGED, STATE, ".gitignore", "INSTALL-FOLLOWUP.md"):
         path = root / name
         safe_destination(root, path)
         if path.exists() and not path.is_file():
@@ -143,6 +310,8 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE):
         raise ValueError("Recording resolutions requires a saved pending conflict and a nonempty --reason")
     options = state["options"] if state else dict(workspace=root.name, environment="local", role="application", slack="")
     files = render_files(source, **options)
+    config_path = root / "config/workspace-config.yml"
+    environments = agentic_envs(config_path.read_text() if config_path.exists() else files["config/workspace-config.yml"])
     version = digest(files)
     if state is None:
         state = dict(schema_version=1, options=options, baselines={}, pending={}, resolutions=[])
@@ -166,6 +335,13 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE):
             result, conflict = (incoming, False) if local is None else (local, local != incoming)
         else:
             result, conflict = merge_text(base, local, incoming)
+        if name == "config/workspace-config.yml" and local is not None and result is not None and not conflict:
+            # Source defaults must never opt an existing project into another assistant.
+            if agentic_envs(result) != environments:
+                block = "agentic_envs:\n" + "".join(f"  {key}: {str(value).lower()}\n" for key, value in environments.items())
+                result, count = re.subn(r"(?m)^agentic_envs:[^\n]*(?:\n|$)(?:[ \t]+[^\n]*(?:\n|$)|[ \t]*\n)*", block, result)
+                if not count:
+                    result = result.rstrip() + "\n" + block
         # A ref update is a dependency decision; never silently update the declaration while leaving the installed pack behind.
         if name.endswith(".ref") and local is not None and incoming != base and local != incoming and name not in resolve:
             conflict = True
@@ -181,8 +357,11 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE):
                 diff = "".join(difflib.unified_diff((local or "").splitlines(True), (result or "").splitlines(True),
                                                      fromfile=name, tofile=name + " (proposed)"))
                 actions.append(f"{'UPDATE' if apply else 'WOULD UPDATE'} {name}\n{diff}")
+    config_text = writes.get("config/workspace-config.yml", config_path.read_text() if config_path.exists() else files["config/workspace-config.yml"])
+    operations, adapter_actions = adapter_plan(root, agentic_envs(config_text), state, home=home)
+    actions.extend(adapter_actions if apply else ["WOULD " + a if a.startswith(("ADD ", "REMOVE ")) else a for a in adapter_actions])
     state["package_version"] = version
-    if not writes and json.dumps(state, sort_keys=True) == original_state:
+    if not writes and not operations and json.dumps(state, sort_keys=True) == original_state:
         actions = actions or ["NO CHANGES: prior decisions and local customizations preserved"]
         upgrade_followup(root, actions, state["pending"], source=source, state=state, preserve_current=True)
         return apply, actions
@@ -195,6 +374,7 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE):
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
+        apply_adapters(operations)
         save_state(root, state)
     return apply, actions
 
@@ -278,7 +458,7 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
     discovered = inventory(root) if root.exists() else []
     home = Path.home() if home is None else Path(home)
     global_skills = []
-    for parent in (home / ".agents/skills", home / ".codex/skills"):
+    for parent in (home / ".agents/skills", home / ".codex/skills", home / ".cline/skills", home / ".claude/skills"):
         if parent.is_dir():
             global_skills.extend(str(p) for p in parent.glob("*/SKILL.md"))
     # A script cannot identify equivalent renamed skills reliably. Defer instead of duplicating.
@@ -291,6 +471,9 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
         safe_destination(root, path)
         if name in [*files, STATE, ".gitignore", "INSTALL-FOLLOWUP.md"] and path.exists() and not path.is_file():
             raise ValueError(f"Expected file; preserving existing path: {path}")
+    config_path = root / "config/workspace-config.yml"
+    environments = agentic_envs(config_path.read_text() if config_path.exists() else files["config/workspace-config.yml"])
+    adapter_state = json.loads(json.dumps(prior_state)) if prior_state else {"adapters": {"links": {}, "pending": []}}
     actions = []
     for name, content in files.items():
         path = root / name
@@ -312,7 +495,9 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
             with ignore_path.open("a") as out:
                 out.write(("\n" if ignore and not ignore.endswith("\n") else "") + "\n".join(missing) + "\n")
     pack = root / "skills/addyosmani-agent-skills"
-    if skills:
+    if skills and not any(environments.get(env) for env in ADAPTERS):
+        actions.append("SKIP skill downloads: no supported agentic environment is enabled")
+    elif skills:
         if has_skills or pack.exists():
             actions.append("DECIDE skill installation: existing skills/pack found; preserve and resolve duplicates in follow-up")
         elif not active:
@@ -326,20 +511,18 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
                 discovered_skills = sorted((pack / "skills").glob("*/SKILL.md"))
                 if not discovered_skills:
                     raise ValueError("Skill pack is empty")
-                links = root / ".agents/skills"
-                links.mkdir(parents=True, exist_ok=True)
-                for manifest in discovered_skills:
-                    link = links / ("addy-" + manifest.parent.name)
-                    if link.exists() or link.is_symlink():
-                        actions.append(f"DECIDE {link.relative_to(root)}: existing entry preserved")
-                    else:
-                        link.symlink_to(os.path.relpath(manifest.parent, links), target_is_directory=True)
-                actions.append(f"ADD Osmani skill pack; processed {len(discovered_skills)} discovery links")
+                adapter_state.setdefault("adapters", {"links": {}, "pending": []})["pack"] = {
+                    "revision": ref, "fingerprint": pack_fingerprint(pack)}
+                actions.append(f"ADD Osmani skill pack; found {len(discovered_skills)} skills")
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
                 actions.append(f"FAILED skill installation: {error}; retain safe additions and resolve in follow-up")
     else:
         actions.append("SKIP skill downloads; use follow-up to confirm existing packs or install missing ones")
-    actions.append("REUSE Superpowers if enabled; otherwise install once through Codex Plugins")
+    operations, adapter_actions = adapter_plan(root, environments, adapter_state, home=home)
+    actions.extend(adapter_actions if active else ["WOULD " + a if a.startswith(("ADD ", "REMOVE ")) else a for a in adapter_actions])
+    if active:
+        apply_adapters(operations)
+    actions.append("REUSE Superpowers if enabled; otherwise verify a supported installation for each active environment; never assume plugin portability")
     followup = root / "INSTALL-FOLLOWUP.md"
     prompt = f"""# Agent Canvas installation follow-up
 
@@ -363,7 +546,9 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
 >
 > Use one shared plan/task record. Detail only the current phase or epic. Prefer Osmani outcome-based planning and vertical slices, plus Superpowers fresh-context delegation for substantial independent work. Do not add spec approval gates, per-task reviews, duplicate verification, or framework-specific ledgers. Follow project risk/environment rules and PR-only review triggers. Keep the Owner Override effective.
 >
-> Check for matching skills and plugins before installing anything. Reuse matching installations; preserve unrelated agents and skills. Present version differences or renamed duplicates for a decision instead of upgrading, overwriting, or installing another copy. The installer cannot discover every app-managed plugin. If Osmani is already a plugin, update its source-location wording rather than adding local links. If a local pack exists, verify its source/version before adding any missing links. Use Superpowers once through the app plugin. Do not enable upstream hooks or CI.
+> Check for matching skills and plugins before installing anything. Reuse matching installations; preserve unrelated agents and skills. Present version differences or renamed duplicates for a decision instead of upgrading, overwriting, or installing another copy. The installer cannot discover every app-managed plugin. If Osmani is already a plugin, update its source-location wording rather than adding local links. If a local pack exists, verify its source/version before adding any missing links. Verify Superpowers support separately for each active environment; reuse supported existing installations and record unsupported integrations without blocking work. Do not enable upstream hooks or CI.
+>
+> For Slack use an available plugin or connector and the configured project channel. Ask the owner before creating a missing channel. If access is unavailable, record the setup action here and continue work. Prefix posts with [actual agentic_env][role]; never guess the environment.
 >
 > Preview remaining changes, apply agreed safe additions and merges, and verify the touched files and links. Do not run legacy governance scripts or create new approval machinery. Report what is resolved and what still needs my input. Update this follow-up file with the outcome so another session does not repeat finished work. Missing integrations must be reported honestly; continue independent work.
 """
@@ -376,7 +561,7 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
         actions.append("ADD INSTALL-FOLLOWUP.md (ready-to-run conflict-resolution prompt)")
     if active and prior_state is None:
         state = dict(schema_version=1, package_version=digest(files), options=options,
-                     baselines={}, pending={}, resolutions=[])
+                     baselines={}, pending={}, resolutions=[], adapters=adapter_state["adapters"])
         for name, incoming in files.items():
             local = (root / name).read_text()
             if local == incoming:
@@ -386,6 +571,9 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
                 state["pending"][name] = dict(incoming=incoming)
         save_state(root, state)
         upgrade_followup(root, ["TRACKING: package baseline saved; reconcile any pending files"], state["pending"], source=source, state=state)
+    elif active and prior_state != adapter_state:
+        save_state(root, adapter_state)
+        upgrade_followup(root, adapter_actions, adapter_state["pending"], source=source, state=adapter_state)
     return active, actions
 
 
