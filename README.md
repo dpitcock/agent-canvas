@@ -112,7 +112,7 @@ The output labels work as **ADD**, **WOULD ADD**, **REUSE**, **SKIP**, or **DECI
 
 ### Finish the conflicts with your agent
 
-Open the target project in Codex, open `INSTALL-FOLLOWUP.md`, and paste its **Prompt to run** into chat. The prompt asks your agent to:
+Open the target project in Codex or Cline, open `INSTALL-FOLLOWUP.md`, and paste its **Prompt to run** into chat. The prompt asks your agent to:
 
 1. Recheck current files and enabled plugins, rather than trusting an old snapshot.
 2. Propose a merge that preserves project details and puts your workflow and Owner Override first.
@@ -143,7 +143,7 @@ To include Osmani on a machine/project without an existing installation:
 python3 scripts/install.py /path/to/my-new-project --skills
 ```
 
-Skill downloads are opt-in. The installer downloads the whole pack at the selected `.ref` commit, preserves shared references, and creates discovery links. It does not run upstream installers or tests. If a pack already exists, it is preserved for source/version checks in the follow-up. Superpowers remains a single Codex plugin installation, as explained below. Failed installs report an error; any earlier safe additions remain for a later run.
+Skill downloads are opt-in. The installer downloads the whole pack at the selected `.ref` commit, preserves shared references, and creates discovery links. It does not run upstream installers or tests. If a pack already exists, it is preserved for source/version checks in the follow-up. Superpowers uses the supported installation for each assistant, as explained below; enabling an environment does not install a plugin. Failed installs report an error; any earlier safe additions remain for a later run.
 
 ## Upgrade without losing your decisions
 
@@ -171,7 +171,7 @@ python3 scripts/install.py /path/to/existing-project --upgrade --apply
 | You deleted a managed file | Preserve the deletion; flag a conflicting package change if needed. |
 | Nothing new happened | Leave the files and recorded decisions alone. |
 
-Only four files are managed this way: `AGENTS.md`, `config/workspace-config.yml`, `.owner-override.example`, and `skills/addyosmani-agent-skills.ref`. Your active `.owner-override`, unrelated agents, application files, and other project files stay untouched.
+Four text files use this merge process: `AGENTS.md`, `config/workspace-config.yml`, `.owner-override.example`, and `skills/addyosmani-agent-skills.ref`. Environment adapters separately track the discovery links they create, adding specific Cline ignore entries when needed. Your active `.owner-override`, unrelated agents, and application files stay untouched.
 
 ### Resolve once, remember next time
 
@@ -188,7 +188,7 @@ The installer can combine text, but it cannot prove that two instructions mean c
 
 ### Keep the small installation record
 
-Commit `.agent-canvas/state.json` alongside your workflow files. It contains the record format version, a package version derived from file contents, original installation options, saved package defaults, pending conflicts, and append-only resolution notes. These let upgrades preserve customizations while moving the saved defaults forward. Keep secrets out of managed configuration and resolution notes; this record is project data, not a credential store.
+Commit `.agent-canvas/state.json` alongside your workflow files. It contains the record format version, a package version derived from file contents, original installation options, saved package defaults, pending conflicts, and append-only resolution notes. It also tracks installer-owned discovery links and the downloaded pack's version and content fingerprint. These let upgrades preserve customizations while moving the saved defaults forward. Keep secrets out of managed configuration and resolution notes; this record is project data, not a credential store.
 
 An older or manually installed project may have no record. In that case, the installer does not guess which edits were yours. Run `--upgrade --apply` to establish the current package proposals, then reconcile differing files and record their resolutions. Future upgrades can use that baseline.
 
@@ -196,9 +196,9 @@ Run upgrades from your updated toolkit clone; the installer does not update a co
 
 ## Manual setup in a new repository
 
-Prefer doing it yourself? These steps are equivalent to the basic file setup above. Have Git and Codex available.
+Prefer doing it yourself? These steps are equivalent to the basic file setup above. Have Git and your coding assistant available.
 
-1. Create your project folder and initialize Git, or use your usual project generator. Open that folder in Codex.
+1. Create your project folder and initialize Git, or use your usual project generator. Open that folder in Codex or Cline.
 2. From this toolkit, copy `AGENTS.md`, `.owner-override.example`, `config/workspace-config.yml`, and `skills/addyosmani-agent-skills.ref` into the same relative locations in your project. Create `config/` and `skills/` if needed.
 3. Customize the settings and owner-specific wording using the next section.
 4. Add the ignore entries below to your project's `.gitignore`.
@@ -236,24 +236,76 @@ This repository currently uses:
 
 ```yaml
 workspace: agent-canvas
+agentic_envs:
+  codex: true
+  cline: true
+  claude_code: false # Reserved; adapter not yet implemented.
+# Applies to production PRs; local authoring requires no reviewers.
 approvals_required:
   code_reviewer: true
   appsec: true
   qa: true
 target_environment: local
 repo_role: toolkit-authoring
-slack_channel_name: ws-agent-canvas-codex
+slack_channel_name: ws-agent-canvas
 ```
 
 - **workspace:** your project name.
+- **agentic_envs:** assistants to configure for this project. This package supports Codex and Cline; `claude_code: false` reserves a future adapter. The list does not identify the assistant currently speaking.
 - **approvals_required:** roles required for production PRs. AppSec checks security; QA checks that the declared behavior and evidence hold up. This list does not require them for ordinary local work.
 - **target_environment:** `local`, `dev`, or `production`, based on the intended use of the change—not merely where the agent runs.
 - **repo_role:** `toolkit-authoring` describes this repository. For an application, use a descriptive value such as `application` and adapt the toolkit-specific lane wording in `AGENTS.md` to your product. This is agent-readable configuration, not a new validated schema.
-- **slack_channel_name:** an actual channel the connected Agent Alert bot can access. If unknown, leave it empty and have the agent ask in chat; do not guess.
+- **slack_channel_name:** one project channel shared by all assistants, such as `ws-my-project`. Leave it empty if unknown. Each authorized post identifies its actual environment and role. Existing channel values are preserved; editing this setting does not create or rename a Slack channel.
 
 The copied rulebook names Dennis as owner and `dpitcock-*` Apps as reviewers. Keep those for Dennis's projects, or replace them with your actual owner and review arrangement. Required roles must have real reviewers when you reach that PR; do not invent approvals. Local work does not wait for that setup.
 
 ## Install the skills
+
+### Choose your coding assistants
+
+Think of `agentic_envs` as a list of doors into the same workshop. Codex and Cline read the same `AGENTS.md`, use the same project settings, and keep the same task and resolution history. They do not need separate workflows.
+
+| Config key | Shared rules | Local Osmani discovery | Superpowers |
+| --- | --- | --- | --- |
+| `codex` | `AGENTS.md` | `.agents/skills/addy-<skill-name>` | Existing Codex plugin; setup separately if missing. |
+| `cline` | `AGENTS.md` | `.cline/skills/<skill-name>` | No automatic installation; report unsupported/missing integration in the follow-up. |
+| `claude_code` | Adapter not implemented | Keep `false` for now | Not configured by this installer. |
+
+[Cline supports AGENTS.md](https://docs.cline.bot/customization/cline-rules) and documents [project skill discovery](https://docs.cline.bot/customization/skills). Its skill folder names must match the manifest names, so its links do not use the Codex `addy-` prefix. Both sets of links point to one local Osmani pack, including its shared references. Cline also discovers `.claude/skills` and `.clinerules/skills`; existing installations need reconciliation to avoid exposing a second copy.
+
+For a new project, the copied config enables Codex and Cline. For an existing project, edit that project's `config/workspace-config.yml` to enable the assistants you use, then run:
+
+```sh
+python3 scripts/install.py /path/to/project --upgrade
+python3 scripts/install.py /path/to/project --upgrade --apply
+```
+
+The first command previews integration changes; the second applies safe changes. Existing installations without an `agentic_envs` section keep Codex-only behavior. Use the simple indented mapping shown above, with literal `true` or `false` values. Unknown names, invalid values, and unsupported enabled adapters are rejected before changes are made.
+
+Upgrades do not download skills. They can expose a previously installer-downloaded, verified local pack to a newly enabled assistant. Manually installed or changed packs are preserved for reconciliation in the follow-up. If no pack exists, install missing skills separately with the opt-in `--skills` installation flow after checking for existing plugins.
+
+Disabling an environment only permits removal of its unchanged installer-owned discovery links. User-created or modified entries remain for reconciliation. It does not uninstall the assistant, disable its plugins, delete the shared pack, or remove `AGENTS.md`. All generated integration files remain within the project; no home-directory settings are written.
+
+These checks validate filesystem setup. After installation, start a fresh session in each enabled assistant and confirm that its skill list includes the expected skills. App versions and settings can affect discovery.
+
+### Adding another assistant later
+
+An adapter is the small part of the installer that tells an assistant where to find our shared instructions and skills. Adding a name to YAML alone does not implement support.
+
+Claude Code, Gemini, and Antigravity are future integration examples, not supported adapters in this package. `claude_code: false` is currently accepted as a reserved setting; `claude_code: true` is rejected. Do not add `gemini` or `antigravity` to project config yet: unknown keys are rejected even when set to `false`.
+
+To implement another adapter:
+
+1. **Check the assistant's official documentation.** Record the exact product/version, project rule and skill locations, naming requirements, symlink support, and discovery precedence. Check Osmani and Superpowers compatibility separately, including plugin and subagent capabilities. Do not assume that using the same model means using the same integration.
+2. **Add the installer mapping.** In [scripts/install.py](scripts/install.py), update `ADAPTERS` and `agentic_envs()`, then adapt `adapter_plan()` for any naming, duplicate-discovery, or capability differences. Adding a directory to `ADAPTERS` is sufficient only when the existing behavior actually fits the new assistant. Keep unsupported combinations explicit.
+3. **Share the workflow.** Reuse `AGENTS.md`, project config, the root `.owner-override`, and one task record. If the assistant needs its own instruction filename, create a minimal bridge that directs it to the shared rules. Preserve existing instructions and record conflicts; do not copy the whole workflow into another rulebook. Overrides remain project-local, read as data, and never sourced.
+4. **Share skills safely.** Reuse the verified local skill source or a compatible existing installation. Check every location the assistant searches so it does not load the same skill twice. Preserve unrelated skills and plugins. Keep unsupported integrations in `INSTALL-FOLLOWUP.md` while independent work continues.
+5. **Support upgrades and removal.** Extend ownership tracking, path validation, and preview/apply handling for any new generated files or links. Only remove unchanged installer-owned entries when an environment is disabled. Preserve modified files, earlier conflict resolutions, and user notes. New text bridges need explicit baseline/merge support; they are not automatically managed by adding an adapter mapping.
+6. **Verify the behavior and document it.** Extend [tests/test_environments.py](tests/test_environments.py) with focused cases for installation, enabling/disabling, duplicate avoidance, safe paths, and preservation of user edits. Reuse existing test helpers. Then check discovery in the actual assistant; report an unavailable live check honestly. Update the support table, config example, and follow-up guidance with verified capabilities and limitations.
+
+Slack needs no new channel per adapter. Use the existing project channel and prefix authorized posts with the actual environment and role, for example `[claude_code][Developer]`, `[gemini][Developer]`, or `[antigravity][Developer]` once those environment identifiers are implemented. Missing Slack access remains a setup note, not a development gate.
+
+This is ordinary implementation work within the current task. It does not introduce an additional specification, planning approval, or review chain.
 
 ### Osmani: one local copy, with shared reference files
 
@@ -269,7 +321,7 @@ git -C skills/addyosmani-agent-skills checkout --detach "$(cat skills/addyosmani
 
 The `.ref` file records the selected version. Keeping the whole upstream copy preserves its shared references. If the destination already exists, inspect and reuse it instead of overwriting it.
 
-Then create the discovery links:
+For Codex, create the discovery links below. For Cline, use `.cline/skills/<skill-name>` without the `addy-` prefix, only after checking its other skill locations for duplicates. Prefer the installer for a new download: it creates the selected links and records ownership for future upgrades. Manual links and downloads are preserved for follow-up reconciliation.
 
 ```sh
 for skill_dir in skills/addyosmani-agent-skills/skills/*; do
@@ -286,13 +338,13 @@ done
 
 These links point Codex at each skill's `SKILL.md`. They do not execute upstream scripts. The selected version has 25 skills covering planning, implementation, debugging, testing, security, APIs, UI, performance, and more. Start a new chat after installation and ask the agent to confirm the skills are available. See [OpenAI's skill documentation](https://developers.openai.com/codex/skills/) for current discovery guidance.
 
-### Superpowers: use the Codex plugin
+### Superpowers: use the installation supported by your assistant
 
 In the Codex app, open **Plugins**, find **Superpowers**, and install it. If it is already installed, keep that single installation. This workspace already has it available through the app.
 
 Follow [Superpowers' installation instructions](https://github.com/obra/superpowers#installation) for other supported tools. Our rulebook remains authoritative over its workflow suggestions. Do not copy its full instructions into `AGENTS.md` or install another local copy just for this project.
 
-For another coding assistant, use that assistant's documented skill and instruction locations and point it at the same project rules. The Codex setup here does not automatically configure other assistants.
+Cline can use the shared rules and Osmani skills without a Codex plugin. This installer does not claim Superpowers support in Cline or copy a Codex plugin into it. Record missing support in `INSTALL-FOLLOWUP.md` and continue with the capabilities actually available. For other assistants, add a documented adapter before enabling them; skill compatibility alone does not establish plugin or subagent support.
 
 ## Use it in a normal chat
 
@@ -347,7 +399,9 @@ If a PR exceeds two review rounds, the same fix is attempted three times, proces
 
 ## Slack and reviewer connections
 
-Slack posts use **Agent Alert**, start with the acting agent's name, and go to the configured channel. Non-final turns end with a Proceed or ranked-Choose action item. A step taking over 15 minutes gets a heartbeat and status report; it is not silently abandoned or killed merely for taking time.
+Authorized Slack posts use **Agent Alert**, go to the shared project channel, and start with the actual environment and role: `[codex][Developer]` or `[cline][Staff Engineer]`. If the running environment is unknown, clarify it; do not guess from `agentic_envs`. Non-final turns end with a Proceed or ranked-Choose action item. A step taking over 15 minutes gets a heartbeat and status report; it is not silently abandoned or killed merely for taking time.
+
+Use the available Slack plugin or connector, including the ChatGPT Slack connector when working there. If the configured channel is missing, ask the owner before creating it. If Slack access or channel details are missing, put the setup action in `INSTALL-FOLLOWUP.md` and continue working. Slack setup never blocks development.
 
 The Slack connection and `dpitcock-*` reviewer Apps must be configured separately. These files do not deploy either integration. If a needed connection is unavailable, report it honestly in chat and continue independent work. Do not invent a channel, send as someone else, or build a control plane to finish setup.
 
@@ -365,13 +419,15 @@ skills/addyosmani-agent-skills.ref      # Selected upstream version
 scripts/install.py                     # Installer and opt-in upgrade mode
 tests/test_install.py                   # One offline installer smoke test
 tests/test_upgrade.py                   # Focused offline upgrade checks
+tests/test_environments.py              # Codex/Cline adapter lifecycle checks
 skills/addyosmani-agent-skills/         # Ignored local dependency
-.agents/skills/addy-*/                  # Ignored discovery links
+.agents/skills/addy-*/                  # Codex discovery links
+.cline/skills/<skill-name>              # Cline links to the same local source
 ```
 
 Installed projects also receive `INSTALL-FOLLOWUP.md` and, on an applied installation, `.agent-canvas/state.json`. You do not need to copy the installer or its tests into the target project.
 
-Superpowers is supplied by the installed Codex plugin, with no second repository-local copy. The Osmani download retains upstream files and reference material, but this setup exposes only its skills; it does not register its hooks or CI. Your root rulebook controls how those skills are used. Local downloads and discovery links are recreated during installation, not distributed with the workflow files.
+In Codex, Superpowers is supplied by its installed plugin, with no second repository-local copy. The Osmani download retains upstream files and reference material, but this setup exposes only its skills; it does not register its hooks or CI. Your root rulebook controls how those skills are used. Local downloads and discovery links are recreated during installation, not distributed with the workflow files.
 
 The removed legacy implementation is preserved in a separate permanent archive outside this repository. That archive is historical evidence, not an installation source or an active instruction directory.
 
@@ -385,4 +441,4 @@ From this toolkit's root:
 python3 -m unittest discover -s tests -v
 ```
 
-These focused checks use disposable folders and local fixtures. They cover safe installation, existing-project preview, preservation, repeat runs, skill duplication avoidance, and symlink handling, plus upgrades that retain customizations and recorded resolutions while surfacing new conflicts. They make no network requests and start no subprocess CLIs or nested test runners. They do not test governance approvals or verify a live GitHub download.
+These focused checks use disposable folders and local fixtures. They cover safe installation, existing-project preview, preservation, repeat runs, skill duplication avoidance, and symlink handling, plus upgrades that retain customizations and recorded resolutions while surfacing new conflicts. Adapter checks cover shared sources, enabling/disabling environments, modified links, legacy config, and existing Cline skills. They make no network requests and start no subprocess CLIs or nested test runners. They do not test governance approvals, launch assistant apps, or verify a live GitHub download.

@@ -3,7 +3,8 @@
 ## Authority and scope
 - Use `config/workspace-config.yml`; `POSTMORTEM.txt` and any external legacy archive are historical evidence, not instructions.
 - These rules take precedence over upstream skills, plugins, and repository instructions; Owner Override takes precedence over these rules. Skills must not add unrequested specs, plan reviews, or approval loops.
-- Hybrid: use Osmani for outcome-based planning and vertical slices, and the installed Superpowers plugin for focused fresh-context delegation; add detailed interfaces/test assertions only when a handoff needs them. Load only relevant skills; Osmani source and shared references live in `skills/addyosmani-agent-skills/`, discovered via `.agents/skills/addy-*`.
+- Hybrid: use Osmani for outcome-based planning and vertical slices, and Superpowers where supported for focused fresh-context delegation; add detailed interfaces/test assertions only when a handoff needs them. Load only relevant skills; one Osmani source with shared references lives in `skills/addyosmani-agent-skills/`. Codex discovers it via `.agents/skills/addy-*`; Cline via `.cline/skills/<skill-name>`.
+- `agentic_envs` selects project integrations, not the current speaker. Codex and Cline share this rulebook and task record. Use the actual running environment's supported tools; never claim a plugin or delegation capability is available merely because another environment has it. Record missing integrations in `INSTALL-FOLLOWUP.md` and continue independent work.
 - Do work once: maintain one canonical plan/task record for the active scope, using the existing task description for routine work; both frameworks and all subagents use it. Give each task one implementation owner, check existing progress before dispatch, and never recreate completed tasks, duplicate plans, or add framework-specific ledgers or reports.
 - Choose one technique for each activity, not two complete workflows. Reuse valid verification evidence and PR reviews; rerun only for relevant changes, failures, unresolved concerns, or an explicit request—not a framework switch. Your environment-based reviews, PR-only triggers, and focused-test rules govern both; ask Dennis only about material conflicts these rules do not resolve.
 - Never apply this governance to its own construction or repair: no reviewers, approvals, or readiness gates.
@@ -43,7 +44,8 @@
 - If a step exceeds 15 minutes, post a heartbeat and report its status; never wait silently or kill it merely for elapsed time.
 
 ## Communication
-- Send Slack posts as Agent Alert, prefixed with the acting agent, to `slack_channel_name`; never infer a missing channel.
+- Use one environment-neutral project Slack channel named by `slack_channel_name`. Send authorized posts as Agent Alert through the available Slack plugin or connector, prefixed with `[agentic_env][role]`, such as `[codex][Developer]` or `[cline][Staff Engineer]`. Identify the actual running environment; clarify if unknown, never infer it from the enabled-environments list.
+- Never guess a channel. If the configured channel is missing, ask the owner before creating it. If Slack access or channel details are unavailable, record the setup action in `INSTALL-FOLLOWUP.md` and continue independent work. Configuration changes do not create or rename channels; Slack setup never blocks development.
 - End each turn with one Proceed or ranked-Choose action item, except the final completed turn.
 - Do not build a Slack control plane.
 
