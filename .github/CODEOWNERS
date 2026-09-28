@@ -1,0 +1,13 @@
+# Ownership routing only; review requirements live in AGENTS.md.
+# GitHub Apps are reviewers, not CODEOWNERS user/team identities.
+# Authoring: documentation and internal work default to the repository owner.
+* @dpitcock
+
+# Shipped: the selected skill version used by fresh installations.
+/skills/addyosmani-agent-skills.ref @dpitcock
+# Add explicit shipped-path entries when introducing new distributed code.
+
+# Governance repair is authoring; ownership never gates Dennis's edits.
+/AGENTS.md @dpitcock
+/config/workspace-config.yml @dpitcock
+/.github/CODEOWNERS @dpitcock

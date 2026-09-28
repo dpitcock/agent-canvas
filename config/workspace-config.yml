@@ -1,0 +1,9 @@
+workspace: agent-canvas
+# Applies to production PRs; local authoring requires no reviewers.
+approvals_required:
+  code_reviewer: true
+  appsec: true
+  qa: true
+target_environment: local
+repo_role: toolkit-authoring
+slack_channel_name: ws-agent-canvas-codex

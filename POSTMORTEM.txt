@@ -1,0 +1,44 @@
+POSTMORTEM: TOOLKIT GOVERNANCE OVERHEAD
+
+Scope: Sampled sanitized source and contemporaneous records; executed no repository code. No usable archive path was supplied. Historical SHAs below are quoted from records, not independently verified. Commit/PR totals, growth over time, actual token consumption, and current hosted enforcement cannot be established without history or telemetry. Missing CI and renamed Markdown are sanitization artifacts, not defects.
+
+1. ROOT CAUSES (ranked)
+
+1) Self-application exceeded the stated delivery risk.
+project/EPIC-006-personal-use-checkpoint.txt records “personal use on this Mac” and “not a public production package,” yet preserves canonical release gates and independent Principal, QA, and AppSec checkpoint approvals. policy/review-paths.json classifies the toolkit's policy, enforcement scripts, templates, dependencies, and core documentation as production paths. docs/superpowers/specs/2026-09-27-single-maintainer-authoring-design.txt provides a narrower authoring exception but retains exact-head independent review. The lighter route therefore did not cover much of the toolkit's own implementation.
+
+2) Immutable governance dependencies created a documented recovery deadlock.
+docs/superpowers/specs/2026-09-27-epic-006-recovery-design.txt explicitly calls this a “bootstrap deadlock”: root validation prevents repairing invalid root configuration; an active predecessor blocks successor admission; revising its plan invalidates assessment and completed-task bindings. Recovery itself requires staged trusted-validator installation, host-admin authorization, and fresh Principal/QA/AppSec reviews. Fixing governance depended on satisfying governance that could not advance normally.
+
+3) Planning and pre-PR approvals multiplied work and invalidation.
+docs/gates.txt requires Principal project approval, QA epic approval, and Principal plus conditional specialist plan approval. AGENTS.txt says “Do not open even a draft PR before both final reviews pass.” Implementation changes require renewed staff and AppSec reviews. project/EPIC-006-plan-reviews.txt records corrections and separate Principal, QA, and AppSec reviews of plan revision 2. These are actual planning reviews, beyond PR review. Counterevidence matters: AGENTS.txt excludes staff approval at task completion; tests/review-scheduling.test.mjs verifies pushes never dispatch reviewers and duplicate readiness produces one claim. Blanket per-commit review triggering is not supported by this snapshot.
+
+4) Expensive governance tests generated their own repair workload.
+tests/epic-policy-adoption.test.mjs launches nested Node test runners from two historical checkout states; tests/scaffold.test.mjs invokes subprocess CLIs and Git fixtures. The 29 top-level test files contain 5,762 lines, extensively covering policy, review, authorization, and lifecycle machinery. Size alone is not proof of waste. Stronger evidence: project/EPIC-006-readiness-correction.txt records 66 scoped tests totaling approximately 42 minutes, tied to source 70d21cbaedce52889e2d1cf8659670fd92fb5ef5. project/EPIC-006-test-transport-correction.txt records 30-second executable-startup timeouts, stalled runners, an incomplete batch, and a separate transport repair effort.
+
+5) Recovery and verification became a substantial parallel deliverable.
+The project directory contains separate readiness, bootstrap, policy-adoption, lifecycle, dispatch, QA-routing, QA-materialization, QA-completion, and transport correction records. The recovery design adds another controller before supersession can start. These concrete artifacts document repeated process repair, although the original governance-first priority was owner-authorized (project/EPIC-006-plan-reviews.txt); not all governance work was unsolicited scope drift.
+
+Platform evidence: scripts/check-host-reviews.mjs performs paginated review/check/workflow reads, repeated PR-head checks, open-PR enumeration, and status posting. This establishes API-heavy machinery, not observed quota exhaustion or bot counts. docs/slack-control-plane.txt describes an optional integration that “does not deploy a Slack app”; deployed notification overhead is unproven.
+
+2. WHAT WASTED THE MOST TOKENS
+
+Best qualitative estimate: repeated planning/review, evidence rewriting, and recovery design consumed the largest share, followed by diagnosis and reruns of subprocess-heavy governance tests. Multiple independent roles reconsidered revised artifacts while head/revision changes invalidated earlier evidence. Test elapsed time supports operational cost, not a numerical token estimate. No percentage is defensible from this snapshot.
+
+3. KEEP
+
+- Preserve user scope and explicit authorization boundaries.
+- Never fabricate approvals, test results, or completion claims.
+- Protect secrets and isolate untrusted inputs.
+- Run focused tests for changed behavior.
+- Review material shipped policy changes once at the PR boundary.
+- Record unresolved failures briefly and accurately.
+- Keep adopter policy versioned and reproducible.
+
+4. DROP
+
+Mandatory role chains for routine toolkit work; pre-PR approval barriers; immutable task assessments and evidence-only commits; approval resets for harmless documentation edits; recovery controllers that require further recovery authorization; exhaustive lifecycle matrices on every increment; notification control-plane expansion without demonstrated need.
+
+5. FRESH-START RULES
+
+Separate maintainer workflow from shipped adopter enforcement. Toolkit development uses one short task description, direct implementation, focused verification, and one PR review where warranted. Planning and minor documentation edits need no specialist signoff. Strict adopter gates remain an explicit, versioned product feature, tested with compact fixtures and a small release integration suite. Escalate only concrete security-sensitive changes. Allow the owner to revise or abandon internal plans without replaying historical approvals. Stop when the requested deliverable and relevant checks are complete.
