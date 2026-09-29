@@ -129,6 +129,8 @@ Open the target project in Codex or Cline, open `INSTALL-FOLLOWUP.md`, and paste
 
 The installer checks local agent instructions, skill files, rule files, and standard user skill directories. It cannot discover every app-managed plugin or understand conflicting prose. Existing skills therefore defer automatic skill downloads—even if their folder names differ. Use the follow-up to decide whether anything is actually missing. An existing follow-up file is preserved, including your edits and completed resolutions; the agent rescans live files when using it.
 
+The installation and upgrade follow-up prompts also direct the agent to inspect the target project's existing GitHub CI, external checks, and branch protections/rulesets, recording findings or access gaps in `INSTALL-FOLLOWUP.md`. The installer itself does not query GitHub, create CI, or change GitHub settings. Installed agents must wait for all pending CI checks before merging, including checks GitHub treats as optional.
+
 ### Installer options
 
 | Option | Meaning |
