@@ -39,6 +39,8 @@ class InstallSmoke(unittest.TestCase):
             self.assertEqual((fresh / ".owner-override.example").read_bytes(),
                              (installer.SOURCE / ".owner-override.example").read_bytes())
             self.assertFalse((fresh / ".owner-override").exists())
+            self.assertEqual((fresh / "agents/review-coordinator.md").read_bytes(),
+                             (installer.SOURCE / "agents/review-coordinator.md").read_bytes())
             self.assertIn("Prompt to run", (fresh / "INSTALL-FOLLOWUP.md").read_text())
             before = {p.relative_to(fresh): p.read_bytes() for p in fresh.rglob("*") if p.is_file()}
             installer.install(fresh, apply=True, skills=True, home=home, downloader=local_pack)
@@ -98,7 +100,7 @@ class InstallSmoke(unittest.TestCase):
             # Installing another project must not inherit an override from the
             # source toolkit, a sibling project, a parent, the home, or the env.
             source = base / "toolkit-source"
-            for name in ("AGENTS.md", ".owner-override.example", "skills/addyosmani-agent-skills.ref", "config/workspace-config.yml"):
+            for name in installer.MANAGED:
                 destination = source / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes((installer.SOURCE / name).read_bytes())

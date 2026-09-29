@@ -64,7 +64,7 @@ A **project** is the whole goal. A **phase** is a big stage. An **epic** is a us
 
 For smaller projects, skip phases: **Project → Epic → Task**. Routine fixes may need only a short task description. Detail only the current phase, or current epic when there are no phases. Expand future work when you reach it. Finishing one phase does not create another approval gate.
 
-Each active epic says what must work, what checks will prove it, and what must be true before merging. Principal approval happens once at the PR for planned delivery; Principal returns only for exceptions. QA checks the PR's declared test evidence, not the planning process. Routine authoring needs no formal plan or Principal review.
+Each active epic says what must work, what checks will prove it, and what must be true before merging. There are no planning approvals. The PR review coordinator selects relevant reviewers; QA, when selected, checks the declared behavior and test evidence.
 
 ## How much review?
 
@@ -72,9 +72,9 @@ First consider scope and risk: Tier 1 is small and low risk; Tier 2 is bounded b
 
 | Target environment | Normal review expectation |
 | --- | --- |
-| `local` — your machine | Direct commits; no reviewers. |
-| `dev` — development environment | Code Reviewer only. |
-| `production` — live use | The roles in the project's `approvals_required`. |
+| `local` — your machine | Direct commits without a PR need no reviewers; PRs need one approval. |
+| `dev` — development environment | One approval from a coordinator-selected reviewer. |
+| `production` — live use | One approval; coordinator selects coverage based on risk. |
 
 Authentication, secrets, database schema, payments, and user data raise the work to Tier 3 even locally. Bring relevant expertise to the PR. You can always open a PR before approval.
 
@@ -86,7 +86,9 @@ Every code review skill, including Osmani and Superpowers, adds inline comments 
 
 The developer owns follow-up: read outstanding comments from all review rounds on the PR, verify and fix valid findings, reply in the original threads with commit/test evidence, and resolve addressed threads using the developer's identity. Already-fixed findings can be resolved with evidence; disputed or unfinished findings stay open with an explanation. This also governs Superpowers' receiving-code-review skill. Resolving a thread does not supply reviewer approval.
 
-**This toolkit repository has one exception:** Staff Engineer is the sole PR reviewer for both authoring and shipped changes. Do not add Principal, Code Reviewer, AppSec, or QA approvals to this repository. This exception lives in the toolkit-specific `AGENTS.md` lanes, which the installer replaces for `--repo-role application` (the default). Installed application projects retain the environment/risk review rules above and their own `approvals_required`; updates preserve their project settings.
+The developer dispatches a separate [PR review coordinator](agents/review-coordinator.md) on the existing review events. It selects one lead (Code Reviewer, Staff, AppSec, or QA) based on the diff's dominant risk, adding specialists only for distinct material concerns. Exposed ports can require AppSec; complex integration tests can require QA. This policy applies equally to this toolkit and installed projects.
+
+Only **one approval total** is required, from any selected reviewer App. Every requested review must finish, with no outstanding request for changes or unresolved blocking findings, before merging. The coordinator selects and delegates; fresh reviewer agents inspect the work and publish verdicts through their Apps; the developer fixes findings and merges after CI completes. One approval cannot override another reviewer's objection. Governance repair remains exempt.
 
 For this toolkit, internal docs, tests, scripts, and tooling use the light **authoring lane**. Templates, adopter policy, distributed bootstrap, and CI configuration use the **shipped lane**: versioned changes reviewed at the PR. A bootstrap script shipped to others stays shipped even if it lives in `scripts/`.
 
@@ -260,11 +262,8 @@ agentic_envs:
   codex: true
   cline: true
   claude_code: false # Reserved; adapter not yet implemented.
-# Applies to production PRs; local authoring requires no reviewers.
-approvals_required:
-  code_reviewer: true
-  appsec: true
-  qa: true
+# One approval per PR; coordinator selects the relevant reviewer(s).
+approvals_required: 1
 target_environment: local
 repo_role: toolkit-authoring
 slack_channel_name: ws-agent-canvas
@@ -272,12 +271,12 @@ slack_channel_name: ws-agent-canvas
 
 - **workspace:** your project name.
 - **agentic_envs:** assistants to configure for this project. This package supports Codex and Cline; `claude_code: false` reserves a future adapter. The list does not identify the assistant currently speaking.
-- **approvals_required:** roles required for production PRs. AppSec checks security; QA checks that the declared behavior and evidence hold up. This list does not require them for ordinary local work.
+- **approvals_required:** `1` approval per PR from any coordinator-selected reviewer App. Specialist coverage does not add approval quotas. Existing role maps require reconciliation during upgrade; the installer preserves project customizations.
 - **target_environment:** `local`, `dev`, or `production`, based on the intended use of the change—not merely where the agent runs.
 - **repo_role:** `toolkit-authoring` describes this repository. For an application, use a descriptive value such as `application` and adapt the toolkit-specific lane wording in `AGENTS.md` to your product. This is agent-readable configuration, not a new validated schema.
 - **slack_channel_name:** one project channel shared by all assistants, such as `ws-my-project`. Leave it empty if unknown. Each authorized post identifies its actual environment and role. Existing channel values are preserved; editing this setting does not create or rename a Slack channel.
 
-The copied rulebook names Dennis as owner and `dpitcock-*` Apps as reviewers. Keep those for Dennis's projects, or replace them with your actual owner and review arrangement. Required roles must have real reviewers when you reach that PR; do not invent approvals. Local work does not wait for that setup.
+The copied rulebook names Dennis as owner and `dpitcock-*` Apps as reviewers. Keep those for Dennis's projects, or replace them with your actual owner and review arrangement. Selected roles must have real reviewers when you reach that PR; do not invent approvals. Local work does not wait for that setup.
 
 ## Install the skills
 
@@ -439,14 +438,14 @@ text(ALL_TOOLS.filter(tool => /gh[_-]identity|review_as_app/i.test(tool.name + "
 
 Use the discovered `gh_identity_review_as_app` tool to submit the fresh reviewer's verdict. It takes `repo` (`owner/repo`), `pr_number`, `app_role`, `verdict` (`approve` or `request_changes`), and an optional review `body`. The tool authenticates the submission as the selected App; it does **not** inspect the PR, run tests, or create an independent review. Those findings must already come from the reviewer context. No token retrieval or Git identity change is needed to submit through this tool.
 
-| Required reviewer | `app_role` |
+| Selected reviewer | `app_role` |
 | --- | --- |
 | Staff Engineer | `staff` |
 | Code Reviewer | `reviewer` |
 | AppSec | `appsec` |
 | QA | `qa` |
 
-Use only the roles required by the current project's rules. This toolkit uses **`staff` only**; installed application projects use their own environment/risk rules. Finding additional App identities does not add review requirements. If discovery finds no tool, report that discovery result; if a call fails, report its actual error. Record missing setup in `INSTALL-FOLLOWUP.md` and continue independent work.
+Use only coordinator-selected roles. Finding additional App identities does not add review requirements. The coordinator prompt is installed and upgraded as a managed file, and AGENTS.md directs the developer to dispatch it with the available subagent tools; no plugin registration or background service is needed. If discovery finds no tool, report that discovery result; if a call fails, report its actual error. Record missing setup in `INSTALL-FOLLOWUP.md` and continue independent work.
 
 ## Clean install layout
 
@@ -456,6 +455,7 @@ AGENTS.md                              # Your workflow and overrides
 README.md                              # Setup and usage
 POSTMORTEM.txt                         # Historical explanation only
 config/workspace-config.yml            # Project settings
+agents/review-coordinator.md            # PR reviewer selection and delegation
 .github/CODEOWNERS                     # Ownership example
 .gitignore                            # Local installation exclusions
 skills/addyosmani-agent-skills.ref      # Selected upstream version
