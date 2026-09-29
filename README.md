@@ -419,6 +419,27 @@ Use the available Slack plugin or connector, including the ChatGPT Slack connect
 
 The Slack connection and `dpitcock-*` reviewer Apps must be configured separately. These files do not deploy either integration. If a needed connection is unavailable, report it honestly in chat and continue independent work. Do not invent a channel, send as someone else, or build a control plane to finish setup.
 
+### Finding and using the reviewer tool
+
+The reviewer connection is the **`gh_identity` / `gh-identity` MCP server**. Its tools may be deferred: available to discover and call, even though they are absent from the assistant's initial tool list. Before reporting that reviewer access is missing, search the running environment's tool registry for `gh_identity`, `gh-identity`, or `review_as_app`. A GitHub CLI session authenticated as the PR author says nothing about this separate MCP connection.
+
+In Codex sessions that expose `functions.exec` and `ALL_TOOLS`, discover the callable name and declaration with:
+
+```js
+text(ALL_TOOLS.filter(tool => /gh[_-]identity|review_as_app/i.test(tool.name + " " + tool.description)));
+```
+
+Use the discovered `gh_identity_review_as_app` tool to submit the fresh reviewer's verdict. It takes `repo` (`owner/repo`), `pr_number`, `app_role`, `verdict` (`approve` or `request_changes`), and an optional review `body`. The tool authenticates the submission as the selected App; it does **not** inspect the PR, run tests, or create an independent review. Those findings must already come from the reviewer context. No token retrieval or Git identity change is needed to submit through this tool.
+
+| Required reviewer | `app_role` |
+| --- | --- |
+| Staff Engineer | `staff` |
+| Code Reviewer | `reviewer` |
+| AppSec | `appsec` |
+| QA | `qa` |
+
+Use only the roles required by the current project's rules. This toolkit uses **`staff` only**; installed application projects use their own environment/risk rules. Finding additional App identities does not add review requirements. If discovery finds no tool, report that discovery result; if a call fails, report its actual error. Record missing setup in `INSTALL-FOLLOWUP.md` and continue independent work.
+
 ## Clean install layout
 
 ```text

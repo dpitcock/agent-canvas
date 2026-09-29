@@ -40,6 +40,8 @@
 - Reviews attach only to PR opened, marked ready, or explicit re-request events; never commits or task completion.
 - Do not duplicate a review for an unchanged PR merely because it was marked ready.
 - Reviewers are the `dpitcock-*` GitHub Apps, operating in fresh read-only contexts and returning verdicts; the developer merges.
+- Discover the configured `gh_identity` / `gh-identity` MCP tools before declaring reviewer access unavailable. Search the running environment's tool registry, including deferred tools, by server name and `review_as_app`; the initial tool list and `gh auth status` do not establish MCP availability. In Codex with `functions.exec`, inspect `ALL_TOOLS` for matching names/descriptions and use the returned declaration.
+- `gh_identity_review_as_app` submits an existing review verdict as a selected GitHub App; it does not perform the review or create an independent reviewer context. Use the fresh reviewer's actual verdict and findings, with `repo`, `pr_number`, `app_role`, `verdict` (`approve` or `request_changes`), and optional `body`. Staff Engineer maps to `staff`, Code Reviewer to `reviewer`, AppSec to `appsec`, and QA to `qa`; select only roles required by this project's rules. Prefer this tool over personal-account CLI approval or retrieving tokens. If discovery or submission fails, report the specific limitation, record needed setup in `INSTALL-FOLLOWUP.md`, and continue independent work without inventing approvals.
 - Run focused tests of changed behavior, without nested test runners; do not test governance machinery for its own sake.
 - If a step exceeds 15 minutes, post a heartbeat and report its status; never wait silently or kill it merely for elapsed time.
 
