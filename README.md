@@ -426,6 +426,8 @@ Use the available Slack plugin or connector, including the ChatGPT Slack connect
 
 The Slack connection and `dpitcock-*` reviewer Apps must be configured separately. These files do not deploy either integration. If a needed connection is unavailable, report it honestly in chat and continue independent work. Do not invent a channel, send as someone else, or build a control plane to finish setup.
 
+Reviewers finish a complete pass through their assigned scope before publishing: they inspect the whole relevant diff and context and report every supported finding, rather than stopping at the first blocker. When fixes change the PR head, the affected reviewer re-reviews the fix and surrounding affected scope for remaining or newly introduced issues; it does not only confirm that its original comment was addressed.
+
 ### Finding and using the reviewer tool
 
 The reviewer connection is the **`gh_identity` / `gh-identity` MCP server**. Its tools may be deferred: available to discover and call, even though they are absent from the assistant's initial tool list. Before reporting that reviewer access is missing, search the running environment's tool registry for `gh_identity`, `gh-identity`, or `review_as_app`. A GitHub CLI session authenticated as the PR author says nothing about this separate MCP connection.
