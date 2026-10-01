@@ -11,6 +11,14 @@ spec = importlib.util.spec_from_file_location("installer", Path(__file__).resolv
 installer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(installer)
 
+uninstall_spec = importlib.util.spec_from_file_location("uninstaller", Path(__file__).resolve().parents[1] / "scripts/uninstall.py")
+uninstaller = importlib.util.module_from_spec(uninstall_spec)
+uninstall_spec.loader.exec_module(uninstaller)
+
+nuke_spec = importlib.util.spec_from_file_location("agent_nuke", Path(__file__).resolve().parents[1] / "scripts/agent-nuke.py")
+agent_nuke = importlib.util.module_from_spec(nuke_spec)
+nuke_spec.loader.exec_module(agent_nuke)
+
 
 class InstallSmoke(unittest.TestCase):
     def test_new_existing_repeated_and_conflicting_installations(self):
@@ -130,6 +138,61 @@ class InstallSmoke(unittest.TestCase):
             self.assertEqual(snapshot(isolated), baseline_files)
             self.assertFalse((isolated / ".owner-override").exists())
             self.assertEqual((existing / ".owner-override").read_bytes(), original[Path(".owner-override")])
+
+    def test_uninstall_can_force_remove_or_preserve_modified_shared_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            home = base / "empty-home"
+
+            def local_pack(destination, revision):
+                skill = destination / "skills/example"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("example")
+
+            preserved = base / "preserved"
+            installer.install(preserved, skills=True, home=home, downloader=local_pack)
+            (preserved / "AGENTS.md").write_text("Project additions\n")
+            (preserved / ".gitignore").write_text("app-cache\n" + (preserved / ".gitignore").read_text())
+            active, actions = uninstaller.uninstall(preserved, mode="preserve")
+            self.assertFalse(active)
+            self.assertTrue(any(action.startswith("WOULD REMOVE") for action in actions))
+            uninstaller.uninstall(preserved, mode="preserve", apply=True)
+            self.assertEqual((preserved / "AGENTS.md").read_text(), "Project additions\n")
+            self.assertEqual((preserved / ".gitignore").read_text(), "app-cache\n")
+            self.assertFalse((preserved / ".agent-canvas").exists())
+            self.assertFalse((preserved / "skills/addyosmani-agent-skills").exists())
+
+            forced = base / "forced"
+            installer.install(forced, skills=False, home=home)
+            (forced / "AGENTS.md").write_text("Modified package rules\n")
+            uninstaller.uninstall(forced, mode="remove-all", apply=True)
+            self.assertFalse((forced / "AGENTS.md").exists())
+            self.assertFalse((forced / "config/workspace-config.yml").exists())
+            self.assertFalse((forced / "INSTALL-FOLLOWUP.md").exists())
+
+    def test_agent_nuke_preserves_plans_but_removes_agent_workflow_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            (root / "plans/current").mkdir(parents=True)
+            (root / "plans/current/implementation-plan.md").write_text("keep")
+            (root / "docs/superpowers/specs").mkdir(parents=True)
+            (root / "docs/superpowers/specs/design.md").write_text("keep")
+            (root / ".agents/skills/example").mkdir(parents=True)
+            (root / ".agents/skills/example/SKILL.md").write_text("remove")
+            (root / "agents").mkdir()
+            (root / "agents/review.md").write_text("remove")
+            (root / ".github/workflows").mkdir(parents=True)
+            (root / ".github/workflows/ci.yml").write_text("remove")
+            (root / "AGENTS.md").write_text("remove")
+            (root / "app.py").write_text("keep")
+            agent_nuke.nuke(root, apply=True)
+            self.assertTrue((root / "plans/current/implementation-plan.md").is_file())
+            self.assertTrue((root / "docs/superpowers/specs/design.md").is_file())
+            self.assertFalse((root / ".agents").exists())
+            self.assertFalse((root / "agents").exists())
+            self.assertFalse((root / ".github").exists())
+            self.assertFalse((root / "AGENTS.md").exists())
+            self.assertEqual((root / "app.py").read_text(), "keep")
 
 
 if __name__ == "__main__":

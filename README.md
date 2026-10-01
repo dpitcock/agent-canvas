@@ -149,6 +149,40 @@ The installation and upgrade follow-up prompts also direct the agent to inspect 
 
 Options do not overwrite values in existing config files. The copied owner and reviewer wording still names Dennis and the `dpitcock-*` Apps; the follow-up asks you to confirm or adapt these.
 
+## Trial another agent framework or start over
+
+Agent Canvas is designed to be removable, so a project can trial another agent framework without rebuilding the application or its plans. Both removal tools show a preview first and make no changes until you add `--apply`.
+
+### Remove only Agent Canvas
+
+Use the official uninstaller when you want to remove this package and leave the rest of the project alone:
+
+```sh
+python3 scripts/uninstall.py /path/to/project
+python3 scripts/uninstall.py /path/to/project --apply
+```
+
+The default `preserve` mode removes only artifacts that the installation record can prove Agent Canvas created and which remain unchanged. It removes the package's own ignore entries and its marked follow-up section, while retaining project notes and files that may have existed before installation or were edited afterward.
+
+To deliberately remove every known Agent Canvas path, including edits to its managed files, use `remove-all`:
+
+```sh
+python3 scripts/uninstall.py /path/to/project --mode remove-all --apply
+```
+
+`remove-all` deletes the complete Agent Canvas follow-up file as well as managed settings, installed skill links/packs, and the installation record. It still does not touch application code, Git history, or unrelated project files.
+
+### Clear agent and governance setup: `agent-nuke`
+
+For a clean framework trial, use the broader reset tool:
+
+```sh
+python3 scripts/agent-nuke.py /path/to/project
+python3 scripts/agent-nuke.py /path/to/project --apply
+```
+
+`agent-nuke` clears common repository-level agent, skill, governance, and workflow locations—including agent instruction files, agent/configuration directories, workflow metadata, and Agent Canvas artifacts. It preserves normal application files and paths identified as plans, epics, tasks, or specs, including `plans/`, `epics/`, `tasks/`, and `docs/superpowers/specs/`. Review the preview carefully: this is intentionally broader than the official uninstaller and is meant to reset process setup between experiments.
+
 To include Osmani on a machine/project without an existing installation:
 
 ```sh
