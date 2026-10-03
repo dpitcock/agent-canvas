@@ -168,8 +168,23 @@ The installation and upgrade follow-up prompts also direct the agent to inspect 
 | `--repo-role application\|toolkit-authoring` | Defaults to `application`, adapting the copied lane rules for an app. |
 | `--slack-channel NAME` | Known channel for a new config; defaults to empty, never guessed. |
 | `--skills` | Also download pinned Osmani skills when no existing skills are detected. Check app plugins first. |
+| `--supervised` | Register the project with the opt-in host-owned continuation supervisor. This does not alter the Codex desktop app. |
+| `--supervisor-state-dir PATH` | Use an explicit host-state directory outside the project; requires `--supervised`. Defaults to `~/.agent-canvas-supervisor`. |
 
 Options do not overwrite values in existing config files. The copied owner and reviewer wording still names Dennis and the `dpitcock-*` Apps; the follow-up asks you to confirm or adapt these.
+
+### Opt in to host-supervised turns
+
+Use `--supervised` on an installation or an applied upgrade to register the target project in the supervisor's host-owned state directory:
+
+```sh
+python3 scripts/install.py /path/to/project --apply --supervised
+python3 scripts/install.py /path/to/project --upgrade --apply --supervised
+```
+
+The installer records that the project opted in, but that record is not completion authority. The supervisor's task state, evidence receipts, and append-only audit log remain outside the project. Its custom renderer can buffer `item/agentMessage/delta` content until it receives `turn/completed` and the host gate releases it. See [the supervised-mode design](docs/supervised-mode.md) for the runtime boundary, the POC test coverage, and its limitations.
+
+The default state path is `~/.agent-canvas-supervisor`; use `--supervisor-state-dir` when the host runs it under a separate service account or protected volume. The directory must be outside the target project. Uninstalling Agent Canvas intentionally preserves host audit state.
 
 ## Trial another agent framework or start over
 
