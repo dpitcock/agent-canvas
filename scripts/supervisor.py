@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
+import fcntl
 
 
 DEFAULT_PROHIBITED = ("push", "publish", "pr_create", "merge", "destructive", "credential_change",
@@ -28,6 +30,11 @@ def _digest(value):
 
 def _now():
     return time.time_ns()
+
+
+def _validate_task_id(task_id):
+    if not isinstance(task_id, str) or not task_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in task_id):
+        raise ValueError("task_id must contain only letters, digits, hyphen, and underscore")
 
 
 class HostSupervisor:
@@ -51,6 +58,7 @@ class HostSupervisor:
         return self._project_dir(project) / "registration.json"
 
     def _task_path(self, task_id, project=None):
+        _validate_task_id(task_id)
         if project is not None:
             path = self._project_dir(project) / "tasks" / f"{task_id}.json"
             if not path.is_file():
@@ -86,6 +94,18 @@ class HostSupervisor:
         project = Path(project).resolve()
         if not project.is_dir():
             raise ValueError("Supervised project must be an existing directory")
+        try:
+            self.root.relative_to(project)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Host state directory must be outside the supervised project workspace")
+        try:
+            project.relative_to(self.root)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Host state directory must be outside the supervised project workspace")
         registration = self._registration(project)
         if registration.exists():
             current = self._read(registration)
@@ -118,8 +138,7 @@ class HostSupervisor:
 
     def create_task(self, task_id, project, actions, *, validators=(), blockers=(), permitted_operations=("read", "write", "delegate")):
         registration = self.provision(project)
-        if not task_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in task_id):
-            raise ValueError("task_id must contain only letters, digits, hyphen, and underscore")
+        _validate_task_id(task_id)
         path = self._project_dir(project) / "tasks" / f"{task_id}.json"
         if path.exists():
             return self._read(path)
@@ -146,25 +165,37 @@ class HostSupervisor:
     def _save_task(self, task):
         self._write(self._task_path(task["task_id"], task["project"]), task)
 
+    @contextmanager
+    def _locked_task(self, task_id, project=None):
+        """Serialize read-modify-write task decisions across supervisor processes."""
+        path = self._task_path(task_id, project)
+        lock_path = path.with_name(path.name + ".lock")
+        with lock_path.open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield self._read(path)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
     def _remaining(self, task):
         return [(action_id, action) for action_id, action in task["actions"].items() if action["status"] != "complete"]
 
     def claim_action(self, task_id, action_id, attempt_id, *, project=None):
-        task = self.task(task_id, project=project)
-        if task["status"] != "active":
-            return Decision(task["status"])
-        action = task["actions"].get(action_id)
-        if not action:
-            raise ValueError(f"Unknown action: {action_id}")
-        if action["status"] == "complete":
-            return Decision("complete")
-        if action["status"] == "leased":
-            return Decision("reconcile", message="A prior side-effect dispatch requires reconciliation.")
-        action["status"] = "leased"
-        action["attempts"].append({"attempt_id": attempt_id, "at": _now(), "decision": "dispatch"})
-        self._save_task(task)
-        self._event(task_id, "action_dispatched", project=task["project"], action_id=action_id, attempt_id=attempt_id)
-        return Decision("dispatch")
+        with self._locked_task(task_id, project) as task:
+            if task["status"] != "active":
+                return Decision(task["status"])
+            action = task["actions"].get(action_id)
+            if not action:
+                raise ValueError(f"Unknown action: {action_id}")
+            if action["status"] == "complete":
+                return Decision("complete")
+            if action["status"] == "leased":
+                return Decision("reconcile", message="A prior side-effect dispatch requires reconciliation.")
+            action["status"] = "leased"
+            action["attempts"].append({"attempt_id": attempt_id, "at": _now(), "decision": "dispatch"})
+            self._save_task(task)
+            self._event(task_id, "action_dispatched", project=task["project"], action_id=action_id, attempt_id=attempt_id)
+            return Decision("dispatch")
 
     def reconcile_action(self, task_id, action_id, *, succeeded, receipt, project=None):
         task = self.task(task_id, project=project)
@@ -231,31 +262,31 @@ class HostSupervisor:
         return True
 
     def gate_final(self, task_id, attempt_id, content, *, project=None):
-        task = self.task(task_id, project=project)
-        self._event(task_id, "final_attempt", project=task["project"], attempt_id=attempt_id, content_digest=hashlib.sha256(content.encode()).hexdigest())
-        if task["status"] in {"paused", "cancelled"}:
-            return Decision(task["status"], message="Automatic continuation is disabled until an explicit resume.")
-        remaining = self._remaining(task)
-        if remaining:
-            action_id, action = remaining[0]
-            self._event(task_id, "continuation_queued", project=task["project"], action_id=action_id)
-            return Decision("continue", next_action={"id": action_id, **{k: v for k, v in action.items() if k not in {"attempts", "evidence", "status"}}})
-        if task["blockers"]:
-            blocker = task["blockers"][0]
-            message = blocker.get("owner_action", "Owner authorization is required.")
-            task["visible_messages"].append(message)
-            task["status"] = "blocked"
+        with self._locked_task(task_id, project) as task:
+            self._event(task_id, "final_attempt", project=task["project"], attempt_id=attempt_id, content_digest=hashlib.sha256(content.encode()).hexdigest())
+            if task["status"] in {"paused", "cancelled"}:
+                return Decision(task["status"], message="Automatic continuation is disabled until an explicit resume.")
+            remaining = self._remaining(task)
+            if remaining:
+                action_id, action = remaining[0]
+                self._event(task_id, "continuation_queued", project=task["project"], action_id=action_id)
+                return Decision("continue", next_action={"id": action_id, **{k: v for k, v in action.items() if k not in {"attempts", "evidence", "status"}}})
+            if task["blockers"]:
+                blocker = task["blockers"][0]
+                message = blocker.get("owner_action", "Owner authorization is required.")
+                task["visible_messages"].append(message)
+                task["status"] = "blocked"
+                self._save_task(task)
+                self._event(task_id, "blocker_delivered", project=task["project"], blocker_id=blocker.get("id"))
+                return Decision("blocker", release=True, message=message)
+            if not self._validate(task):
+                self._event(task_id, "continuation_queued", project=task["project"], reason="validator_failed")
+                return Decision("continue", message="Host validator failed; repair the reported action.")
+            task["visible_messages"].append(content)
+            task["status"] = "complete"
             self._save_task(task)
-            self._event(task_id, "blocker_delivered", project=task["project"], blocker_id=blocker.get("id"))
-            return Decision("blocker", release=True, message=message)
-        if not self._validate(task):
-            self._event(task_id, "continuation_queued", project=task["project"], reason="validator_failed")
-            return Decision("continue", message="Host validator failed; repair the reported action.")
-        task["visible_messages"].append(content)
-        task["status"] = "complete"
-        self._save_task(task)
-        self._event(task_id, "final_released", project=task["project"], attempt_id=attempt_id)
-        return Decision("complete", release=True, message=content)
+            self._event(task_id, "final_released", project=task["project"], attempt_id=attempt_id)
+            return Decision("complete", release=True, message=content)
 
     def visible_messages(self, task_id, *, project=None):
         return self.task(task_id, project=project)["visible_messages"]

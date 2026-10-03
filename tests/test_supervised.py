@@ -1,5 +1,6 @@
 """Host-supervised task tests; all state lives in temporary host directories."""
 import importlib.util
+import multiprocessing
 from pathlib import Path
 import sys
 import tempfile
@@ -16,6 +17,11 @@ def load(name):
 supervisor = load("supervisor")
 client = load("supervised_client")
 installer = load("install")
+
+
+def claim_from_process(state_dir, project, result):
+    host = supervisor.HostSupervisor(state_dir)
+    result.put(host.claim_action("task-1", "effect", "other-attempt", project=project).kind)
 
 
 class SupervisedTasks(unittest.TestCase):
@@ -166,6 +172,44 @@ class MultipleProjects(unittest.TestCase):
             host.create_task("task-1", beta, [{"id": "two", "operation": "write"}])
             with self.assertRaisesRegex(ValueError, "ambiguous"):
                 host.task("task-1")
+
+    def test_task_id_path_traversal_is_rejected_before_project_lookup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", project, [{"id": "one", "operation": "write"}])
+            with self.assertRaisesRegex(ValueError, "task_id"):
+                host.task("../task-1", project=project)
+
+    def test_host_state_inside_or_enclosing_workspace_is_rejected_by_supervisor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            with self.assertRaisesRegex(ValueError, "outside"):
+                supervisor.HostSupervisor(project / "host-state").provision(project)
+            with self.assertRaisesRegex(ValueError, "outside"):
+                supervisor.HostSupervisor(base).provision(project)
+
+    def test_interprocess_lease_lock_allows_only_one_side_effect_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", project, [{"id": "effect", "operation": "write", "side_effect": True}])
+            context = multiprocessing.get_context("fork")
+            result = context.Queue()
+            with host._locked_task("task-1", project) as task:
+                child = context.Process(target=claim_from_process, args=(base / "host-state", project, result))
+                child.start()
+                self.assertTrue(result.empty())
+            child.join(timeout=2)
+            self.assertEqual(child.exitcode, 0)
+            self.assertEqual(result.get(timeout=1), "dispatch")
+            self.assertEqual(host.claim_action("task-1", "effect", "later-attempt", project=project).kind, "reconcile")
 
 
 if __name__ == "__main__":
