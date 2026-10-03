@@ -198,35 +198,37 @@ class HostSupervisor:
             return Decision("dispatch")
 
     def reconcile_action(self, task_id, action_id, *, succeeded, receipt, project=None):
-        task = self.task(task_id, project=project)
-        action = task["actions"].get(action_id)
-        if not action or action["status"] != "leased":
-            raise ValueError("Only a leased action can be reconciled")
-        if succeeded:
-            action.update(status="complete", evidence=receipt)
-            event = "action_reconciled"
-        else:
-            action["status"] = "pending"
-            event = "retry_queued"
-        self._save_task(task)
-        self._event(task_id, event, project=task["project"], action_id=action_id, receipt=receipt)
+        with self._locked_task(task_id, project) as task:
+            action = task["actions"].get(action_id)
+            if not action or action["status"] != "leased":
+                raise ValueError("Only a leased action can be reconciled")
+            if succeeded:
+                action.update(status="complete", evidence=receipt)
+                event = "action_reconciled"
+            else:
+                action["status"] = "pending"
+                event = "retry_queued"
+            self._save_task(task)
+            self._event(task_id, event, project=task["project"], action_id=action_id, receipt=receipt)
 
     def complete_action(self, task_id, action_id, *, evidence, project=None):
-        task = self.task(task_id, project=project)
-        action = task["actions"].get(action_id)
-        if not action:
-            raise ValueError(f"Unknown action: {action_id}")
-        action.update(status="complete", evidence=evidence)
-        self._save_task(task)
-        self._event(task_id, "action_completed", project=task["project"], action_id=action_id, evidence=evidence)
+        with self._locked_task(task_id, project) as task:
+            action = task["actions"].get(action_id)
+            if not action:
+                raise ValueError(f"Unknown action: {action_id}")
+            action.update(status="complete", evidence=evidence)
+            self._save_task(task)
+            self._event(task_id, "action_completed", project=task["project"], action_id=action_id, evidence=evidence)
 
     def join_child(self, task_id, action_id, child_task_id, *, evidence, project=None):
-        task = self.task(task_id, project=project)
-        action = task["actions"].get(action_id)
-        if not action or action.get("child_task_id") != child_task_id:
-            raise ValueError("Child result is not bound to this parent action")
-        self.complete_action(task_id, action_id, evidence={"child_task_id": child_task_id, "evidence": evidence}, project=task["project"])
-        self._event(task_id, "child_evidence_joined", project=task["project"], action_id=action_id, child_task_id=child_task_id)
+        with self._locked_task(task_id, project) as task:
+            action = task["actions"].get(action_id)
+            if not action or action.get("child_task_id") != child_task_id:
+                raise ValueError("Child result is not bound to this parent action")
+            action.update(status="complete", evidence={"child_task_id": child_task_id, "evidence": evidence})
+            self._save_task(task)
+            self._event(task_id, "action_completed", project=task["project"], action_id=action_id, evidence=action["evidence"])
+            self._event(task_id, "child_evidence_joined", project=task["project"], action_id=action_id, child_task_id=child_task_id)
 
     def _validator_receipt(self, validator):
         command = validator.get("command")
@@ -264,7 +266,7 @@ class HostSupervisor:
     def gate_final(self, task_id, attempt_id, content, *, project=None):
         with self._locked_task(task_id, project) as task:
             self._event(task_id, "final_attempt", project=task["project"], attempt_id=attempt_id, content_digest=hashlib.sha256(content.encode()).hexdigest())
-            if task["status"] in {"paused", "cancelled"}:
+            if task["status"] in {"complete", "blocked", "paused", "cancelled"}:
                 return Decision(task["status"], message="Automatic continuation is disabled until an explicit resume.")
             remaining = self._remaining(task)
             if remaining:
@@ -301,24 +303,24 @@ class HostSupervisor:
         return Decision("continue", next_action={"id": action_id, **{k: v for k, v in action.items() if k not in {"attempts", "evidence", "status"}}})
 
     def pause(self, task_id, *, project=None):
-        task = self.task(task_id, project=project)
-        task["status"] = "paused"
-        self._save_task(task)
-        self._event(task_id, "paused", project=task["project"])
+        with self._locked_task(task_id, project) as task:
+            task["status"] = "paused"
+            self._save_task(task)
+            self._event(task_id, "paused", project=task["project"])
 
     def resume(self, task_id, *, project=None):
-        task = self.task(task_id, project=project)
-        if task["status"] != "paused":
-            raise ValueError("Only a paused task can resume")
-        task["status"] = "active"
-        self._save_task(task)
-        self._event(task_id, "resumed", project=task["project"])
+        with self._locked_task(task_id, project) as task:
+            if task["status"] != "paused":
+                raise ValueError("Only a paused task can resume")
+            task["status"] = "active"
+            self._save_task(task)
+            self._event(task_id, "resumed", project=task["project"])
 
     def cancel(self, task_id, *, project=None):
-        task = self.task(task_id, project=project)
-        task["status"] = "cancelled"
-        self._save_task(task)
-        self._event(task_id, "cancelled", project=task["project"])
+        with self._locked_task(task_id, project) as task:
+            task["status"] = "cancelled"
+            self._save_task(task)
+            self._event(task_id, "cancelled", project=task["project"])
 
     def request_operation(self, task_id, operation, *, project=None):
         task = self.task(task_id, project=project)

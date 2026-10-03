@@ -24,6 +24,12 @@ def claim_from_process(state_dir, project, result):
     result.put(host.claim_action("task-1", "effect", "other-attempt", project=project).kind)
 
 
+def pause_from_process(state_dir, project, result):
+    host = supervisor.HostSupervisor(state_dir)
+    host.pause("task-1", project=project)
+    result.put("paused")
+
+
 class SupervisedTasks(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -210,6 +216,40 @@ class MultipleProjects(unittest.TestCase):
             self.assertEqual(child.exitcode, 0)
             self.assertEqual(result.get(timeout=1), "dispatch")
             self.assertEqual(host.claim_action("task-1", "effect", "later-attempt", project=project).kind, "reconcile")
+
+    def test_terminal_final_or_blocker_is_not_released_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", project, [{"id": "done", "operation": "write"}])
+            host.complete_action("task-1", "done", evidence={"host": "observed"})
+            self.assertTrue(host.gate_final("task-1", "first", "finished", project=project).release)
+            duplicate = host.gate_final("task-1", "second", "finished again", project=project)
+            self.assertFalse(duplicate.release)
+            self.assertEqual(host.visible_messages("task-1", project=project), ["finished"])
+
+    def test_pause_uses_the_same_lock_as_final_delivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", project, [{"id": "done", "operation": "write"}])
+            host.complete_action("task-1", "done", evidence={"host": "observed"})
+            context = multiprocessing.get_context("fork")
+            result = context.Queue()
+            with host._locked_task("task-1", project):
+                child = context.Process(target=pause_from_process, args=(base / "host-state", project, result))
+                child.start()
+                self.assertTrue(result.empty())
+            child.join(timeout=2)
+            self.assertEqual(child.exitcode, 0)
+            self.assertEqual(result.get(timeout=1), "paused")
+            decision = host.gate_final("task-1", "after-pause", "finished", project=project)
+            self.assertEqual(decision.kind, "paused")
+            self.assertFalse(decision.release)
 
 
 if __name__ == "__main__":
