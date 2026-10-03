@@ -8,9 +8,10 @@ import uuid
 
 
 class SupervisedRenderer:
-    def __init__(self, supervisor, task_id):
+    def __init__(self, supervisor, task_id, *, project=None):
         self.supervisor = supervisor
         self.task_id = task_id
+        self.project = project
         self._buffer = []
 
     def consume(self, event):
@@ -20,7 +21,7 @@ class SupervisedRenderer:
             return []
         if method != "turn/completed":
             return [{"kind": "progress", "event": event}]
-        decision = self.supervisor.gate_final(self.task_id, str(uuid.uuid4()), "".join(self._buffer))
+        decision = self.supervisor.gate_final(self.task_id, str(uuid.uuid4()), "".join(self._buffer), project=self.project)
         self._buffer = []
         if decision.release:
             return [{"kind": "final", "content": decision.message, "decision": decision.kind}]
