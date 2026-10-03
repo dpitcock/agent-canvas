@@ -151,6 +151,56 @@ The installation and upgrade follow-up prompts also direct the agent to inspect 
 
 Options do not overwrite values in existing config files. The copied owner and reviewer wording still names Dennis and the `dpitcock-*` Apps; the follow-up asks you to confirm or adapt these.
 
+### Opt in to host-supervised turns
+
+Supervised mode is an opt-in proof of concept for a different guarantee: a coding agent may produce progress and a candidate final message, but it cannot decide that the candidate is user-visible. A host-side supervisor makes that decision from its own task state and validation evidence.
+
+#### Architecture
+
+```text
+Sibling project ── install --supervised ──> host registration
+       │                                      │
+       │ workspace files, tool activity        │ host-owned state directory
+       ▼                                      ▼
+Codex App Server ── events ──> custom renderer ──> HostSupervisor
+                                      │                 │
+                         visible progress               ├─ actions and authorization snapshot
+                                      │                 ├─ evidence and validator receipts
+                                      ▼                 ├─ leases, retries, blockers, audit log
+                               buffered final           ▼
+                                                     release / continue / precise blocker
+```
+
+The project workspace holds normal project files and a non-authoritative installation record. The host directory holds the authority: immutable authorization snapshots, per-project task/action graphs, validator receipts, side-effect leases and reconciliation outcomes, blockers, and an append-only audit log. A project file claiming completion changes none of those records.
+
+The renderer forwards ordinary progress events but buffers `item/agentMessage/delta` content. At `turn/completed`, it asks the supervisor whether the final content may be released. If host-owned actions remain, the candidate final stays hidden and the supervisor supplies the next action for a continuation. If no independent action remains but an owner decision is missing, it releases only that precise blocker.
+
+One host state directory can supervise several sibling projects. Each operation is scoped by project identity, so separate projects may both use `task-1` without sharing evidence, visible messages, or audit events. A task lookup without a project identity is rejected if it would be ambiguous.
+
+#### Set up a sibling project
+
+Choose a host-state directory that the agent process cannot write. It must be outside the project and must not contain the project; a separately protected volume or service-account-owned directory is the intended deployment boundary.
+
+For a new or existing sibling project, first preview the normal installation, then apply supervised registration:
+
+```sh
+python3 scripts/install.py /path/to/sibling-project
+python3 scripts/install.py /path/to/sibling-project --apply --supervised \
+  --supervisor-state-dir /srv/agent-canvas-supervisor
+```
+
+To add supervision while upgrading an already installed project:
+
+```sh
+python3 scripts/install.py /path/to/sibling-project --upgrade --apply --supervised \
+  --supervisor-state-dir /srv/agent-canvas-supervisor
+```
+
+Registration creates or reuses the project’s host-owned registration; it does not create a task, grant new agent permissions, start a turn, alter global credentials, or modify the Codex desktop app. The custom client must start each supervised task with the project identity and route every App Server turn through its renderer. It creates the host task with its authorized actions and validator definitions, then renders a final response only after the supervisor returns a release decision.
+
+The default state path is `~/.agent-canvas-supervisor`, but use `--supervisor-state-dir` for a protected host deployment. The installer rejects a state directory inside or enclosing the project. Uninstalling Agent Canvas intentionally preserves host audit state.
+
+This is not enforcement for sessions opened directly in the existing Codex desktop app: that UI does not currently use the custom renderer. The POC validates the host gate against App Server-shaped events, not a live model turn. See [the supervised-mode design](docs/supervised-mode.md) for the full limitation and upstream capability list.
 To include Osmani on a machine/project without an existing installation:
 
 ```sh
