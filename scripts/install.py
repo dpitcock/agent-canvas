@@ -4,6 +4,7 @@
 import argparse
 import difflib
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,30 @@ END = "<!-- agent-canvas:upgrade:end -->"
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def provision_supervised(root, state_dir):
+    """Register a project in host state; never treat project files as authority."""
+    root = Path(root).resolve()
+    state_dir = (Path.home() / ".agent-canvas-supervisor") if state_dir is None else Path(state_dir).expanduser()
+    state_dir = state_dir.resolve()
+    try:
+        state_dir.relative_to(root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Supervisor state directory must be outside the project workspace")
+    try:
+        root.relative_to(state_dir)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Supervisor state directory must be outside the project workspace")
+    spec = importlib.util.spec_from_file_location("agent_canvas_supervisor", SOURCE / "scripts/supervisor.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    registration = module.HostSupervisor(state_dir).provision(root)
+    return {"enabled": True, "state_dir": str(state_dir), "registration_digest": digest(registration)}
 
 
 ADAPTERS = {"codex": ".agents/skills", "cline": ".cline/skills"}
@@ -205,6 +230,11 @@ def read_state(root):
         assert isinstance(state["pending"], dict) and set(state["pending"]) <= set(MANAGED)
         assert all(isinstance(v, dict) and isinstance(v["incoming"], str) for v in state["pending"].values())
         assert isinstance(state["resolutions"], list)
+        if "supervised" in state:
+            supervised = state["supervised"]
+            assert isinstance(supervised, dict) and supervised.get("enabled") is True
+            assert isinstance(supervised.get("state_dir"), str)
+            assert re.fullmatch(r"[0-9a-f]{64}", supervised.get("registration_digest", ""))
         if "adapters" in state:
             adapter = state["adapters"]
             assert isinstance(adapter, dict) and isinstance(adapter["links"], dict)
@@ -306,7 +336,8 @@ Pending files: {', '.join('`' + name + '`' for name in sorted(pending)) or 'none
         path.write_text(updated)
 
 
-def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=None):
+def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=None,
+            supervised=False, supervisor_state_dir=None):
     root = Path(target).expanduser().resolve()
     if not root.is_dir():
         raise ValueError("Install the project first; upgrade target must exist")
@@ -326,12 +357,22 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
     version = digest(files)
     if state is None:
         state = dict(schema_version=1, options=options, baselines={}, pending={}, resolutions=[])
+    supervised_record = None
+    if supervised:
+        if apply:
+            supervised_record = provision_supervised(root, supervisor_state_dir)
+            state["supervised"] = supervised_record
+            actions = ["REGISTER supervised project in host-owned state"]
+        else:
+            actions = ["WOULD REGISTER supervised project in host-owned state"]
+    else:
+        actions = []
     for name in resolve:
         if name not in MANAGED or name not in state["pending"]:
             raise ValueError(f"No pending conflict to resolve: {name}")
         if state["pending"][name]["incoming"] != files[name]:
             raise ValueError(f"Package changed since this conflict was recorded: {name}; preview/apply the new proposal first")
-    actions, writes = [], {}
+    writes = {}
     for name, incoming in files.items():
         path = root / name
         local = path.read_text() if path.exists() else None
@@ -461,7 +502,8 @@ def render_files(source, *, workspace, environment, role, slack):
 
 
 def install(target, *, apply=False, skills=False, workspace=None, environment="local",
-            role="application", slack="", source=SOURCE, home=None, downloader=download_skills):
+            role="application", slack="", source=SOURCE, home=None, downloader=download_skills,
+            supervised=False, supervisor_state_dir=None):
     root = Path(target).expanduser().resolve()
     if root.exists() and not root.is_dir():
         raise ValueError("Target must be a directory")
@@ -567,6 +609,12 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
 > Preview remaining changes, apply agreed safe additions and merges, and verify the touched files and links. Do not run legacy governance scripts or create new approval machinery. Report what is resolved and what still needs my input. Update this follow-up file with the outcome so another session does not repeat finished work. Missing integrations must be reported honestly; continue independent work.
 """
     root.mkdir(parents=True, exist_ok=True)
+    if supervised:
+        if active:
+            adapter_state["supervised"] = provision_supervised(root, supervisor_state_dir)
+            actions.append("REGISTER supervised project in host-owned state")
+        else:
+            actions.append("WOULD REGISTER supervised project in host-owned state")
     if followup.exists():
         actions.append("KEEP INSTALL-FOLLOWUP.md unchanged; rescan live files when running its prompt")
     else:
@@ -576,6 +624,8 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
     if active and prior_state is None:
         state = dict(schema_version=1, package_version=digest(files), options=options,
                      baselines={}, pending={}, resolutions=[], adapters=adapter_state["adapters"])
+        if "supervised" in adapter_state:
+            state["supervised"] = adapter_state["supervised"]
         for name, incoming in files.items():
             local = (root / name).read_text()
             if local == incoming:
@@ -599,6 +649,8 @@ def main():
     parser.add_argument("--resolve", action="append", default=[], metavar="FILE", help="record current contents as the resolution of a pending managed file")
     parser.add_argument("--reason", default="", help="why the pending conflict was resolved this way")
     parser.add_argument("--skills", action="store_true", help="download pinned Osmani pack; only if no existing skills were detected and you have checked app plugins")
+    parser.add_argument("--supervised", action="store_true", help="register this project with the host-owned final-delivery supervisor")
+    parser.add_argument("--supervisor-state-dir", type=Path, help="host-owned state directory; must be outside the project")
     parser.add_argument("--workspace")
     parser.add_argument("--environment", choices=("local", "dev", "production"), help="initial environment; default local")
     parser.add_argument("--repo-role", choices=("application", "toolkit-authoring"), help="initial role; default application")
@@ -608,6 +660,8 @@ def main():
         parser.error("--upgrade does not download skills; reconcile skill versions separately")
     if args.upgrade and any(value is not None for value in (args.workspace, args.environment, args.repo_role, args.slack_channel)):
         parser.error("upgrades reuse recorded installation options; edit project settings directly instead of passing initial-install options")
+    if args.supervisor_state_dir and not args.supervised:
+        parser.error("--supervisor-state-dir requires --supervised")
     if (args.resolve or args.reason) and not args.upgrade:
         parser.error("--resolve and --reason require --upgrade")
     if args.resolve and not args.apply:
@@ -615,11 +669,13 @@ def main():
     try:
         if args.upgrade:
             active, actions = upgrade(args.target, apply=args.apply, resolve=args.resolve,
-                                      reason=args.reason, source=SOURCE)
+                                      reason=args.reason, source=SOURCE, supervised=args.supervised,
+                                      supervisor_state_dir=args.supervisor_state_dir)
         else:
             active, actions = install(args.target, apply=args.apply, skills=args.skills,
                                       workspace=args.workspace, environment=args.environment or "local",
-                                      role=args.repo_role or "application", slack=args.slack_channel or "")
+                                      role=args.repo_role or "application", slack=args.slack_channel or "",
+                                      supervised=args.supervised, supervisor_state_dir=args.supervisor_state_dir)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Installer stopped: {error}\nEarlier changes may remain; inspect the project before retrying.\n")
     print("Safe changes applied." if active else "PREVIEW: only INSTALL-FOLLOWUP.md is updated; use --apply for safe changes.")
