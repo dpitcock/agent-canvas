@@ -80,6 +80,28 @@ Authentication, secrets, database schema, payments, and user data raise the work
 
 Reviews attach to PR opening, marking ready, or an explicit re-request. They do not fire on every commit or completed task. Marking an unchanged PR ready does not require repeating a valid review. Reviewers work read-only and return a verdict; the developer merges.
 
+## Writing a clear PR
+
+Start with one sentence explaining the outcome in everyday language. Then use a short scope list for the behavior that changed and a verification list for checks that actually ran. A reader should understand the change without reading the commit history or knowing internal task IDs.
+
+```markdown
+The game keeps a usable host when the current host leaves or cannot respond.
+
+## Scope
+- Continue the session when the host voluntarily transfers control.
+- Recommend the player who should start a rematch.
+- Remove an unavailable player who is not the current player.
+
+## Verification
+- Focused engine tests: 186 passed.
+- Focused UI tests: 102 passed.
+- Typecheck and formatting check completed in Docker.
+
+The local pre-commit hook was skipped because it verifies host dependencies. Docker is the project's authoritative verifier.
+```
+
+Use normal Markdown line breaks—never literal `\\n`. Keep bullets concrete, define or omit unexplained jargon, and state limitations plainly. Review summaries and inline comments follow the same rule: say what is wrong, why it matters, and what should change, without ceremonial language.
+
 Before merging in GitHub, the developer checks all CI check runs and commit statuses for the current PR head, including optional checks. Pending, queued, waiting, running, failed, errored, timed-out, or cancelled checks block the merge, as do missing required checks or an incomplete status response. Recheck the SHA and results immediately before merging and bind the merge to that SHA where supported. Review approval and `bypass-review` do not waive CI completion; do not force a merge past CI. These are agent behavior rules. Enforcing the same restriction in GitHub requires branch protection or rulesets with the repository's actual CI checks required.
 
 Every code review skill, including Osmani and Superpowers, adds inline comments for actionable, line-specific findings alongside its overall summary and verdict. Reviewer handoffs include the reviewed commit SHA and request exact diff locations and severity for each finding. Publish those comments with the summary in one `gh_identity_review_as_app` call, anchored to that SHA. Keep broader findings in the summary; clean reviews need no filler comments. Invalid inline anchors must be corrected, not silently omitted. This shared rule lives in `AGENTS.md` so it applies across skill upgrades without editing pinned upstream skills or plugin caches.
