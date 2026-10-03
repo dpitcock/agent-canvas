@@ -138,5 +138,35 @@ class SupervisedInstallation(unittest.TestCase):
                                   supervisor_state_dir=base)
 
 
+class MultipleProjects(unittest.TestCase):
+    def test_same_task_id_is_isolated_by_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            alpha, beta = base / "alpha", base / "beta"
+            alpha.mkdir()
+            beta.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", alpha, [{"id": "alpha-action", "operation": "write"}])
+            host.create_task("task-1", beta, [{"id": "beta-action", "operation": "write"}])
+            host.complete_action("task-1", "alpha-action", evidence={"host": "alpha"}, project=alpha)
+            self.assertTrue(host.gate_final("task-1", "alpha-final", "alpha done", project=alpha).release)
+            beta_decision = host.gate_final("task-1", "beta-final", "beta done", project=beta)
+            self.assertEqual(beta_decision.kind, "continue")
+            self.assertEqual(host.visible_messages("task-1", project=alpha), ["alpha done"])
+            self.assertEqual(host.visible_messages("task-1", project=beta), [])
+
+    def test_ambiguous_legacy_task_lookup_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            alpha, beta = base / "alpha", base / "beta"
+            alpha.mkdir()
+            beta.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", alpha, [{"id": "one", "operation": "write"}])
+            host.create_task("task-1", beta, [{"id": "two", "operation": "write"}])
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                host.task("task-1")
+
+
 if __name__ == "__main__":
     unittest.main()
