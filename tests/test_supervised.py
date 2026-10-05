@@ -100,6 +100,30 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(receipt["exit_status"], "timeout")
         self.assertEqual(receipt["output"], "partial output error output")
 
+    def test_failed_validator_queues_a_bounded_remediation_action(self):
+        self.task(validators=[{
+            "id": "repair-me",
+            "command": [sys.executable, "-c", "import sys; print('repair this'); sys.exit(1)"],
+            "timeout_s": 2,
+        }])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        decision = self.host.gate_final("task-1", "attempt-1", "finished")
+        self.assertEqual(decision.kind, "continue")
+        self.assertEqual(decision.next_action["id"], "validator:repair-me")
+        self.assertEqual(decision.next_action["exit_status"], 1)
+        self.assertIn("repair this", decision.next_action["output"])
+
+    def test_project_relative_validator_binary_receipt_has_its_own_digest(self):
+        binary = self.project / "bin" / "check"
+        binary.parent.mkdir()
+        binary.write_text("#!/bin/sh\necho checked\n")
+        binary.chmod(0o700)
+        self.task(validators=[{"id": "relative-binary", "command": ["./bin/check"], "timeout_s": 2}])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        self.assertTrue(self.host.gate_final("task-1", "attempt-1", "finished").release)
+        receipt = self.host.task("task-1")["evidence"]["validators"]["relative-binary"]
+        self.assertEqual(receipt["binary_digest"], supervisor.hashlib.sha256(binary.read_bytes()).hexdigest())
+
     def test_genuine_blocker_is_released_only_after_independent_actions_finish(self):
         self.task(blockers=[{"id": "owner-choice", "owner_action": "Choose the deployment region."}])
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "blocked").kind, "continue")
@@ -131,6 +155,16 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(result.kind, "blocker")
         self.assertIn("explicit owner authorization", result.message)
         self.assertNotIn("push", self.host.task("task-1")["authorization"]["permitted_operations"])
+
+    def test_unauthorized_action_cannot_be_leased_or_dispatched(self):
+        self.task(actions=[{"id": "merge-release", "operation": "merge"}])
+        decision = self.host.claim_action("task-1", "merge-release", "attempt-1")
+        self.assertEqual(decision.kind, "blocker")
+        self.assertEqual(self.host.task("task-1")["actions"]["merge-release"]["status"], "pending")
+        self.assertEqual(self.host.gate_final("task-1", "final-1", "done").kind, "blocker")
+        events = self.host.audit("task-1")
+        self.assertIn("authorization_blocked", [event["type"] for event in events])
+        self.assertNotIn("action_dispatched", [event["type"] for event in events])
 
     def test_child_evidence_must_be_joined_before_parent_finalizes(self):
         self.task(actions=[{"id": "child", "operation": "delegate", "child_task_id": "child-1"}])

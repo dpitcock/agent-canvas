@@ -14,10 +14,12 @@ The locally generated Codex App Server protocol schema exposes `turn/start`, `it
 
 The guarantee holds only when users interact through this custom client and the agent lacks filesystem access to its host-state root. File permissions alone do not protect a state directory from another process running as the same operating-system identity. The existing Codex desktop app is outside this interception boundary.
 
+Project-local prompts, task files, configuration, and workflow overrides are not completion authority. A trusted owner bypass, if introduced, must arrive through a separately authenticated host channel; this POC does not treat `.owner-override` or any workspace file as permission to release a final message.
+
 Upstream desktop support needs: a host-owned final-message interceptor, durable host task state, callbacks for completion and recovery/compaction, a way to suppress default final rendering, cancellation propagation, and child-turn evidence/join events.
 
 ## Test results
 
-Executed: `python3 -m unittest discover -s tests -v` (40 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
+Executed: `python3 -m unittest discover -s tests -v` (43 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
 
 The supervised tests cover the ten required scenarios through the host API and an App Server-shaped renderer event stream. Unrun: a live Codex App Server model turn, desktop-app interception, and an operating-system-separated service-account deployment. Those require a deliberately deployed custom client and host boundary; they are not represented as passing checks.

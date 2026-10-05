@@ -181,6 +181,14 @@ class HostSupervisor:
     def _remaining(self, task):
         return [(action_id, action) for action_id, action in task["actions"].items() if action["status"] != "complete"]
 
+    @staticmethod
+    def _operation_allowed(task, operation):
+        return operation in task["authorization"]["permitted_operations"]
+
+    @staticmethod
+    def _authorization_message(operation):
+        return f"{operation} requires explicit owner authorization in a new authorization revision."
+
     def claim_action(self, task_id, action_id, attempt_id, *, project=None):
         with self._locked_task(task_id, project) as task:
             if task["status"] != "active":
@@ -188,6 +196,11 @@ class HostSupervisor:
             action = task["actions"].get(action_id)
             if not action:
                 raise ValueError(f"Unknown action: {action_id}")
+            operation = action.get("operation")
+            if not self._operation_allowed(task, operation):
+                self._event(task_id, "authorization_blocked", project=task["project"], operation=operation,
+                            action_id=action_id)
+                return Decision("blocker", message=self._authorization_message(operation))
             if action["status"] == "complete":
                 return Decision("complete")
             if action["status"] == "leased":
@@ -237,6 +250,16 @@ class HostSupervisor:
             return value.decode("utf-8", errors="replace")
         return value or ""
 
+    @staticmethod
+    def _validator_binary(command, project):
+        candidate = Path(command[0])
+        if candidate.is_absolute():
+            return candidate.resolve()
+        if "/" in command[0]:
+            return (Path(project) / candidate).resolve()
+        executable = shutil.which(command[0])
+        return Path(executable).resolve() if executable else candidate
+
     def _validator_receipt(self, validator, project):
         command = validator.get("command")
         if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
@@ -252,8 +275,7 @@ class HostSupervisor:
         except subprocess.TimeoutExpired as error:
             output = (self._output_text(error.stdout) + self._output_text(error.stderr))[:8192]
             status = "timeout"
-        executable = shutil.which(command[0]) or command[0]
-        binary = Path(executable)
+        binary = self._validator_binary(command, project)
         binary_digest = hashlib.sha256(binary.read_bytes()).hexdigest() if binary.is_file() else None
         return {"command": command, "command_digest": _digest(command), "binary_digest": binary_digest,
                 "exit_status": status, "output": output, "digest": hashlib.sha256(output.encode()).hexdigest(),
@@ -269,8 +291,8 @@ class HostSupervisor:
             self._event(task["task_id"], "validator_received", project=task["project"], validator_id=validator_id, receipt=receipt)
             if receipt["exit_status"] != 0:
                 self._save_task(task)
-                return False
-        return True
+                return validator_id, receipt
+        return None
 
     def gate_final(self, task_id, attempt_id, content, *, project=None):
         with self._locked_task(task_id, project) as task:
@@ -278,10 +300,23 @@ class HostSupervisor:
             if task["status"] in TERMINAL_STATUSES | {"paused"}:
                 return Decision(task["status"], message="Automatic continuation is disabled until an explicit resume.")
             remaining = self._remaining(task)
-            if remaining:
-                action_id, action = remaining[0]
+            authorized = [(action_id, action) for action_id, action in remaining
+                          if self._operation_allowed(task, action.get("operation"))]
+            if authorized:
+                action_id, action = authorized[0]
                 self._event(task_id, "continuation_queued", project=task["project"], action_id=action_id)
                 return Decision("continue", next_action={"id": action_id, **{k: v for k, v in action.items() if k not in {"attempts", "evidence", "status"}}})
+            if remaining:
+                action_id, action = remaining[0]
+                operation = action.get("operation")
+                message = self._authorization_message(operation)
+                task["visible_messages"].append(message)
+                task["status"] = "blocked"
+                self._save_task(task)
+                self._event(task_id, "authorization_blocked", project=task["project"], operation=operation,
+                            action_id=action_id)
+                self._event(task_id, "blocker_delivered", project=task["project"], blocker_id=action_id)
+                return Decision("blocker", release=True, message=message)
             if task["blockers"]:
                 blocker = task["blockers"][0]
                 message = blocker.get("owner_action", "Owner authorization is required.")
@@ -290,9 +325,16 @@ class HostSupervisor:
                 self._save_task(task)
                 self._event(task_id, "blocker_delivered", project=task["project"], blocker_id=blocker.get("id"))
                 return Decision("blocker", release=True, message=message)
-            if not self._validate(task):
-                self._event(task_id, "continuation_queued", project=task["project"], reason="validator_failed")
-                return Decision("continue", message="Host validator failed; repair the reported action.")
+            validator_failure = self._validate(task)
+            if validator_failure:
+                validator_id, receipt = validator_failure
+                remediation = {"id": f"validator:{validator_id}", "kind": "validator_remediation",
+                               "validator_id": validator_id, "exit_status": receipt["exit_status"],
+                               "output": receipt["output"], "digest": receipt["digest"]}
+                self._event(task_id, "continuation_queued", project=task["project"], reason="validator_failed",
+                            next_action=remediation)
+                return Decision("continue", message=f"Host validator {validator_id} failed; repair it and retry.",
+                                next_action=remediation)
             task["visible_messages"].append(content)
             task["status"] = "complete"
             self._save_task(task)
@@ -341,8 +383,8 @@ class HostSupervisor:
 
     def request_operation(self, task_id, operation, *, project=None):
         task = self.task(task_id, project=project)
-        if operation in task["authorization"]["permitted_operations"]:
+        if self._operation_allowed(task, operation):
             return Decision("permitted")
-        message = f"{operation} requires explicit owner authorization in a new authorization revision."
+        message = self._authorization_message(operation)
         self._event(task_id, "authorization_blocked", project=task["project"], operation=operation)
         return Decision("blocker", message=message)
