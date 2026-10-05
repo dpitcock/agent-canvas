@@ -173,7 +173,7 @@ Codex App Server ── events ──> custom renderer ──> HostSupervisor
 
 The project workspace holds normal project files and a non-authoritative installation record. The host directory holds the authority: immutable authorization snapshots, per-project task/action graphs, validator receipts, side-effect leases and reconciliation outcomes, blockers, and an append-only audit log. A project file claiming completion changes none of those records.
 
-The renderer forwards ordinary progress events but buffers `item/agentMessage/delta` content. At `turn/completed`, it asks the supervisor whether the final content may be released. If host-owned actions remain, the candidate final stays hidden and the supervisor supplies the next action for a continuation. If no independent action remains but an owner decision is missing, it releases only that precise blocker.
+The renderer forwards ordinary progress events but buffers `item/agentMessage/delta` content and completed agent-message items. It asks the supervisor whether final content may be released only for a `turn/completed` event whose status is `completed`; failed or interrupted turns retain no candidate final and recover from host state. If host-owned actions remain, the candidate final stays hidden and the supervisor supplies the next action for a continuation. If no independent action remains but an owner decision is missing, it releases only that precise blocker.
 
 One host state directory can supervise several sibling projects. Each operation is scoped by project identity, so separate projects may both use `task-1` without sharing evidence, visible messages, or audit events. A task lookup without a project identity is rejected if it would be ambiguous.
 

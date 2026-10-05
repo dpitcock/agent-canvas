@@ -231,7 +231,13 @@ class HostSupervisor:
             self._event(task_id, "action_completed", project=task["project"], action_id=action_id, evidence=action["evidence"])
             self._event(task_id, "child_evidence_joined", project=task["project"], action_id=action_id, child_task_id=child_task_id)
 
-    def _validator_receipt(self, validator):
+    @staticmethod
+    def _output_text(value):
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return value or ""
+
+    def _validator_receipt(self, validator, project):
         command = validator.get("command")
         if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
             raise ValueError("Host validator command must be a nonempty argument list")
@@ -239,11 +245,13 @@ class HostSupervisor:
         if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 300:
             raise ValueError("Host validator timeout_s must be between 0 and 300")
         try:
-            run = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+            run = subprocess.run(command, capture_output=True, text=True, timeout=timeout,
+                                 check=False, cwd=project)
             output = (run.stdout + run.stderr)[:8192]
             status = run.returncode
         except subprocess.TimeoutExpired as error:
-            output, status = (error.stdout or "")[:8192], "timeout"
+            output = (self._output_text(error.stdout) + self._output_text(error.stderr))[:8192]
+            status = "timeout"
         executable = shutil.which(command[0]) or command[0]
         binary = Path(executable)
         binary_digest = hashlib.sha256(binary.read_bytes()).hexdigest() if binary.is_file() else None
@@ -256,7 +264,7 @@ class HostSupervisor:
             validator_id = validator.get("id")
             if not validator_id:
                 raise ValueError("Host validators require an id")
-            receipt = self._validator_receipt(validator)
+            receipt = self._validator_receipt(validator, task["project"])
             task["evidence"]["validators"][validator_id] = receipt
             self._event(task["task_id"], "validator_received", project=task["project"], validator_id=validator_id, receipt=receipt)
             if receipt["exit_status"] != 0:

@@ -4,7 +4,7 @@
 
 One host state directory can serve multiple projects. Every task operation accepts a project identity and resolves state beneath that project's host registration. Task IDs may therefore repeat across projects without sharing actions, evidence, visible messages, or audit events; an unqualified lookup is rejected when it would be ambiguous.
 
-The custom renderer consumes Codex App Server item events. It forwards progress but buffers `item/agentMessage/delta` content. Only after `turn/completed` does it ask the host supervisor to release content. Remaining host actions queue a continuation instead; a blocker is delivered only after no independently authorized action remains.
+The custom renderer consumes Codex App Server item events. It forwards progress but buffers both `item/agentMessage/delta` content and completed `agentMessage` items. Only a `turn/completed` event with status `completed` asks the host supervisor to release content; failed or interrupted turns remain recoverable. Remaining host actions queue a continuation instead; a blocker is delivered only after no independently authorized action remains.
 
 The POC uses atomic replacement for task state, fsynced append-only audit events, and an interprocess task lease lock. It recovers a leased side-effect action as `reconcile`, never a second dispatch. Pause and cancellation are persisted and disable automatic continuation.
 
@@ -18,6 +18,6 @@ Upstream desktop support needs: a host-owned final-message interceptor, durable 
 
 ## Test results
 
-Executed: `python3 -m unittest discover -s tests -v` (36 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
+Executed: `python3 -m unittest discover -s tests -v` (40 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
 
 The supervised tests cover the ten required scenarios through the host API and an App Server-shaped renderer event stream. Unrun: a live Codex App Server model turn, desktop-app interception, and an operating-system-separated service-account deployment. Those require a deliberately deployed custom client and host boundary; they are not represented as passing checks.

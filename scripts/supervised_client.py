@@ -12,17 +12,33 @@ class SupervisedRenderer:
         self.supervisor = supervisor
         self.task_id = task_id
         self.project = project
-        self._buffer = []
+        self._deltas = []
+        self._completed_messages = []
 
     def consume(self, event):
         method = event.get("method")
         if method == "item/agentMessage/delta":
-            self._buffer.append(event.get("params", {}).get("delta", ""))
+            self._deltas.append(event.get("params", {}).get("delta", ""))
             return []
+        if method == "item/completed":
+            item = event.get("params", {}).get("item", {})
+            if item.get("type") == "agentMessage":
+                # App Server repeats the complete agent message (including its
+                # text) after deltas. It is final-message content, not progress.
+                self._completed_messages.append(item.get("text", ""))
+                return []
         if method != "turn/completed":
             return [{"kind": "progress", "event": event}]
-        decision = self.supervisor.gate_final(self.task_id, str(uuid.uuid4()), "".join(self._buffer), project=self.project)
-        self._buffer = []
+        status = event.get("params", {}).get("turn", {}).get("status")
+        if status != "completed":
+            self._deltas = []
+            self._completed_messages = []
+            return [{"kind": "turn_incomplete", "status": status,
+                     "message": "Turn did not complete; host state remains recoverable."}]
+        content = "".join(self._completed_messages or self._deltas)
+        decision = self.supervisor.gate_final(self.task_id, str(uuid.uuid4()), content, project=self.project)
+        self._deltas = []
+        self._completed_messages = []
         if decision.release:
             return [{"kind": "final", "content": decision.message, "decision": decision.kind}]
         if decision.kind == "continue":

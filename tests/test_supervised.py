@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 def load(name):
@@ -77,6 +78,28 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(receipt["exit_status"], 0)
         self.assertIn("digest", receipt)
 
+    def test_validator_runs_from_the_registered_project_directory(self):
+        (self.project / "project-marker").write_text("present")
+        self.task(validators=[{
+            "id": "project-cwd",
+            "command": [sys.executable, "-c", "import pathlib, sys; sys.exit(not pathlib.Path('project-marker').is_file())"],
+            "timeout_s": 2,
+        }])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        self.assertTrue(self.host.gate_final("task-1", "attempt-1", "finished").release)
+
+    def test_timeout_receipt_decodes_partial_output(self):
+        self.task(validators=[{"id": "timeout", "command": [sys.executable, "-c", "pass"], "timeout_s": 2}])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        subprocess_timeout = supervisor.subprocess.TimeoutExpired(
+            [sys.executable, "-c", "pass"], 2, output=b"partial output", stderr=b" error output")
+        with mock.patch.object(supervisor.subprocess, "run", side_effect=subprocess_timeout):
+            decision = self.host.gate_final("task-1", "attempt-1", "finished")
+        self.assertEqual(decision.kind, "continue")
+        receipt = self.host.task("task-1")["evidence"]["validators"]["timeout"]
+        self.assertEqual(receipt["exit_status"], "timeout")
+        self.assertEqual(receipt["output"], "partial output error output")
+
     def test_genuine_blocker_is_released_only_after_independent_actions_finish(self):
         self.task(blockers=[{"id": "owner-choice", "owner_action": "Choose the deployment region."}])
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "blocked").kind, "continue")
@@ -119,11 +142,34 @@ class SupervisedTasks(unittest.TestCase):
         self.task()
         renderer = client.SupervisedRenderer(self.host, "task-1")
         self.assertEqual(renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "secret final"}}), [])
-        output = renderer.consume({"method": "turn/completed", "params": {}})
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": " completed final"}}}), [])
+        output = renderer.consume({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
         self.assertEqual(output[0]["kind"], "continuation")
+        self.assertNotIn("secret final", str(output))
+        self.assertNotIn("completed final", str(output))
         events = [event["type"] for event in self.host.audit("task-1")]
         self.assertIn("final_attempt", events)
         self.assertIn("continuation_queued", events)
+
+    def test_renderer_does_not_gate_failed_or_interrupted_turns(self):
+        self.task()
+        for status in ("failed", "interrupted"):
+            renderer = client.SupervisedRenderer(self.host, "task-1")
+            renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "partial final"}})
+            result = renderer.consume({"method": "turn/completed", "params": {"turn": {"status": status}}})
+            self.assertEqual(result[0]["kind"], "turn_incomplete")
+        self.assertEqual(self.host.visible_messages("task-1"), [])
+        self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit("task-1")])
+
+    def test_renderer_releases_only_the_buffered_completed_agent_message(self):
+        self.task()
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "streamed duplicate"}})
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": {
+            "item": {"type": "agentMessage", "text": "authoritative final"}}}), [])
+        released = renderer.consume({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+        self.assertEqual(released, [{"kind": "final", "content": "authoritative final", "decision": "complete"}])
 
 
 class SupervisedInstallation(unittest.TestCase):
