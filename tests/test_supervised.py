@@ -230,6 +230,22 @@ class MultipleProjects(unittest.TestCase):
             self.assertFalse(duplicate.release)
             self.assertEqual(host.visible_messages("task-1", project=project), ["finished"])
 
+    def test_pause_and_resume_cannot_reopen_a_terminal_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", project, [{"id": "done", "operation": "write"}])
+            host.complete_action("task-1", "done", evidence={"host": "observed"})
+            self.assertTrue(host.gate_final("task-1", "first", "finished", project=project).release)
+            host.pause("task-1", project=project)
+            with self.assertRaisesRegex(ValueError, "terminal"):
+                host.resume("task-1", project=project)
+            host.cancel("task-1", project=project)
+            self.assertEqual(host.task("task-1", project=project)["status"], "complete")
+            self.assertFalse(host.gate_final("task-1", "second", "duplicate", project=project).release)
+
     def test_pause_uses_the_same_lock_as_final_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

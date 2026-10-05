@@ -17,6 +17,7 @@ import fcntl
 
 DEFAULT_PROHIBITED = ("push", "publish", "pr_create", "merge", "destructive", "credential_change",
                       "config_change", "external_message")
+TERMINAL_STATUSES = {"complete", "blocked", "cancelled"}
 
 
 class Decision:
@@ -266,7 +267,7 @@ class HostSupervisor:
     def gate_final(self, task_id, attempt_id, content, *, project=None):
         with self._locked_task(task_id, project) as task:
             self._event(task_id, "final_attempt", project=task["project"], attempt_id=attempt_id, content_digest=hashlib.sha256(content.encode()).hexdigest())
-            if task["status"] in {"complete", "blocked", "paused", "cancelled"}:
+            if task["status"] in TERMINAL_STATUSES | {"paused"}:
                 return Decision(task["status"], message="Automatic continuation is disabled until an explicit resume.")
             remaining = self._remaining(task)
             if remaining:
@@ -304,6 +305,9 @@ class HostSupervisor:
 
     def pause(self, task_id, *, project=None):
         with self._locked_task(task_id, project) as task:
+            if task["status"] in TERMINAL_STATUSES:
+                self._event(task_id, "terminal_transition_ignored", project=task["project"], requested="pause")
+                return
             task["status"] = "paused"
             self._save_task(task)
             self._event(task_id, "paused", project=task["project"])
@@ -311,6 +315,8 @@ class HostSupervisor:
     def resume(self, task_id, *, project=None):
         with self._locked_task(task_id, project) as task:
             if task["status"] != "paused":
+                if task["status"] in TERMINAL_STATUSES:
+                    raise ValueError("A terminal task cannot resume")
                 raise ValueError("Only a paused task can resume")
             task["status"] = "active"
             self._save_task(task)
@@ -318,6 +324,9 @@ class HostSupervisor:
 
     def cancel(self, task_id, *, project=None):
         with self._locked_task(task_id, project) as task:
+            if task["status"] in TERMINAL_STATUSES:
+                self._event(task_id, "terminal_transition_ignored", project=task["project"], requested="cancel")
+                return
             task["status"] = "cancelled"
             self._save_task(task)
             self._event(task_id, "cancelled", project=task["project"])
