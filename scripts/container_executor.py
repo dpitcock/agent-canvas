@@ -280,7 +280,7 @@ class ContainerExecutor:
         staged = Path(staged_inputs).resolve()
         if not staged.is_dir():
             raise ConfigurationError("a host-owned staging directory is required")
-        return [cls.RUNTIME, "create", "--pull=never", "--name", name, "--network", "none", "--user", "65532:65532",
+        return [cls.RUNTIME, "create", "--pull=never", "--log-driver", "none", "--name", name, "--network", "none", "--user", "65532:65532",
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only", "--pids-limit", str(request.pids),
                 "--memory", request.memory, "--cpus", request.cpus, "--ulimit", "nofile=64:64",
                 "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m", "--tmpfs", "/outputs:rw,noexec,nosuid,nodev,size=16m",
@@ -304,6 +304,15 @@ class ContainerExecutor:
         if not version or not image_id.startswith("sha256:"):
             raise ConfigurationError("Docker did not report an immutable server and image identity")
         return version, image_id
+
+    @classmethod
+    def _remove_container(cls, name):
+        """Best-effort Docker cleanup whose failure remains a failed execution."""
+        try:
+            removed = subprocess.run([cls.RUNTIME, "rm", "-f", name], capture_output=True, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return removed.returncode == 0
 
     @classmethod
     def run(cls, request, identity, staging_parent, *, cancellation=None):
@@ -357,11 +366,12 @@ class ContainerExecutor:
                 truncated |= len(rest) > available
             status = process.returncode if not (timed_out or cancelled) else ("timeout" if timed_out else "cancelled")
         finally:
+            cleanup_ok = True
             if started:
-                removed = subprocess.run([cls.RUNTIME, "rm", "-f", name], capture_output=True, timeout=10, check=False)
-                if removed.returncode:
-                    raise ConfigurationError("Docker container cleanup could not be confirmed")
+                cleanup_ok = cls._remove_container(name)
             shutil.rmtree(snapshot.root, ignore_errors=True)
+            if not cleanup_ok:
+                raise ConfigurationError("Docker container cleanup could not be confirmed")
         return ExecutionReceipt.build(action_id=request.action_id, attempt_id=request.attempt_id, input_digest=snapshot.digest,
                                       command=request.command, image=request.image, runtime=cls.RUNTIME,
                                       runtime_version=version, exit_status=status, timed_out=timed_out,

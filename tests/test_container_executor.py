@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 def load_executor():
@@ -103,6 +104,8 @@ class RuntimeValidationTests(unittest.TestCase):
         self.assertIn("dst=/inputs,readonly", mounts[0])
         self.assertNotIn(str(request.project), " ".join(plan))
         self.assertIn("--pull=never", plan)
+        self.assertIn("--log-driver", plan)
+        self.assertIn("none", plan)
 
     def test_rejects_unbounded_or_invalid_resource_limits(self):
         image = "example/tool@sha256:" + "a" * 64
@@ -111,6 +114,10 @@ class RuntimeValidationTests(unittest.TestCase):
                 with self.assertRaises(executor.ConfigurationError):
                     executor.ExecutionRequest(action_id="action", attempt_id="attempt", project=Path("/tmp/project"),
                                               image=image, command=["true"], inputs=[], **changes)
+
+    def test_container_removal_failure_is_reported_without_skipping_stage_cleanup(self):
+        with mock.patch.object(executor.subprocess, "run", side_effect=executor.subprocess.TimeoutExpired("docker", 10)):
+            self.assertFalse(executor.ContainerExecutor._remove_container("agent-canvas-test"))
 
 
 @unittest.skipUnless(os.environ.get("AGENT_CANVAS_CONTAINER_IMAGE"), "set a digest-pinned container image to run integration tests")
