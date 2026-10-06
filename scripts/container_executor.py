@@ -328,7 +328,10 @@ class ContainerExecutor:
                                     timeout=5, check=False)
         except (OSError, subprocess.SubprocessError):
             return False
-        return absent.returncode != 0
+        if absent.returncode == 0:
+            return False
+        error = absent.stderr.decode("utf-8", "replace") if isinstance(absent.stderr, bytes) else (absent.stderr or "")
+        return f"No such container: {name}" in error
 
     @staticmethod
     def _remove_stage(path):
