@@ -236,6 +236,8 @@ class HostSupervisor:
 
     def _request_interrupt(self, task_id, status, *, project=None):
         with self._locked_interrupt(task_id, project) as path:
+            if path.exists() and self._read(path).get("status") == "cancelled" and status == "paused":
+                return
             self._write(path, {"status": status, "requested_at": _now()})
 
     def _clear_interrupt(self, task_id, *, project=None):
