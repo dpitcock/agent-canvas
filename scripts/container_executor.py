@@ -314,6 +314,15 @@ class ContainerExecutor:
             return False
         return removed.returncode == 0
 
+    @staticmethod
+    def _remove_stage(path):
+        """Do not return a validation receipt while a stage may still exist."""
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            return False
+        return not Path(path).exists()
+
     @classmethod
     def run(cls, request, identity, staging_parent, *, cancellation=None):
         """Stage and execute, returning an integrity-bound receipt on every outcome.
@@ -369,9 +378,9 @@ class ContainerExecutor:
             cleanup_ok = True
             if started:
                 cleanup_ok = cls._remove_container(name)
-            shutil.rmtree(snapshot.root, ignore_errors=True)
-            if not cleanup_ok:
-                raise ConfigurationError("Docker container cleanup could not be confirmed")
+            stage_removed = cls._remove_stage(snapshot.root)
+            if not cleanup_ok or not stage_removed:
+                raise ConfigurationError("Docker or host staging cleanup could not be confirmed")
         return ExecutionReceipt.build(action_id=request.action_id, attempt_id=request.attempt_id, input_digest=snapshot.digest,
                                       command=request.command, image=request.image, runtime=cls.RUNTIME,
                                       runtime_version=version, exit_status=status, timed_out=timed_out,

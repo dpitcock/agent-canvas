@@ -119,6 +119,10 @@ class RuntimeValidationTests(unittest.TestCase):
         with mock.patch.object(executor.subprocess, "run", side_effect=executor.subprocess.TimeoutExpired("docker", 10)):
             self.assertFalse(executor.ContainerExecutor._remove_container("agent-canvas-test"))
 
+    def test_stage_removal_failure_is_explicit(self):
+        with mock.patch.object(executor.shutil, "rmtree", side_effect=OSError("busy")):
+            self.assertFalse(executor.ContainerExecutor._remove_stage(Path("/host-owned/stage")))
+
 
 @unittest.skipUnless(os.environ.get("AGENT_CANVAS_CONTAINER_IMAGE"), "set a digest-pinned container image to run integration tests")
 class DockerIntegrationTests(unittest.TestCase):
