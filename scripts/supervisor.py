@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 import time
 
+import fcntl
+
 
 DEFAULT_PROHIBITED = ("push", "publish", "pr_create", "merge", "destructive", "credential_change",
                       "config_change", "external_message")
@@ -28,6 +30,10 @@ def _digest(value):
 
 def _now():
     return time.time_ns()
+
+
+def _text_output(value):
+    return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")
 
 
 class HostSupervisor:
@@ -150,21 +156,27 @@ class HostSupervisor:
         return [(action_id, action) for action_id, action in task["actions"].items() if action["status"] != "complete"]
 
     def claim_action(self, task_id, action_id, attempt_id, *, project=None):
-        task = self.task(task_id, project=project)
-        if task["status"] != "active":
-            return Decision(task["status"])
-        action = task["actions"].get(action_id)
-        if not action:
-            raise ValueError(f"Unknown action: {action_id}")
-        if action["status"] == "complete":
-            return Decision("complete")
-        if action["status"] == "leased":
-            return Decision("reconcile", message="A prior side-effect dispatch requires reconciliation.")
-        action["status"] = "leased"
-        action["attempts"].append({"attempt_id": attempt_id, "at": _now(), "decision": "dispatch"})
-        self._save_task(task)
-        self._event(task_id, "action_dispatched", project=task["project"], action_id=action_id, attempt_id=attempt_id)
-        return Decision("dispatch")
+        lock_path = self._task_path(task_id, project).with_suffix(".lock")
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                task = self.task(task_id, project=project)
+                if task["status"] != "active":
+                    return Decision(task["status"])
+                action = task["actions"].get(action_id)
+                if not action:
+                    raise ValueError(f"Unknown action: {action_id}")
+                if action["status"] == "complete":
+                    return Decision("complete")
+                if action["status"] == "leased":
+                    return Decision("reconcile", message="A prior side-effect dispatch requires reconciliation.")
+                action["status"] = "leased"
+                action["attempts"].append({"attempt_id": attempt_id, "at": _now(), "decision": "dispatch"})
+                self._save_task(task)
+                self._event(task_id, "action_dispatched", project=task["project"], action_id=action_id, attempt_id=attempt_id)
+                return Decision("dispatch")
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
     def reconcile_action(self, task_id, action_id, *, succeeded, receipt, project=None):
         task = self.task(task_id, project=project)
@@ -206,10 +218,10 @@ class HostSupervisor:
             raise ValueError("Host validator timeout_s must be between 0 and 300")
         try:
             run = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
-            output = (run.stdout + run.stderr)[:8192]
+            output = (_text_output(run.stdout) + _text_output(run.stderr))[:8192]
             status = run.returncode
         except subprocess.TimeoutExpired as error:
-            output, status = (error.stdout or "")[:8192], "timeout"
+            output, status = _text_output(error.stdout)[:8192], "timeout"
         executable = shutil.which(command[0]) or command[0]
         binary = Path(executable)
         binary_digest = hashlib.sha256(binary.read_bytes()).hexdigest() if binary.is_file() else None

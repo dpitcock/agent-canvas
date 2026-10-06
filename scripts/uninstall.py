@@ -116,10 +116,15 @@ def remove_ignore_entries(root, state, actions, apply):
     if path.is_symlink():
         actions.append("PRESERVE .gitignore: it is a symlink")
         return
-    entries = set(IGNORE)
-    for relative in state.get("adapters", {}).get("links", {}):
-        if relative.startswith(".cline/skills/"):
-            entries.add("/.cline/skills/" + Path(relative).name)
+    provenance = state.get("provenance")
+    if provenance is not None:
+        entries = set(provenance.get("gitignore_entries", []))
+    else:
+        # State written before provenance tracking used the historical fixed set.
+        entries = set(IGNORE)
+        for relative in state.get("adapters", {}).get("links", {}):
+            if relative.startswith(".cline/skills/"):
+                entries.add("/.cline/skills/" + Path(relative).name)
     old = path.read_text()
     kept = [line for line in old.splitlines(keepends=True) if line.rstrip("\r\n") not in entries]
     new = "".join(kept)
@@ -157,6 +162,8 @@ def uninstall(target, *, mode="preserve", apply=False):
     state = read_state(root) if (root / STATE).exists() else None
     actions = []
     baselines = state.get("baselines", {}) if state else {}
+    provenance = state.get("provenance") if state else None
+    managed_files = set(provenance.get("managed_files", [])) if provenance is not None else None
 
     for name in MANAGED:
         path = root / name
@@ -169,7 +176,9 @@ def uninstall(target, *, mode="preserve", apply=False):
             else:
                 actions.append(f"PRESERVE {name}: it is a symlink")
             continue
-        owned_unchanged = name in baselines and baselines[name] is not None and path.read_text() == baselines[name]
+        owned_unchanged = (name in baselines and baselines[name] is not None
+                           and path.read_text() == baselines[name]
+                           and (managed_files is None or name in managed_files))
         if mode == "remove-all" or owned_unchanged:
             planned_removal(root, path, actions, apply)
         else:

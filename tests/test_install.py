@@ -170,6 +170,26 @@ class InstallSmoke(unittest.TestCase):
             self.assertFalse((forced / "config/workspace-config.yml").exists())
             self.assertFalse((forced / "INSTALL-FOLLOWUP.md").exists())
 
+    def test_preserve_uninstall_keeps_preexisting_matching_files_and_ignore_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "project"
+            target.mkdir()
+            (target / "AGENTS.md").write_text((installer.SOURCE / "AGENTS.md").read_text())
+            preexisting_ignore = installer.IGNORE[0]
+            (target / ".gitignore").write_text(preexisting_ignore + "\n")
+
+            installer.install(target, apply=True, home=base / "home")
+            state = installer.read_state(target)
+            self.assertNotIn("AGENTS.md", state["provenance"]["managed_files"])
+            self.assertNotIn(preexisting_ignore, state["provenance"]["gitignore_entries"])
+            self.assertIn("config/workspace-config.yml", state["provenance"]["managed_files"])
+
+            uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertTrue((target / "AGENTS.md").exists())
+            self.assertEqual((target / ".gitignore").read_text(), preexisting_ignore + "\n")
+
     def test_agent_nuke_preserves_plans_but_removes_agent_workflow_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"

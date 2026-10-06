@@ -1,9 +1,11 @@
 """Host-supervised task tests; all state lives in temporary host directories."""
 import importlib.util
+import multiprocessing
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 def load(name):
@@ -16,6 +18,13 @@ def load(name):
 supervisor = load("supervisor")
 client = load("supervised_client")
 installer = load("install")
+
+
+def claim_from_another_process(state_dir, project, start, results, attempt_id):
+    """Claim one action after every contender is ready to race for it."""
+    start.wait()
+    host = supervisor.HostSupervisor(state_dir)
+    results.put(host.claim_action("task-1", "write-doc", attempt_id, project=project).kind)
 
 
 class SupervisedTasks(unittest.TestCase):
@@ -89,6 +98,36 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(restarted.claim_action("task-1", "send", "attempt-2").kind, "reconcile")
         restarted.reconcile_action("task-1", "send", succeeded=True, receipt={"provider_id": "one"})
         self.assertEqual(restarted.task("task-1")["actions"]["send"]["status"], "complete")
+
+    def test_concurrent_processes_dispatch_an_action_once(self):
+        """Removing claim serialization allows multiple processes to dispatch this action."""
+        self.task()
+        context = multiprocessing.get_context("fork")
+        start = context.Event()
+        results = context.Queue()
+        workers = [
+            context.Process(target=claim_from_another_process,
+                            args=(str(self.base / "host-state"), str(self.project), start, results, f"attempt-{index}"))
+            for index in range(16)
+        ]
+        for worker in workers:
+            worker.start()
+        start.set()
+        decisions = [results.get(timeout=10) for _ in workers]
+        for worker in workers:
+            worker.join(timeout=10)
+            self.assertEqual(worker.exitcode, 0)
+        self.assertEqual(decisions.count("dispatch"), 1)
+        self.assertEqual(decisions.count("reconcile"), len(workers) - 1)
+
+    def test_validator_receipt_decodes_byte_output_before_hashing(self):
+        """A timeout-compatible byte stream still yields a text receipt and digest."""
+        timeout = supervisor.subprocess.TimeoutExpired(["ignored"], 1, output=b"validator output")
+        with patch.object(supervisor.subprocess, "run", side_effect=timeout):
+            receipt = self.host._validator_receipt({"id": "check", "command": ["ignored"]})
+
+        self.assertEqual(receipt["output"], "validator output")
+        self.assertEqual(receipt["digest"], "af0c829e3106013e4ef9555521848126776f8a7054fc42e1b64b94dbc4627de1")
 
     def test_continuation_cannot_broaden_default_prohibited_operations(self):
         self.task()

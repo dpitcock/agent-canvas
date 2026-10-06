@@ -195,7 +195,7 @@ def adapter_plan(root, environments, state, home=None):
     return operations, actions
 
 
-def apply_adapters(operations):
+def apply_adapters(operations, provenance=None):
     for operation, link, target in operations:
         if operation == "remove":
             link.unlink()
@@ -210,6 +210,10 @@ def apply_adapters(operations):
                 entry = "/.cline/skills/" + link.name
                 if entry not in old.splitlines():
                     ignore.write_text(old + ("\n" if old and not old.endswith("\n") else "") + entry + "\n")
+                    if provenance is not None:
+                        entries = provenance.setdefault("gitignore_entries", [])
+                        if entry not in entries:
+                            entries.append(entry)
 
 
 def read_state(root):
@@ -230,6 +234,15 @@ def read_state(root):
         assert isinstance(state["pending"], dict) and set(state["pending"]) <= set(MANAGED)
         assert all(isinstance(v, dict) and isinstance(v["incoming"], str) for v in state["pending"].values())
         assert isinstance(state["resolutions"], list)
+        if "provenance" in state:
+            provenance = state["provenance"]
+            assert isinstance(provenance, dict)
+            assert set(provenance) <= {"managed_files", "gitignore_entries"}
+            assert isinstance(provenance.get("managed_files", []), list)
+            assert set(provenance.get("managed_files", [])) <= set(MANAGED)
+            assert isinstance(provenance.get("gitignore_entries", []), list)
+            assert all(entry in IGNORE or re.fullmatch(r"/\.cline/skills/[^/]+", entry)
+                       for entry in provenance.get("gitignore_entries", []))
         if "supervised" in state:
             supervised = state["supervised"]
             assert isinstance(supervised, dict) and supervised.get("enabled") is True
@@ -426,8 +439,9 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
-        apply_adapters(operations)
+        apply_adapters(operations, state.setdefault("provenance", {}))
         save_state(root, state)
+        upgrade_followup(root, actions, state["pending"], source=source, state=state)
     return apply, actions
 
 
@@ -528,6 +542,9 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
     config_path = root / "config/workspace-config.yml"
     environments = agentic_envs(config_path.read_text() if config_path.exists() else files["config/workspace-config.yml"])
     adapter_state = json.loads(json.dumps(prior_state)) if prior_state else {"adapters": {"links": {}, "pending": []}}
+    provenance = adapter_state.setdefault("provenance", {})
+    provenance.setdefault("managed_files", [])
+    provenance.setdefault("gitignore_entries", [])
     actions = []
     for name, content in files.items():
         path = root / name
@@ -540,6 +557,7 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("x") as out:
                     out.write(content)
+                provenance["managed_files"].append(name)
     ignore_path = root / ".gitignore"
     ignore = ignore_path.read_text() if ignore_path.exists() else ""
     missing = [entry for entry in IGNORE if entry not in ignore.splitlines()]
@@ -548,6 +566,7 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
         if active:
             with ignore_path.open("a") as out:
                 out.write(("\n" if ignore and not ignore.endswith("\n") else "") + "\n".join(missing) + "\n")
+            provenance["gitignore_entries"].extend(missing)
     pack = root / "skills/addyosmani-agent-skills"
     if skills and not any(environments.get(env) for env in ADAPTERS):
         actions.append("SKIP skill downloads: no supported agentic environment is enabled")
@@ -575,7 +594,7 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
     operations, adapter_actions = adapter_plan(root, environments, adapter_state, home=home)
     actions.extend(adapter_actions if active else ["WOULD " + a if a.startswith(("ADD ", "REMOVE ")) else a for a in adapter_actions])
     if active:
-        apply_adapters(operations)
+        apply_adapters(operations, provenance)
     actions.append("REUSE Superpowers if enabled; otherwise verify a supported installation for each active environment; never assume plugin portability")
     followup = root / "INSTALL-FOLLOWUP.md"
     prompt = f"""# Agent Canvas installation follow-up
@@ -623,7 +642,8 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
         actions.append("ADD INSTALL-FOLLOWUP.md (ready-to-run conflict-resolution prompt)")
     if active and prior_state is None:
         state = dict(schema_version=1, package_version=digest(files), options=options,
-                     baselines={}, pending={}, resolutions=[], adapters=adapter_state["adapters"])
+                     baselines={}, pending={}, resolutions=[], adapters=adapter_state["adapters"],
+                     provenance=provenance)
         if "supervised" in adapter_state:
             state["supervised"] = adapter_state["supervised"]
         for name, incoming in files.items():
