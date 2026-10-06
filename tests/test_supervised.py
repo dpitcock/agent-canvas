@@ -138,6 +138,18 @@ class SupervisedTasks(unittest.TestCase):
         receipt = self.host.task("task-1")["evidence"]["validators"]["relative-binary"]
         self.assertEqual(receipt["binary_digest"], expected_digest)
 
+    def test_absolute_workspace_validator_receipt_binds_the_executable_that_ran(self):
+        binary = self.project / "bin" / "check"
+        binary.parent.mkdir()
+        binary.write_text("#!/bin/sh\nprintf '#!/bin/sh\\nexit 1\\n' > ./bin/check\necho checked\n")
+        binary.chmod(0o700)
+        expected_digest = supervisor.hashlib.sha256(binary.read_bytes()).hexdigest()
+        self.task(validators=[{"id": "absolute-binary", "command": [str(binary)], "timeout_s": 2}])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        self.assertTrue(self.host.gate_final("task-1", "attempt-1", "finished").release)
+        receipt = self.host.task("task-1")["evidence"]["validators"]["absolute-binary"]
+        self.assertEqual(receipt["binary_digest"], expected_digest)
+
     def test_pause_interrupts_a_validator_before_final_release(self):
         self.task(validators=[{
             "id": "slow",
@@ -397,6 +409,28 @@ class SupervisedInstallation(unittest.TestCase):
 
 
 class MultipleProjects(unittest.TestCase):
+    def test_concurrent_task_creation_is_serialized_before_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.provision(project)
+            lock_path = host._project_dir(project) / "tasks" / "task-1.json.lock"
+            lock_path.parent.mkdir(parents=True)
+            result = {}
+            with lock_path.open("a", encoding="utf-8") as lock:
+                supervisor.fcntl.flock(lock.fileno(), supervisor.fcntl.LOCK_EX)
+                creator = threading.Thread(target=lambda: result.setdefault(
+                    "task", host.create_task("task-1", project, [{"id": "effect", "operation": "write"}])))
+                creator.start()
+                time.sleep(0.05)
+                self.assertNotIn("task", result)
+            creator.join(timeout=1)
+            self.assertFalse(creator.is_alive())
+            self.assertEqual(result["task"]["actions"]["effect"]["status"], "pending")
+            self.assertEqual(host.claim_action("task-1", "effect", "first", project=project).kind, "dispatch")
+            self.assertEqual(host.claim_action("task-1", "effect", "second", project=project).kind, "reconcile")
     def test_same_task_id_is_isolated_by_project(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

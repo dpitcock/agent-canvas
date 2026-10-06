@@ -183,27 +183,34 @@ class HostSupervisor:
         registration = self.provision(project)
         _validate_task_id(task_id)
         path = self._project_dir(project) / "tasks" / f"{task_id}.json"
-        if path.exists():
-            return self._read(path)
-        action_map = {}
-        for action in actions:
-            action = dict(action)
-            action_id = action.pop("id", None)
-            if not action_id or action_id in action_map:
-                raise ValueError("actions require unique ids")
-            action_map[action_id] = {**action, "status": "pending", "attempts": [], "evidence": None}
-        authorization = {"revision": 1, "permitted_operations": sorted(set(permitted_operations)),
-                         "prohibited_operations": list(DEFAULT_PROHIBITED)}
-        authorization["digest"] = _digest(authorization)
-        task = {"schema_version": 1, "task_id": task_id, "project": registration["project"],
-                "status": "paused" if "pause" in registration.get("owner_override", {}).get("modes", []) else "active",
-                "authorization": authorization, "actions": action_map, "validators": list(validators),
-                "blockers": list(blockers), "evidence": {"validators": {}}, "visible_messages": []}
-        self._write(path, task)
-        self._event(task_id, "task_created", project=project, authorization_digest=authorization["digest"])
-        if task["status"] == "paused":
-            self._event(task_id, "owner_override_paused", project=project)
-        return task
+        lock_path = path.with_name(path.name + ".lock")
+        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with lock_path.open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                if path.exists():
+                    return self._read(path)
+                action_map = {}
+                for action in actions:
+                    action = dict(action)
+                    action_id = action.pop("id", None)
+                    if not action_id or action_id in action_map:
+                        raise ValueError("actions require unique ids")
+                    action_map[action_id] = {**action, "status": "pending", "attempts": [], "evidence": None}
+                authorization = {"revision": 1, "permitted_operations": sorted(set(permitted_operations)),
+                                 "prohibited_operations": list(DEFAULT_PROHIBITED)}
+                authorization["digest"] = _digest(authorization)
+                task = {"schema_version": 1, "task_id": task_id, "project": registration["project"],
+                        "status": "paused" if "pause" in registration.get("owner_override", {}).get("modes", []) else "active",
+                        "authorization": authorization, "actions": action_map, "validators": list(validators),
+                        "blockers": list(blockers), "evidence": {"validators": {}}, "visible_messages": []}
+                self._write(path, task)
+                self._event(task_id, "task_created", project=project, authorization_digest=authorization["digest"])
+                if task["status"] == "paused":
+                    self._event(task_id, "owner_override_paused", project=project)
+                return task
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def task(self, task_id, *, project=None):
         return self._read(self._task_path(task_id, project))
@@ -333,7 +340,12 @@ class HostSupervisor:
         binary = self._validator_binary(command, project)
         binary_bytes = binary.read_bytes() if binary.is_file() else None
         binary_digest = hashlib.sha256(binary_bytes).hexdigest() if binary_bytes is not None else None
-        if binary_bytes is None or "/" not in command[0] or Path(command[0]).is_absolute():
+        try:
+            binary.relative_to(Path(project).resolve())
+            workspace_binary = True
+        except ValueError:
+            workspace_binary = False
+        if binary_bytes is None or not workspace_binary:
             return command, binary_digest, None
         descriptor, copy_name = tempfile.mkstemp(prefix="validator-", dir=self.root)
         copy_path = Path(copy_name)
