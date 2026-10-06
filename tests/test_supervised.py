@@ -187,6 +187,23 @@ class SupervisedTasks(unittest.TestCase):
             self.host.resume("task-1")
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "finished").kind, "paused")
 
+    def test_resume_waiting_for_task_lock_does_not_block_gate_interrupt_check(self):
+        self.task()
+        self.host.pause("task-1")
+        resumed = threading.Thread(target=lambda: self.host.resume("task-1"))
+        with self.host._locked_task("task-1"):
+            resumed.start()
+            time.sleep(0.05)
+            observed = {}
+            checker = threading.Thread(target=lambda: observed.setdefault(
+                "status", self.host._interrupt_status("task-1")))
+            checker.start()
+            checker.join(timeout=0.5)
+            self.assertFalse(checker.is_alive())
+            self.assertEqual(observed["status"], "paused")
+        resumed.join(timeout=1)
+        self.assertFalse(resumed.is_alive())
+
     def test_genuine_blocker_is_released_only_after_independent_actions_finish(self):
         self.task(blockers=[{"id": "owner-choice", "owner_action": "Choose the deployment region."}])
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "blocked").kind, "continue")

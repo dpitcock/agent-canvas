@@ -22,6 +22,6 @@ Upstream desktop support needs: a host-owned final-message interceptor, durable 
 
 ## Test results
 
-Executed: `python3 -m unittest discover -s tests -v` (51 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
+Executed: `python3 -m unittest discover -s tests -v` (52 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
 
 The supervised tests cover the ten required scenarios through the host API and an App Server-shaped renderer event stream. Unrun: a live Codex App Server model turn, desktop-app interception, and an operating-system-separated service-account deployment. Those require a deliberately deployed custom client and host boundary; they are not represented as passing checks.

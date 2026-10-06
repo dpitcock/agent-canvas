@@ -496,11 +496,12 @@ class HostSupervisor:
             self._event(task_id, "paused", project=task["project"])
 
     def resume(self, task_id, *, project=None):
-        # Hold the interrupt lock through the state transition so a concurrent pause
-        # cannot have its durable request erased by an invalid resume.
-        with self._locked_interrupt(task_id, project) as interrupt_path:
-            pending = self._read(interrupt_path).get("status") if interrupt_path.exists() else None
-            with self._locked_task(task_id, project) as task:
+        # Match gate_final's task -> interrupt order to avoid an ABBA deadlock.
+        # The task lock also makes clearing the interrupt part of the same valid
+        # paused-to-active transition.
+        with self._locked_task(task_id, project) as task:
+            with self._locked_interrupt(task_id, task["project"]) as interrupt_path:
+                pending = self._read(interrupt_path).get("status") if interrupt_path.exists() else None
                 if task["status"] != "paused":
                     if task["status"] in TERMINAL_STATUSES:
                         raise ValueError("A terminal task cannot resume")
