@@ -204,6 +204,16 @@ class SupervisedTasks(unittest.TestCase):
         resumed.join(timeout=1)
         self.assertFalse(resumed.is_alive())
 
+    def test_resume_cannot_clear_a_pending_cancellation(self):
+        self.task()
+        self.host.pause("task-1")
+        self.host._request_interrupt("task-1", "cancelled")
+        with self.assertRaisesRegex(ValueError, "cancellation"):
+            self.host.resume("task-1")
+        decision = self.host.gate_final("task-1", "attempt-1", "finished")
+        self.assertEqual(decision.kind, "cancelled")
+        self.assertFalse(decision.release)
+
     def test_genuine_blocker_is_released_only_after_independent_actions_finish(self):
         self.task(blockers=[{"id": "owner-choice", "owner_action": "Choose the deployment region."}])
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "blocked").kind, "continue")

@@ -392,6 +392,11 @@ class HostSupervisor:
         with self._locked_task(task_id, project) as task:
             self._event(task_id, "final_attempt", project=task["project"], attempt_id=attempt_id, content_digest=hashlib.sha256(content.encode()).hexdigest())
             if task["status"] in TERMINAL_STATUSES | {"paused"}:
+                if task["status"] == "paused" and self._interrupt_status(task_id, project=task["project"]) == "cancelled":
+                    task["status"] = "cancelled"
+                    self._save_task(task)
+                    self._event(task_id, "cancelled", project=task["project"], source="final_interrupt")
+                    return Decision("cancelled", message="Automatic continuation is disabled until an explicit resume.")
                 return Decision(task["status"], message="Automatic continuation is disabled until an explicit resume.")
             task["withheld_final"] = {"attempt_id": attempt_id, "content": content,
                                       "content_digest": hashlib.sha256(content.encode()).hexdigest(),
@@ -508,6 +513,8 @@ class HostSupervisor:
                     if pending == "paused":
                         raise ValueError("A pause transition is pending")
                     raise ValueError("Only a paused task can resume")
+                if pending == "cancelled":
+                    raise ValueError("A cancellation is pending")
                 interrupt_path.unlink(missing_ok=True)
                 task["status"] = "active"
                 self._save_task(task)
