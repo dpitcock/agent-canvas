@@ -321,7 +321,14 @@ class ContainerExecutor:
             removed = subprocess.run([cls.RUNTIME, "rm", "-f", name], capture_output=True, timeout=10, check=False)
         except (OSError, subprocess.SubprocessError):
             return False
-        return removed.returncode == 0
+        if removed.returncode == 0:
+            return True
+        try:
+            absent = subprocess.run([cls.RUNTIME, "container", "inspect", name], capture_output=True,
+                                    timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return absent.returncode != 0
 
     @staticmethod
     def _remove_stage(path):
@@ -342,12 +349,12 @@ class ContainerExecutor:
             snapshot = stage_inputs(pinned, request.inputs, staging_parent, max_bytes=16 * 1024 * 1024, max_files=128)
         name = "agent-canvas-" + _sha256(f"{request.action_id}:{request.attempt_id}:{uuid.uuid4()}".encode())[:24]
         output, truncated, timed_out, cancelled, status = b"", False, False, False, "launch_failed"
-        started = False
+        create_attempted = False
         try:
+            create_attempted = True
             created = subprocess.run(cls.plan(request, snapshot.root, name), capture_output=True, timeout=10, check=False)
             if created.returncode:
                 raise ConfigurationError("Docker rejected the required isolation configuration")
-            started = True
             process = subprocess.Popen([cls.RUNTIME, "start", "--attach", name], stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT, start_new_session=True)
             deadline = time.monotonic() + request.timeout_s
@@ -381,7 +388,7 @@ class ContainerExecutor:
             status = process.returncode if not (timed_out or cancelled) else ("timeout" if timed_out else "cancelled")
         finally:
             cleanup_ok = True
-            if started:
+            if create_attempted:
                 cleanup_ok = cls._remove_container(name)
             stage_removed = cls._remove_stage(snapshot.root)
             if not cleanup_ok or not stage_removed:

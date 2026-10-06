@@ -129,6 +129,13 @@ class RuntimeValidationTests(unittest.TestCase):
         with mock.patch.object(executor.subprocess, "run", side_effect=executor.subprocess.TimeoutExpired("docker", 10)):
             self.assertFalse(executor.ContainerExecutor._remove_container("agent-canvas-test"))
 
+    def test_container_cleanup_accepts_confirmed_absence_after_create_ambiguity(self):
+        failed_remove = mock.Mock(returncode=1)
+        absent = mock.Mock(returncode=1)
+        with mock.patch.object(executor.subprocess, "run", side_effect=[failed_remove, absent]) as run:
+            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test"))
+        self.assertEqual(run.call_args_list[1].args[0][-2:], ["inspect", "agent-canvas-test"])
+
     def test_stage_removal_failure_is_explicit(self):
         with mock.patch.object(executor.shutil, "rmtree", side_effect=OSError("busy")):
             self.assertFalse(executor.ContainerExecutor._remove_stage(Path("/host-owned/stage")))
