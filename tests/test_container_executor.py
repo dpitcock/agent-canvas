@@ -136,6 +136,12 @@ class RuntimeValidationTests(unittest.TestCase):
             self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test"))
         self.assertEqual(run.call_args_list[1].args[0][-2:], ["inspect", "agent-canvas-test"])
 
+    def test_container_cleanup_accepts_inspect_missing_object_diagnostic(self):
+        failed_remove = mock.Mock(returncode=1)
+        absent = mock.Mock(returncode=1, stderr=b"Error: No such object: agent-canvas-test\n")
+        with mock.patch.object(executor.subprocess, "run", side_effect=[failed_remove, absent]):
+            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test"))
+
     def test_container_cleanup_rejects_ambiguous_inspect_error(self):
         failed_remove = mock.Mock(returncode=1)
         daemon_error = mock.Mock(returncode=1, stderr=b"Cannot connect to the Docker daemon")

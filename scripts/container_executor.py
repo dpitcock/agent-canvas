@@ -331,7 +331,10 @@ class ContainerExecutor:
         if absent.returncode == 0:
             return False
         error = absent.stderr.decode("utf-8", "replace") if isinstance(absent.stderr, bytes) else (absent.stderr or "")
-        return f"No such container: {name}" in error
+        return any(message in error for message in (
+            f"No such container: {name}",
+            f"No such object: {name}",
+        ))
 
     @staticmethod
     def _remove_stage(path):
