@@ -170,6 +170,26 @@ class InstallSmoke(unittest.TestCase):
             self.assertFalse((forced / "config/workspace-config.yml").exists())
             self.assertFalse((forced / "INSTALL-FOLLOWUP.md").exists())
 
+    def test_remove_all_rejects_adapter_path_that_escapes_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "project"
+            target.mkdir()
+            victim = base / "victim"
+            victim.write_text("do not remove")
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "baselines": {},
+                "adapters": {"links": {"../victim": "adapter-target"}},
+            }))
+
+            with self.assertRaisesRegex(ValueError, "outside the project"):
+                uninstaller.uninstall(target, mode="remove-all", apply=True)
+
+            self.assertEqual(victim.read_text(), "do not remove")
+
     def test_preserve_uninstall_keeps_preexisting_matching_files_and_ignore_entries(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

@@ -63,6 +63,24 @@ class SupervisedTasks(unittest.TestCase):
         (self.project / "tasks.md").write_text("write-doc: complete\n")
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "done").kind, "continue")
 
+    def test_unsafe_task_ids_are_rejected_before_task_path_lookup_or_creation(self):
+        for task_id in ("../other", "task/child", ".", ""):
+            with self.subTest(task_id=task_id):
+                with self.assertRaisesRegex(ValueError, "task_id"):
+                    self.host.task(task_id, project=self.project)
+                with self.assertRaisesRegex(ValueError, "task_id"):
+                    self.host.create_task(task_id, self.project, [{"id": "write", "operation": "write"}])
+
+    def test_registration_rejects_a_replacement_directory_at_the_same_path(self):
+        original = self.project
+        replacement = self.base / "replacement"
+        replacement.mkdir()
+        original.rename(self.base / "original")
+        replacement.rename(original)
+
+        with self.assertRaisesRegex(ValueError, "identity"):
+            self.host.provision(original)
+
     def test_restart_recovers_rejected_final_and_leased_action(self):
         self.task()
         self.host.gate_final("task-1", "attempt-1", "done")

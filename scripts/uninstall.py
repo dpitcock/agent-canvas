@@ -34,9 +34,11 @@ def root_path(target):
 def safe_path(root, path):
     path = Path(path)
     try:
-        path.relative_to(root)
+        relative = path.relative_to(root)
     except ValueError as error:
         raise ValueError(f"Path is outside the project: {path}") from error
+    if ".." in relative.parts:
+        raise ValueError(f"Path is outside the project: {path}")
     for ancestor in (path, *path.parents):
         if ancestor == root:
             return

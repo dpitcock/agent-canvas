@@ -51,6 +51,18 @@ class HostSupervisor:
     def _project_key(self, project):
         return hashlib.sha256(str(Path(project).resolve()).encode()).hexdigest()
 
+    @staticmethod
+    def _validate_task_id(task_id):
+        if not isinstance(task_id, str) or not task_id or any(
+                character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                for character in task_id):
+            raise ValueError("task_id must contain only letters, digits, hyphen, and underscore")
+
+    @staticmethod
+    def _project_identity(project):
+        status = Path(project).stat()
+        return {"device": status.st_dev, "inode": status.st_ino}
+
     def _project_dir(self, project):
         return self.root / "projects" / self._project_key(project)
 
@@ -58,6 +70,7 @@ class HostSupervisor:
         return self._project_dir(project) / "registration.json"
 
     def _task_path(self, task_id, project=None):
+        self._validate_task_id(task_id)
         if project is not None:
             path = self._project_dir(project) / "tasks" / f"{task_id}.json"
             if not path.is_file():
@@ -69,6 +82,7 @@ class HostSupervisor:
         return matches[0]
 
     def _task_lock_path(self, task_id, project=None):
+        self._validate_task_id(task_id)
         if project is not None:
             return self._project_dir(project) / "tasks" / f"{task_id}.lock"
         return self._task_path(task_id).with_suffix(".lock")
@@ -111,13 +125,16 @@ class HostSupervisor:
         project = Path(project).resolve()
         if not project.is_dir():
             raise ValueError("Supervised project must be an existing directory")
+        identity = self._project_identity(project)
         registration = self._registration(project)
         if registration.exists():
             current = self._read(registration)
             if current["project"] != str(project):
                 raise ValueError("Host registration project mismatch")
+            if current.get("identity") != identity:
+                raise ValueError("Host registration project directory identity mismatch")
             return current
-        value = {"schema_version": 1, "project": str(project), "created_at": _now()}
+        value = {"schema_version": 1, "project": str(project), "identity": identity, "created_at": _now()}
         self._write(registration, value)
         return value
 
@@ -142,9 +159,8 @@ class HostSupervisor:
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def create_task(self, task_id, project, actions, *, validators=(), blockers=(), permitted_operations=("read", "write", "delegate")):
+        self._validate_task_id(task_id)
         registration = self.provision(project)
-        if not task_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in task_id):
-            raise ValueError("task_id must contain only letters, digits, hyphen, and underscore")
         path = self._project_dir(project) / "tasks" / f"{task_id}.json"
         with self._locked_task(task_id, project=project):
             if path.exists():
