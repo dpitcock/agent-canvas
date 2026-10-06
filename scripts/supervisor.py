@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import signal
 from contextlib import contextmanager
 import fcntl
 
@@ -366,18 +367,19 @@ class HostSupervisor:
             workspace_binary = False
         if binary_bytes is None or not workspace_binary:
             return command, binary_digest, None
-        descriptor, copy_name = tempfile.mkstemp(prefix="validator-", dir=self.root)
-        copy_path = Path(copy_name)
+        context_root = Path(tempfile.mkdtemp(prefix="validator-", dir=self.root))
+        source_parent = lexical.parent
+        copy_parent = context_root / "context"
+        copy_path = copy_parent / lexical.name
         try:
-            with os.fdopen(descriptor, "wb") as out:
-                out.write(binary_bytes)
-                out.flush()
-                os.fsync(out.fileno())
+            shutil.copytree(source_parent, copy_parent, symlinks=False)
+            if hashlib.sha256(copy_path.read_bytes()).hexdigest() != binary_digest:
+                raise ValueError("Validator snapshot did not preserve executable bytes")
             copy_path.chmod(binary.stat().st_mode & 0o777)
         except BaseException:
-            copy_path.unlink(missing_ok=True)
+            shutil.rmtree(context_root, ignore_errors=True)
             raise
-        return [str(copy_path), *command[1:]], binary_digest, copy_path
+        return [str(copy_path), *command[1:]], binary_digest, context_root
 
     def _validator_receipt(self, validator, project):
         command = validator.get("command")
@@ -390,10 +392,12 @@ class HostSupervisor:
         try:
             with tempfile.TemporaryFile(mode="w+b") as stdout, tempfile.TemporaryFile(mode="w+b") as stderr:
                 try:
-                    run = subprocess.run(run_command, stdout=stdout, stderr=stderr, timeout=timeout,
-                                         check=False, cwd=project)
-                    status = run.returncode
+                    run = subprocess.Popen(run_command, stdout=stdout, stderr=stderr, cwd=project,
+                                           start_new_session=True)
+                    status = run.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
+                    os.killpg(run.pid, signal.SIGKILL)
+                    run.wait()
                     status = "timeout"
                 stdout.seek(0)
                 output_bytes = stdout.read(8192)
@@ -403,7 +407,7 @@ class HostSupervisor:
                 output = output_bytes.decode("utf-8", errors="replace")
         finally:
             if protected_copy is not None:
-                protected_copy.unlink(missing_ok=True)
+                shutil.rmtree(protected_copy, ignore_errors=True)
         return {"command": command, "command_digest": _digest(command), "binary_digest": binary_digest,
                 "exit_status": status, "output": output, "digest": hashlib.sha256(output.encode()).hexdigest(),
                 "timeout_s": timeout, "version": validator.get("version", "host-configured")}
