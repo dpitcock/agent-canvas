@@ -60,6 +60,17 @@ class HostSupervisor:
     def _registration(self, project):
         return self._project_dir(project) / "registration.json"
 
+    @contextmanager
+    def _locked_project(self, project):
+        path = self._project_dir(project) / "project.lock"
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
     def _project_event(self, project, event_type, **details):
         event = {"at": _now(), "type": event_type, "project": str(Path(project).resolve()), **details}
         path = self._project_dir(project) / "audit.jsonl"
@@ -137,27 +148,29 @@ class HostSupervisor:
     def import_owner_override(self, project, modes, *, source_digest):
         """Import a one-time, owner-provided workspace snapshot into host state."""
         project = Path(project).resolve()
-        current = self.provision(project)
-        if not isinstance(modes, (list, tuple, set)) or any(mode not in OWNER_OVERRIDE_MODES for mode in modes):
-            raise ValueError("Unknown owner override mode")
-        if not isinstance(source_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", source_digest):
-            raise ValueError("Owner override snapshot requires a SHA-256 source digest")
-        normalized = sorted(set(modes))
-        current["owner_override"] = {"modes": normalized, "source_digest": source_digest, "imported_at": _now()}
-        self._write(self._registration(project), current)
-        self._project_event(project, "owner_override_imported", modes=normalized, source_digest=source_digest)
-        for path in sorted((self._project_dir(project) / "tasks").glob("*.json")):
-            task_id = path.stem
-            task = self._read(path)
-            if task["status"] in TERMINAL_STATUSES:
-                continue
-            if "reset" in normalized:
-                self.cancel(task_id, project=project)
-                self._event(task_id, "owner_override_reset", project=task["project"])
-            elif "pause" in normalized and task["status"] == "active":
-                self.pause(task_id, project=project)
-                self._event(task_id, "owner_override_paused", project=task["project"])
-        return current
+        with self._locked_project(project):
+            current = self.provision(project)
+            if not isinstance(modes, (list, tuple, set)) or any(mode not in OWNER_OVERRIDE_MODES for mode in modes):
+                raise ValueError("Unknown owner override mode")
+            if not isinstance(source_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", source_digest):
+                raise ValueError("Owner override snapshot requires a SHA-256 source digest")
+            normalized = sorted(set(modes))
+            current["owner_override"] = {"modes": normalized, "source_digest": source_digest, "imported_at": _now()}
+            self._write(self._registration(project), current)
+            self._project_event(project, "owner_override_imported", modes=normalized, source_digest=source_digest)
+            paths = [path for path in sorted((self._project_dir(project) / "tasks").glob("*.json")) if not path.name.endswith(".interrupt.json")]
+            for path in paths:
+                task_id = path.stem
+                task = self._read(path)
+                if task["status"] in TERMINAL_STATUSES:
+                    continue
+                if "reset" in normalized:
+                    self.cancel(task_id, project=project)
+                    self._event(task_id, "owner_override_reset", project=task["project"])
+                elif "pause" in normalized and task["status"] == "active":
+                    self.pause(task_id, project=project)
+                    self._event(task_id, "owner_override_paused", project=task["project"])
+            return current
 
     def _project_for_task(self, task_id, project=None):
         return self._task_path(task_id, project).parents[1]
@@ -180,8 +193,12 @@ class HostSupervisor:
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def create_task(self, task_id, project, actions, *, validators=(), blockers=(), permitted_operations=("read", "write", "delegate")):
-        registration = self.provision(project)
         _validate_task_id(task_id)
+        with self._locked_project(project):
+            registration = self.provision(project)
+            return self._create_task_locked(task_id, project, registration, actions, validators, blockers, permitted_operations)
+
+    def _create_task_locked(self, task_id, project, registration, actions, validators, blockers, permitted_operations):
         path = self._project_dir(project) / "tasks" / f"{task_id}.json"
         lock_path = path.with_name(path.name + ".lock")
         lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -340,9 +357,11 @@ class HostSupervisor:
         binary = self._validator_binary(command, project)
         binary_bytes = binary.read_bytes() if binary.is_file() else None
         binary_digest = hashlib.sha256(binary_bytes).hexdigest() if binary_bytes is not None else None
+        raw = Path(command[0]) if Path(command[0]).is_absolute() else Path(project) / command[0]
+        lexical = Path(os.path.abspath(raw))
         try:
-            binary.relative_to(Path(project).resolve())
-            workspace_binary = True
+            lexical.relative_to(Path(project).resolve())
+            workspace_binary = "/" in command[0] or Path(command[0]).is_absolute()
         except ValueError:
             workspace_binary = False
         if binary_bytes is None or not workspace_binary:

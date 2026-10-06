@@ -23,9 +23,13 @@ class SupervisedRenderer:
         if method == "item/completed":
             item = event.get("params", {}).get("item", {})
             if item.get("type") == "agentMessage":
-                # App Server repeats the complete agent message (including its
-                # text) after deltas. It is final-message content, not progress.
-                self._completed_messages.append(item.get("text", ""))
+                # Prefer the protocol's terminal item. Legacy servers omit phase,
+                # so retain the last completed message as a compatibility fallback.
+                phase = item.get("phase")
+                if phase == "final_answer":
+                    self._completed_messages = [item.get("text", "")]
+                elif phase is None:
+                    self._completed_messages.append(item.get("text", ""))
                 return []
         if method != "turn/completed":
             return [{"kind": "progress", "event": event}]
