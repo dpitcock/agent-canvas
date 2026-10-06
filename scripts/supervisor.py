@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 import time
 from contextlib import contextmanager
@@ -50,7 +51,23 @@ class HostSupervisor:
             pass
 
     def _project_key(self, project):
-        return hashlib.sha256(str(Path(project).resolve()).encode()).hexdigest()
+        # Registration keys must not change when workspace symlinks change.
+        return hashlib.sha256(str(self._project_path(project)).encode()).hexdigest()
+
+    @staticmethod
+    def _project_path(project):
+        return Path(os.path.abspath(Path(project).expanduser()))
+
+    @staticmethod
+    def _root_identity(project):
+        info = os.stat(project, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Project root identity must be a real directory")
+        return {"device": info.st_dev, "inode": info.st_ino}
+
+    def _verify_registration_identity(self, project, registration):
+        if registration.get("root_identity") != self._root_identity(project):
+            raise ValueError("Project root identity changed; owner re-registration is required")
 
     def _project_dir(self, project):
         return self.root / "projects" / self._project_key(project)
@@ -70,7 +87,7 @@ class HostSupervisor:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def _project_event(self, project, event_type, **details):
-        event = {"at": _now(), "type": event_type, "project": str(Path(project).resolve()), **details}
+        event = {"at": _now(), "type": event_type, "project": str(self._project_path(project)), **details}
         path = self._project_dir(project) / "audit.jsonl"
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as out:
@@ -82,6 +99,8 @@ class HostSupervisor:
     def _task_path(self, task_id, project=None):
         _validate_task_id(task_id)
         if project is not None:
+            registration = self._read(self._registration(project))
+            self._verify_registration_identity(project, registration)
             path = self._project_dir(project) / "tasks" / f"{task_id}.json"
             if not path.is_file():
                 raise ValueError(f"Unknown task: {task_id}")
@@ -118,17 +137,23 @@ class HostSupervisor:
             raise ValueError(f"Host state is unreadable: {path}") from error
 
     def provision(self, project):
-        project = Path(project).resolve()
+        project = self._project_path(project)
+        with self._locked_project(project):
+            return self._provision_locked(project)
+
+    def _provision_locked(self, project):
+        project = self._project_path(project)
+        identity = self._root_identity(project)
         if not project.is_dir():
             raise ValueError("Supervised project must be an existing directory")
         try:
-            self.root.relative_to(project)
+            self.root.relative_to(project.resolve())
         except ValueError:
             pass
         else:
             raise ValueError("Host state directory must be outside the supervised project workspace")
         try:
-            project.relative_to(self.root)
+            project.resolve().relative_to(self.root)
         except ValueError:
             pass
         else:
@@ -138,16 +163,17 @@ class HostSupervisor:
             current = self._read(registration)
             if current["project"] != str(project):
                 raise ValueError("Host registration project mismatch")
+            self._verify_registration_identity(project, current)
             return current
-        value = {"schema_version": 1, "project": str(project), "created_at": _now()}
+        value = {"schema_version": 1, "project": str(project), "root_identity": identity, "created_at": _now()}
         self._write(registration, value)
         return value
 
     def import_owner_override(self, project, modes, *, source_digest):
         """Import a one-time, owner-provided workspace snapshot into host state."""
-        project = Path(project).resolve()
+        project = self._project_path(project)
         with self._locked_project(project):
-            current = self.provision(project)
+            current = self._provision_locked(project)
             if not isinstance(modes, (list, tuple, set)) or any(mode not in OWNER_OVERRIDE_MODES for mode in modes):
                 raise ValueError("Unknown owner override mode")
             if not isinstance(source_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", source_digest):
@@ -193,7 +219,7 @@ class HostSupervisor:
     def create_task(self, task_id, project, actions, *, validators=(), blockers=(), permitted_operations=("read", "write", "delegate")):
         _validate_task_id(task_id)
         with self._locked_project(project):
-            registration = self.provision(project)
+            registration = self._provision_locked(project)
             return self._create_task_locked(task_id, project, registration, actions, validators, blockers, permitted_operations)
 
     def _create_task_locked(self, task_id, project, registration, actions, validators, blockers, permitted_operations):

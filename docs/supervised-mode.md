@@ -4,7 +4,11 @@
 
 One host state directory can serve multiple projects. Every task operation accepts a project identity and resolves state beneath that project's host registration. Task IDs may therefore repeat across projects without sharing actions, evidence, visible messages, or audit events; an unqualified lookup is rejected when it would be ambiguous.
 
+Registration keys use the stored absolute path without dynamically resolving aliases. The installer canonicalizes the initial target; callers must reuse that exact path. Root device/inode changes and old registrations without an identity fail closed pending owner migration. Provisioning and override import share a project lock. Override imports pin path components, verify the opened root identity, and reject shared hard links as well as symlinks.
+
 The custom renderer consumes Codex App Server item events. It forwards progress but buffers both `item/agentMessage/delta` content and completed `agentMessage` items. Only a `turn/completed` event with status `completed` asks the host supervisor to release content; failed or interrupted turns remain recoverable. Remaining host actions queue a continuation instead; a blocker is delivered only after no independently authorized action remains.
+
+The host must construct each renderer with the `thread_id` and `turn_id` from `turn/start`. Unbound or foreign notifications are ignored, including progress. Each renderer is single-use after any terminal event or gate exception; continuation starts a newly bound renderer.
 
 The POC uses atomic replacement for task state, fsynced append-only audit events, and an interprocess task lease lock. It recovers a leased side-effect action as `reconcile`, never a second dispatch. Pause and cancellation are persisted and disable automatic continuation.
 
@@ -28,6 +32,6 @@ Upstream desktop support needs: a host-owned final-message interceptor, durable 
 
 ## Test results
 
-Executed: `python3 -m unittest discover -s tests -v` (57 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
+Executed: `python3 -m unittest discover -s tests -v` (66 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
 
 Tests cover host action gating, recovery, authorization, multi-project isolation, interrupt ordering, legacy/final message selection, and fail-closed validation. Tests of the removed local runner were replaced with no-execution and restart regressions; the smaller count does not represent successful sandbox validation. Unrun/deferred: isolated validator execution, validation-backed completion, a live Codex App Server model turn, desktop-app interception, and an operating-system-separated service-account deployment.

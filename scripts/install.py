@@ -30,11 +30,15 @@ def digest(value):
 OWNER_OVERRIDE_MODES = {"pause", "bypass-review", "reset"}
 
 
-def root_owner_override(root):
+def root_owner_override(root, *, expected_identity=None):
     """Parse only a regular .owner-override at this target's root."""
     # Pin each directory component without following symlinks, then open the
     # leaf relative to the pinned root. Path checks followed by open are racy.
     root = Path(os.path.abspath(root))
+    initial = os.stat(root, follow_symlinks=False)
+    if not stat.S_ISDIR(initial.st_mode):
+        raise ValueError("Project root identity must be a directory")
+    expected_identity = expected_identity or {"device": initial.st_dev, "inode": initial.st_ino}
     directory = os.open(root.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for component in root.parts[1:]:
@@ -42,6 +46,9 @@ def root_owner_override(root):
                             dir_fd=directory)
             os.close(directory)
             directory = child
+        opened = os.fstat(directory)
+        if expected_identity != {"device": opened.st_dev, "inode": opened.st_ino}:
+            raise ValueError("Project root identity changed during override import")
         try:
             descriptor = os.open(".owner-override", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                                  dir_fd=directory)
@@ -52,8 +59,11 @@ def root_owner_override(root):
     finally:
         os.close(directory)
     with os.fdopen(descriptor, "rb") as source_file:
-        if not stat.S_ISREG(os.fstat(source_file.fileno()).st_mode):
+        info = os.fstat(source_file.fileno())
+        if not stat.S_ISREG(info.st_mode):
             raise ValueError("Owner Override must be a regular file at the project root")
+        if info.st_nlink != 1:
+            raise ValueError("Owner Override must not be a shared hard-linked file")
         source = source_file.read()
     assignment, legacy = None, []
     for raw in source.decode("utf-8").splitlines():
@@ -103,7 +113,7 @@ def provision_supervised(root, state_dir):
     spec.loader.exec_module(module)
     host = module.HostSupervisor(state_dir)
     registration = host.provision(root)
-    override = root_owner_override(root)
+    override = root_owner_override(root, expected_identity=registration["root_identity"])
     if override is not None:
         registration = host.import_owner_override(root, **override)
     return {"enabled": True, "state_dir": str(state_dir), "registration_digest": digest(registration),

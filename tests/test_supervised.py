@@ -36,7 +36,7 @@ def pause_from_process(state_dir, project, result):
 class SupervisedTasks(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.base = Path(self.tmp.name)
+        self.base = Path(self.tmp.name).resolve()
         self.project = self.base / "project"
         self.project.mkdir()
         self.host = supervisor.HostSupervisor(self.base / "host-state")
@@ -107,12 +107,13 @@ class SupervisedTasks(unittest.TestCase):
             with self.subTest(phases=phases):
                 host = supervisor.HostSupervisor(self.base / ("host-" + str(phases)))
                 host.create_task("render", self.project, [])
-                renderer = client.SupervisedRenderer(host, "render")
+                renderer = client.SupervisedRenderer(host, "render", thread_id="thread-1", turn_id="turn-1")
                 for phase, text in zip(phases, ("first", "last")):
                     renderer.consume({"method": "item/completed", "params": {
+                        "threadId": "thread-1", "turnId": "turn-1",
                         "item": {"type": "agentMessage", "phase": phase, "text": text}}})
                 result = renderer.consume({"method": "turn/completed", "params": {
-                    "turn": {"status": "completed"}}})
+                    "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}})
                 expected = "first" if phases[0] == "final_answer" else "last"
                 self.assertEqual(result[0]["content"], expected)
 
@@ -284,10 +285,10 @@ class SupervisedTasks(unittest.TestCase):
 
     def test_audit_log_records_all_gate_decisions_and_renderer_never_leaks_deltas(self):
         self.task()
-        renderer = client.SupervisedRenderer(self.host, "task-1")
-        self.assertEqual(renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "secret final"}}), [])
-        self.assertEqual(renderer.consume({"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": " completed final"}}}), [])
-        output = renderer.consume({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+        renderer = client.SupervisedRenderer(self.host, "task-1", thread_id="thread-1", turn_id="turn-1")
+        self.assertEqual(renderer.consume({"method": "item/agentMessage/delta", "params": {"threadId": "thread-1", "turnId": "turn-1", "delta": "secret final"}}), [])
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": {"threadId": "thread-1", "turnId": "turn-1", "item": {"type": "agentMessage", "text": " completed final"}}}), [])
+        output = renderer.consume({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}})
         self.assertEqual(output[0]["kind"], "continuation")
         self.assertNotIn("secret final", str(output))
         self.assertNotIn("completed final", str(output))
@@ -298,9 +299,9 @@ class SupervisedTasks(unittest.TestCase):
     def test_renderer_does_not_gate_failed_or_interrupted_turns(self):
         self.task()
         for status in ("failed", "interrupted"):
-            renderer = client.SupervisedRenderer(self.host, "task-1")
-            renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "partial final"}})
-            result = renderer.consume({"method": "turn/completed", "params": {"turn": {"status": status}}})
+            renderer = client.SupervisedRenderer(self.host, "task-1", thread_id="thread-1", turn_id="turn-1")
+            renderer.consume({"method": "item/agentMessage/delta", "params": {"threadId": "thread-1", "turnId": "turn-1", "delta": "partial final"}})
+            result = renderer.consume({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": status}}})
             self.assertEqual(result[0]["kind"], "turn_incomplete")
         self.assertEqual(self.host.visible_messages("task-1"), [])
         self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit("task-1")])
@@ -308,11 +309,11 @@ class SupervisedTasks(unittest.TestCase):
     def test_renderer_releases_only_the_buffered_completed_agent_message(self):
         self.task()
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        renderer = client.SupervisedRenderer(self.host, "task-1")
-        renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "streamed duplicate"}})
+        renderer = client.SupervisedRenderer(self.host, "task-1", thread_id="thread-1", turn_id="turn-1")
+        renderer.consume({"method": "item/agentMessage/delta", "params": {"threadId": "thread-1", "turnId": "turn-1", "delta": "streamed duplicate"}})
         self.assertEqual(renderer.consume({"method": "item/completed", "params": {
-            "item": {"type": "agentMessage", "text": "authoritative final"}}}), [])
-        released = renderer.consume({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+            "threadId": "thread-1", "turnId": "turn-1", "item": {"type": "agentMessage", "text": "authoritative final"}}}), [])
+        released = renderer.consume({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}})
         self.assertEqual(released, [{"kind": "final", "content": "authoritative final", "decision": "complete"}])
 
 
@@ -338,7 +339,7 @@ class SupervisedInstallation(unittest.TestCase):
 
     def test_override_swap_at_open_cannot_follow_an_external_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             project = base / "project"
             project.mkdir()
             override = project / ".owner-override"
@@ -357,7 +358,7 @@ class SupervisedInstallation(unittest.TestCase):
 
     def test_supervised_install_imports_a_root_owner_override_as_a_host_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             project = base / "project"
             project.mkdir()
             override = project / ".owner-override"
@@ -379,7 +380,7 @@ class SupervisedInstallation(unittest.TestCase):
 
     def test_supervised_upgrade_imports_only_the_target_root_owner_override(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             project = base / "project"
             state_dir = base / "host-state"
             installer.install(project, source=installer.SOURCE, home=base / "home")
@@ -393,7 +394,7 @@ class SupervisedInstallation(unittest.TestCase):
 
     def test_imported_reset_cancels_existing_nonterminal_host_tasks(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             project = base / "project"
             state_dir = base / "host-state"
             installer.install(project, source=installer.SOURCE, home=base / "home", supervised=True,
@@ -410,7 +411,7 @@ class SupervisedInstallation(unittest.TestCase):
 
     def test_supervised_install_rejects_a_symlinked_owner_override(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             project = base / "project"
             project.mkdir()
             outside = base / "outside-override"
@@ -422,7 +423,7 @@ class SupervisedInstallation(unittest.TestCase):
 
     def test_install_and_upgrade_register_only_with_explicit_supervised_option(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             host_state = base / "host-state"
             project = base / "project"
             installer.install(project, source=installer.SOURCE, home=base / "home", supervised=True,
@@ -446,7 +447,7 @@ class SupervisedInstallation(unittest.TestCase):
 class MultipleProjects(unittest.TestCase):
     def test_concurrent_task_creation_is_serialized_before_publication(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             project = base / "project"
             project.mkdir()
             host = supervisor.HostSupervisor(base / "host-state")
@@ -468,7 +469,7 @@ class MultipleProjects(unittest.TestCase):
             self.assertEqual(host.claim_action("task-1", "effect", "second", project=project).kind, "reconcile")
     def test_same_task_id_is_isolated_by_project(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             alpha, beta = base / "alpha", base / "beta"
             alpha.mkdir()
             beta.mkdir()
@@ -484,7 +485,7 @@ class MultipleProjects(unittest.TestCase):
 
     def test_ambiguous_legacy_task_lookup_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             alpha, beta = base / "alpha", base / "beta"
             alpha.mkdir()
             beta.mkdir()
@@ -496,7 +497,7 @@ class MultipleProjects(unittest.TestCase):
 
     def test_task_id_path_traversal_is_rejected_before_project_lookup(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             project = base / "project"
             project.mkdir()
             host = supervisor.HostSupervisor(base / "host-state")
@@ -506,7 +507,7 @@ class MultipleProjects(unittest.TestCase):
 
     def test_host_state_inside_or_enclosing_workspace_is_rejected_by_supervisor(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             project = base / "project"
             project.mkdir()
             with self.assertRaisesRegex(ValueError, "outside"):
@@ -516,7 +517,7 @@ class MultipleProjects(unittest.TestCase):
 
     def test_interprocess_lease_lock_allows_only_one_side_effect_dispatch(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             project = base / "project"
             project.mkdir()
             host = supervisor.HostSupervisor(base / "host-state")
@@ -534,7 +535,7 @@ class MultipleProjects(unittest.TestCase):
 
     def test_terminal_final_or_blocker_is_not_released_twice(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             project = base / "project"
             project.mkdir()
             host = supervisor.HostSupervisor(base / "host-state")
@@ -547,7 +548,7 @@ class MultipleProjects(unittest.TestCase):
 
     def test_pause_and_resume_cannot_reopen_a_terminal_task(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             project = base / "project"
             project.mkdir()
             host = supervisor.HostSupervisor(base / "host-state")
@@ -563,7 +564,7 @@ class MultipleProjects(unittest.TestCase):
 
     def test_pause_uses_the_same_lock_as_final_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             project = base / "project"
             project.mkdir()
             host = supervisor.HostSupervisor(base / "host-state")

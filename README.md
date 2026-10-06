@@ -177,6 +177,10 @@ The renderer forwards ordinary progress events but buffers `item/agentMessage/de
 
 One host state directory can supervise several sibling projects. Each operation is scoped by project identity, so separate projects may both use `task-1` without sharing evidence, visible messages, or audit events. A task lookup without a project identity is rejected if it would be ambiguous.
 
+Use the exact absolute project path stored in the registration (the installer canonicalizes its target before registration). Host lookups do not re-resolve aliases: registration binds that path to the root directory's device/inode, and replacement or legacy registrations without that identity fail closed pending owner migration. Public provisioning and override import share a project lock.
+
+Each `SupervisedRenderer` requires `thread_id` and `turn_id` obtained by the host from `turn/start`. It ignores unrelated or unidentified events and becomes unusable after completion, failure, or a gate exception. A continuation needs a fresh renderer bound to its new turn.
+
 #### Set up a sibling project
 
 Choose a host-state directory that the agent process cannot write. It must be outside the project and must not contain the project; a separately protected volume or service-account-owned directory is the intended deployment boundary.
@@ -203,6 +207,8 @@ Required validation currently fails closed: after independent work completes, th
 #### Owner escape hatch in supervised projects
 
 During an applied `--supervised` install or upgrade, the installer reads only a regular `.owner-override` at the target project’s root and imports an immutable snapshot into host-owned state. It does not follow symlinks, read parent/sibling/home overrides, or watch the file after installation. Edit the root file and run the same applied supervised upgrade again from the protected host context to import a new snapshot; an agent changing the workspace file alone cannot change host behavior.
+
+The installer pins directory descriptors, verifies the opened root against its host registration, and rejects hard-linked override files as shared files.
 
 | Root `.owner-override` mode | Host-supervised behavior |
 | --- | --- |
