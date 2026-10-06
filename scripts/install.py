@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import tempfile
 
@@ -35,9 +36,14 @@ def root_owner_override(root):
     if not path.exists() and not path.is_symlink():
         return None
     safe_destination(Path(root), path)
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("Owner Override must be a regular file at the project root")
-    source = path.read_bytes()
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        raise ValueError("Owner Override must be a regular file, not a symlink") from error
+    with os.fdopen(descriptor, "rb") as source_file:
+        if not stat.S_ISREG(os.fstat(source_file.fileno()).st_mode):
+            raise ValueError("Owner Override must be a regular file at the project root")
+        source = source_file.read()
     assignment, legacy = None, []
     for raw in source.decode("utf-8").splitlines():
         quote, kept = None, []

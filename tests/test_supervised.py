@@ -180,6 +180,15 @@ class SupervisedTasks(unittest.TestCase):
                     self.assertEqual(task["actions"]["effect"]["attempts"], [])
                     self.assertEqual(task["status"], mode)
 
+    def test_recovery_prefers_authorized_work_before_authorization_blocker(self):
+        self.task(actions=[{"id": "forbidden", "operation": "push"},
+                           {"id": "allowed", "operation": "write"}])
+        self.assertEqual(self.host.recover("task-1").next_action["id"], "allowed")
+        self.host.complete_action("task-1", "allowed", evidence={"host": True})
+        decision = self.host.recover("task-1")
+        self.assertEqual(decision.kind, "blocker")
+        self.assertIn("push", decision.message)
+
     def test_resume_does_not_clear_a_pending_pause_request(self):
         self.task()
         self.host._request_interrupt("task-1", "paused")
@@ -308,6 +317,25 @@ class SupervisedTasks(unittest.TestCase):
 
 
 class SupervisedInstallation(unittest.TestCase):
+    def test_override_swap_at_open_cannot_follow_an_external_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            override = project / ".owner-override"
+            override.write_text("OWNER_OVERRIDE=pause")
+            outside = base / "outside"
+            outside.write_text("OWNER_OVERRIDE=reset")
+            actual_open = installer.os.open
+            def swap(path, flags, *args, **kwargs):
+                if Path(path).name == ".owner-override":
+                    override.unlink()
+                    override.symlink_to(outside)
+                return actual_open(path, flags, *args, **kwargs)
+            with mock.patch.object(installer.os, "open", side_effect=swap):
+                with self.assertRaisesRegex(ValueError, "regular|symlink"):
+                    installer.root_owner_override(project)
+
     def test_supervised_install_imports_a_root_owner_override_as_a_host_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

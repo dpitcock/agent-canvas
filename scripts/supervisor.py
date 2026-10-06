@@ -431,7 +431,13 @@ class HostSupervisor:
             remaining = self._remaining(task)
             if task["status"] != "active" or not remaining:
                 return Decision(task["status"])
-            action_id, action = remaining[0]
+            authorized = [(action_id, action) for action_id, action in remaining
+                          if self._operation_allowed(task, action.get("operation"))]
+            if not authorized:
+                operation = remaining[0][1].get("operation")
+                self._event(task_id, "authorization_blocked", project=task["project"], operation=operation)
+                return Decision("blocker", message=self._authorization_message(operation))
+            action_id, action = authorized[0]
             self._event(task_id, "recovered", project=task["project"], action_id=action_id)
             return Decision("continue", next_action={"id": action_id, **{k: v for k, v in action.items() if k not in {"attempts", "evidence", "status"}}})
 
