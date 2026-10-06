@@ -53,6 +53,14 @@ def _safe_relative(path):
     return tuple(parts)
 
 
+def _remove_tree(path):
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        return False
+    return not Path(path).exists()
+
+
 @dataclass(frozen=True)
 class ProjectIdentity:
     device: int
@@ -186,8 +194,9 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
                 os.close(fd)
         digest = _sha256(_canonical(manifest))
         return StagedInputs(root, tuple(copied), digest, total)
-    except Exception:
-        shutil.rmtree(root, ignore_errors=True)
+    except Exception as error:
+        if not _remove_tree(root):
+            raise ConfigurationError("rejected input stage cleanup could not be confirmed") from error
         raise
 
 
@@ -317,11 +326,7 @@ class ContainerExecutor:
     @staticmethod
     def _remove_stage(path):
         """Do not return a validation receipt while a stage may still exist."""
-        try:
-            shutil.rmtree(path)
-        except OSError:
-            return False
-        return not Path(path).exists()
+        return _remove_tree(path)
 
     @classmethod
     def run(cls, request, identity, staging_parent, *, cancellation=None):

@@ -65,6 +65,16 @@ class StagingTests(unittest.TestCase):
             self.assertEqual(len(snapshot.digest), 64)
             self.assertEqual(snapshot.files, ("large.txt",))
 
+    def test_rejected_stage_reports_cleanup_failure(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as staging:
+            project = Path(directory) / "project"
+            project.mkdir()
+            (project / "input.txt").write_text("input")
+            with executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project)) as pinned:
+                with mock.patch.object(executor.shutil, "rmtree", side_effect=OSError("busy")):
+                    with self.assertRaises(executor.ConfigurationError):
+                        executor.stage_inputs(pinned, ["missing.txt"], Path(staging), max_bytes=1024, max_files=1)
+
 
 class RuntimeValidationTests(unittest.TestCase):
     def test_requires_digest_pinned_image_and_rejects_host_fallback(self):
