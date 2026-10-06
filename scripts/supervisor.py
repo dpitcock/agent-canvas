@@ -286,7 +286,8 @@ class HostSupervisor:
         return f"{operation} requires explicit owner authorization in a new authorization revision."
 
     def claim_action(self, task_id, action_id, attempt_id, *, project=None):
-        with self._locked_task(task_id, project) as task:
+        with self._locked_task(task_id, project) as task, self._locked_interrupt(task_id, project) as path:
+            self._apply_pending_interrupt(task, path)
             if task["status"] != "active":
                 return Decision(task["status"])
             action = task["actions"].get(action_id)
@@ -425,13 +426,24 @@ class HostSupervisor:
         return self.task(task_id, project=project)["visible_messages"]
 
     def recover(self, task_id, *, project=None):
-        task = self.task(task_id, project=project)
-        remaining = self._remaining(task)
-        if task["status"] != "active" or not remaining:
-            return Decision(task["status"])
-        action_id, action = remaining[0]
-        self._event(task_id, "recovered", project=task["project"], action_id=action_id)
-        return Decision("continue", next_action={"id": action_id, **{k: v for k, v in action.items() if k not in {"attempts", "evidence", "status"}}})
+        with self._locked_task(task_id, project) as task, self._locked_interrupt(task_id, project) as path:
+            self._apply_pending_interrupt(task, path)
+            remaining = self._remaining(task)
+            if task["status"] != "active" or not remaining:
+                return Decision(task["status"])
+            action_id, action = remaining[0]
+            self._event(task_id, "recovered", project=task["project"], action_id=action_id)
+            return Decision("continue", next_action={"id": action_id, **{k: v for k, v in action.items() if k not in {"attempts", "evidence", "status"}}})
+
+    def _apply_pending_interrupt(self, task, path):
+        """Caller holds task and interrupt locks, in that order."""
+        if task["status"] not in TERMINAL_STATUSES and path.exists():
+            status = self._read(path)["status"]
+            if status not in {"paused", "cancelled"}:
+                raise ValueError("Invalid host interrupt")
+            task["status"] = status
+            self._save_task(task)
+            self._event(task["task_id"], status, project=task["project"], source="pending_interrupt")
 
     def pause(self, task_id, *, project=None):
         self._request_interrupt(task_id, "paused", project=project)

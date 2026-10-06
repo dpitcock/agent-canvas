@@ -164,6 +164,22 @@ class SupervisedTasks(unittest.TestCase):
                 self.assertFalse(thread.is_alive())
         self.assertTrue(published.is_set())
 
+    def test_pending_interrupt_prevents_dispatch_and_recovery(self):
+        for mode in ("paused", "cancelled"):
+            for operation in ("claim", "recover"):
+                with self.subTest(mode=mode, operation=operation):
+                    task_id = mode + operation
+                    self.host.create_task(task_id, self.project, [{"id": "effect", "operation": "write"}])
+                    self.host._request_interrupt(task_id, mode)
+                    if operation == "claim":
+                        decision = self.host.claim_action(task_id, "effect", "attempt")
+                    else:
+                        decision = self.host.recover(task_id)
+                    self.assertEqual(decision.kind, mode)
+                    task = self.host.task(task_id)
+                    self.assertEqual(task["actions"]["effect"]["attempts"], [])
+                    self.assertEqual(task["status"], mode)
+
     def test_resume_does_not_clear_a_pending_pause_request(self):
         self.task()
         self.host._request_interrupt("task-1", "paused")
