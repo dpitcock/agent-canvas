@@ -16,8 +16,8 @@ safe_path = _uninstall.safe_path
 
 
 TARGETS = (
-    "AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules", ".mcp.json", "hooks.json",
-    "settings.json", "config.toml", "INSTALL-FOLLOWUP.md", ".owner-override",
+    "AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules", ".mcp.json",
+    "INSTALL-FOLLOWUP.md", ".owner-override",
     ".owner-override.example", ".agent-canvas", ".agents", ".cline", ".clinerules",
     ".claude", ".codex", ".cursor", ".github", "agents", "skills", "rules", "commands",
     "config/workspace-config.yml", "CODEOWNERS", ".github/CODEOWNERS", "docs/superpowers",

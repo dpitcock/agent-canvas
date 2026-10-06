@@ -214,6 +214,22 @@ class InstallSmoke(unittest.TestCase):
             self.assertFalse((root / "AGENTS.md").exists())
             self.assertEqual((root / "app.py").read_text(), "keep")
 
+    def test_agent_nuke_preserves_root_application_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            (root / "settings.json").write_text('{"theme": "dark"}')
+            (root / "config.toml").write_text('[application]\nport = 8080\n')
+            (root / "hooks.json").write_text('{"hooks": ["pre-commit"]}')
+            (root / "AGENTS.md").write_text("remove")
+
+            agent_nuke.nuke(root, apply=True)
+
+            self.assertEqual((root / "settings.json").read_text(), '{"theme": "dark"}')
+            self.assertEqual((root / "config.toml").read_text(), '[application]\nport = 8080\n')
+            self.assertEqual((root / "hooks.json").read_text(), '{"hooks": ["pre-commit"]}')
+            self.assertFalse((root / "AGENTS.md").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

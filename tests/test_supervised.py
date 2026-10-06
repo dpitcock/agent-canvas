@@ -27,6 +27,13 @@ def claim_from_another_process(state_dir, project, start, results, attempt_id):
     results.put(host.claim_action("task-1", "write-doc", attempt_id, project=project).kind)
 
 
+def complete_from_another_process(state_dir, project, start, action_id):
+    """Complete an independent action while every worker races from the same start."""
+    start.wait()
+    host = supervisor.HostSupervisor(state_dir)
+    host.complete_action("task-1", action_id, evidence={"worker": action_id}, project=project)
+
+
 class SupervisedTasks(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -83,6 +90,30 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(decision.kind, "blocker")
         self.assertEqual(self.host.visible_messages("task-1"), ["Choose the deployment region."])
 
+    def test_completed_final_is_not_released_twice_when_a_turn_is_replayed(self):
+        self.task()
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+
+        first = self.host.gate_final("task-1", "attempt-1", "finished")
+        replay = self.host.gate_final("task-1", "attempt-2", "replayed final")
+
+        self.assertTrue(first.release)
+        self.assertEqual(replay.kind, "complete")
+        self.assertFalse(replay.release)
+        self.assertEqual(self.host.visible_messages("task-1"), ["finished"])
+
+    def test_blocked_final_is_not_released_twice_when_a_turn_is_replayed(self):
+        self.task(blockers=[{"id": "owner-choice", "owner_action": "Choose the deployment region."}])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+
+        first = self.host.gate_final("task-1", "attempt-1", "blocked")
+        replay = self.host.gate_final("task-1", "attempt-2", "replayed final")
+
+        self.assertTrue(first.release)
+        self.assertEqual(replay.kind, "blocked")
+        self.assertFalse(replay.release)
+        self.assertEqual(self.host.visible_messages("task-1"), ["Choose the deployment region."])
+
     def test_pause_and_cancel_interrupt_and_prevent_automatic_continuation(self):
         self.task()
         self.host.pause("task-1")
@@ -120,6 +151,27 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(decisions.count("dispatch"), 1)
         self.assertEqual(decisions.count("reconcile"), len(workers) - 1)
 
+    def test_concurrent_processes_complete_independent_actions_without_losing_state(self):
+        """Removing mutation serialization loses completions from competing file replacements."""
+        action_ids = [f"write-{index}" for index in range(16)]
+        self.task(actions=[{"id": action_id, "operation": "write"} for action_id in action_ids])
+        context = multiprocessing.get_context("fork")
+        start = context.Event()
+        workers = [
+            context.Process(target=complete_from_another_process,
+                            args=(str(self.base / "host-state"), str(self.project), start, action_id))
+            for action_id in action_ids
+        ]
+        for worker in workers:
+            worker.start()
+        start.set()
+        for worker in workers:
+            worker.join(timeout=10)
+            self.assertEqual(worker.exitcode, 0)
+
+        actions = self.host.task("task-1")["actions"]
+        self.assertEqual({action_id for action_id, action in actions.items() if action["status"] == "complete"}, set(action_ids))
+
     def test_validator_receipt_decodes_byte_output_before_hashing(self):
         """A timeout-compatible byte stream still yields a text receipt and digest."""
         timeout = supervisor.subprocess.TimeoutExpired(["ignored"], 1, output=b"validator output")
@@ -151,6 +203,39 @@ class SupervisedTasks(unittest.TestCase):
         events = [event["type"] for event in self.host.audit("task-1")]
         self.assertIn("final_attempt", events)
         self.assertIn("continuation_queued", events)
+
+    def test_renderer_withholds_completed_agent_message_notifications_until_the_gate(self):
+        self.task()
+        renderer = client.SupervisedRenderer(self.host, "task-1")
+
+        for event in (
+            {"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": "secret final"}}},
+            {"method": "item/agentMessage/completed", "params": {"text": "another secret final"}},
+        ):
+            with self.subTest(method=event["method"]):
+                self.assertEqual(renderer.consume(event), [])
+        output = renderer.consume({"method": "turn/completed", "params": {}})
+        self.assertEqual(output[0]["kind"], "continuation")
+        self.assertNotIn("secret final", str(output))
+
+    def test_failed_or_interrupted_turn_completion_discards_partial_text_without_gating(self):
+        for status in ("failed", "interrupted"):
+            with self.subTest(status=status):
+                task_id = f"task-{status}"
+                self.host.create_task(task_id, self.project, actions=[{"id": "write-doc", "operation": "write"}])
+                self.host.complete_action(task_id, "write-doc", evidence={"receipt": "host-observed"})
+                renderer = client.SupervisedRenderer(self.host, task_id)
+                renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "partial text"}})
+
+                output = renderer.consume({"method": "turn/completed", "params": {"status": status}})
+
+                self.assertEqual(output[0]["kind"], "progress")
+                self.assertNotIn("final_attempt", [
+                    event["type"] for event in self.host.audit(task_id) if event["task_id"] == task_id
+                ])
+                renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "complete text"}})
+                output = renderer.consume({"method": "turn/completed", "params": {"status": "completed"}})
+                self.assertEqual(output[0]["content"], "complete text")
 
 
 class SupervisedInstallation(unittest.TestCase):
