@@ -198,6 +198,8 @@ python3 scripts/install.py /path/to/sibling-project --upgrade --apply --supervis
 
 Registration creates or reuses the project’s host-owned registration; it does not create a task, grant new agent permissions, start a turn, alter global credentials, or modify the Codex desktop app. The custom client must start each supervised task with the project identity and route every App Server turn through its renderer. It creates the host task with its authorized actions and validator definitions, then renders a final response only after the supervisor returns a release decision.
 
+Required validation currently fails closed: after independent work completes, the host returns `validation_unavailable` and withholds the final response. This POC does not execute project validators or copy their runtime trees under the supervisor account. The [container runner follow-up (#8)](https://github.com/dpitcock/agent-canvas/issues/8) will enable validation only after isolation and bounded-input tests pass.
+
 #### Owner escape hatch in supervised projects
 
 During an applied `--supervised` install or upgrade, the installer reads only a regular `.owner-override` at the target project’s root and imports an immutable snapshot into host-owned state. It does not follow symlinks, read parent/sibling/home overrides, or watch the file after installation. Edit the root file and run the same applied supervised upgrade again from the protected host context to import a new snapshot; an agent changing the workspace file alone cannot change host behavior.

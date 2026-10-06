@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 def load(name):
@@ -79,139 +80,89 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(recovered.recover("task-1").next_action["id"], "write-doc")
         self.assertEqual(recovered.claim_action("task-1", "write-doc", "lease-2").kind, "reconcile")
 
-    def test_valid_completion_runs_fresh_host_validator_then_releases_buffer(self):
-        self.task(validators=[{"id": "check", "command": [sys.executable, "-c", "print('ok')"], "timeout_s": 2}])
-        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+    def test_validation_fails_closed_without_executing_or_snapshotting(self):
+        marker = self.project / "validator-ran"
+        self.task(validators=[{"id": "check", "command": [
+            sys.executable, "-c", "from pathlib import Path; Path('validator-ran').touch()"]}])
+        self.host.complete_action("task-1", "write-doc", evidence={"host": "observed"})
         decision = self.host.gate_final("task-1", "attempt-1", "finished")
-        self.assertTrue(decision.release)
-        self.assertEqual(self.host.visible_messages("task-1"), ["finished"])
-        receipt = self.host.task("task-1")["evidence"]["validators"]["check"]
-        self.assertEqual(receipt["exit_status"], 0)
-        self.assertIn("digest", receipt)
-
-    def test_validator_runs_from_the_registered_project_directory(self):
-        (self.project / "project-marker").write_text("present")
-        self.task(validators=[{
-            "id": "project-cwd",
-            "command": [sys.executable, "-c", "import pathlib, sys; sys.exit(not pathlib.Path('project-marker').is_file())"],
-            "timeout_s": 2,
-        }])
-        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        self.assertTrue(self.host.gate_final("task-1", "attempt-1", "finished").release)
-
-    def test_timeout_receipt_decodes_and_bounds_partial_output(self):
-        self.task(validators=[{
-            "id": "timeout",
-            "command": [sys.executable, "-c", "import sys, time; print('partial output', flush=True); print('x' * 20000, flush=True); time.sleep(1)"],
-            "timeout_s": 0.05,
-        }])
-        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        decision = self.host.gate_final("task-1", "attempt-1", "finished")
-        self.assertEqual(decision.kind, "continue")
-        receipt = self.host.task("task-1")["evidence"]["validators"]["timeout"]
-        self.assertEqual(receipt["exit_status"], "timeout")
-        self.assertIn("partial output", receipt["output"])
-        self.assertLessEqual(len(receipt["output"].encode()), 8192)
-
-    def test_failed_validator_queues_a_bounded_remediation_action(self):
-        self.task(validators=[{
-            "id": "repair-me",
-            "command": [sys.executable, "-c", "import sys; print('repair this'); sys.exit(1)"],
-            "timeout_s": 2,
-        }])
-        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        decision = self.host.gate_final("task-1", "attempt-1", "finished")
-        self.assertEqual(decision.kind, "continue")
-        self.assertEqual(decision.next_action["id"], "validator:repair-me")
-        self.assertEqual(decision.next_action["exit_status"], 1)
-        self.assertIn("repair this", decision.next_action["output"])
-
-    def test_project_relative_validator_receipt_binds_the_executable_that_ran(self):
-        binary = self.project / "bin" / "check"
-        binary.parent.mkdir()
-        binary.write_text("#!/bin/sh\nprintf '#!/bin/sh\\nexit 1\\n' > ./bin/check\necho checked\n")
-        binary.chmod(0o700)
-        expected_digest = supervisor.hashlib.sha256(binary.read_bytes()).hexdigest()
-        self.task(validators=[{"id": "relative-binary", "command": ["./bin/check"], "timeout_s": 2}])
-        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        self.assertTrue(self.host.gate_final("task-1", "attempt-1", "finished").release)
-        receipt = self.host.task("task-1")["evidence"]["validators"]["relative-binary"]
-        self.assertEqual(receipt["binary_digest"], expected_digest)
-
-    def test_validator_snapshot_preserves_sibling_runtime_context(self):
-        binary = self.project / "bin" / "check"
-        binary.parent.mkdir()
-        (binary.parent / "marker").write_text("present\n")
-        binary.write_text("#!/bin/sh\ntest \"$(cat \"$(dirname \"$0\")/marker\")\" = present\n")
-        binary.chmod(0o700)
-        self.task(validators=[{"id": "sibling", "command": ["./bin/check"], "timeout_s": 2}])
-        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        self.assertTrue(self.host.gate_final("task-1", "attempt-1", "finished").release)
-
-    def test_validator_timeout_kills_descendant_processes(self):
-        self.task(validators=[{
-            "id": "descendant",
-            "command": ["/bin/sh", "-c", "(sleep 0.2; touch child-survived) & sleep 1"],
-            "timeout_s": 0.05,
-        }])
-        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        self.assertEqual(self.host.gate_final("task-1", "attempt-1", "finished").kind, "continue")
-        time.sleep(0.3)
-        self.assertFalse((self.project / "child-survived").exists())
-
-    def test_absolute_workspace_validator_receipt_binds_the_executable_that_ran(self):
-        binary = self.project / "bin" / "check"
-        binary.parent.mkdir()
-        binary.write_text("#!/bin/sh\nprintf '#!/bin/sh\\nexit 1\\n' > ./bin/check\necho checked\n")
-        binary.chmod(0o700)
-        expected_digest = supervisor.hashlib.sha256(binary.read_bytes()).hexdigest()
-        self.task(validators=[{"id": "absolute-binary", "command": [str(binary)], "timeout_s": 2}])
-        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        self.assertTrue(self.host.gate_final("task-1", "attempt-1", "finished").release)
-        receipt = self.host.task("task-1")["evidence"]["validators"]["absolute-binary"]
-        self.assertEqual(receipt["binary_digest"], expected_digest)
-
-    def test_pause_interrupts_a_validator_before_final_release(self):
-        self.task(validators=[{
-            "id": "slow",
-            "command": [sys.executable, "-c", "import pathlib, time; pathlib.Path('validator-start').touch(); time.sleep(0.2)"],
-            "timeout_s": 2,
-        }])
-        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        result = {}
-        thread = threading.Thread(target=lambda: result.setdefault(
-            "decision", self.host.gate_final("task-1", "attempt-1", "finished")))
-        thread.start()
-        for _ in range(40):
-            if (self.project / "validator-start").exists():
-                break
-            time.sleep(0.01)
-        self.assertTrue((self.project / "validator-start").exists())
-        self.host.pause("task-1")
-        thread.join(timeout=2)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(result["decision"].kind, "paused")
+        self.assertEqual(decision.kind, "validation_unavailable")
+        self.assertFalse(decision.release)
+        self.assertIn("container", decision.message)
+        self.assertFalse(marker.exists())
         self.assertEqual(self.host.visible_messages("task-1"), [])
+        self.assertEqual(self.host.task("task-1")["evidence"]["validators"], {})
+        self.assertEqual(list(self.host.root.glob("validator-*")), [])
+        restarted = supervisor.HostSupervisor(self.host.root)
+        self.assertEqual(restarted.gate_final("task-1", "retry", "finished").kind,
+                         "validation_unavailable")
 
-    def test_pause_wins_over_failed_validator_remediation(self):
-        self.task(validators=[{
-            "id": "slow-failure",
-            "command": [sys.executable, "-c", "import pathlib, sys, time; pathlib.Path('validator-start').touch(); time.sleep(0.2); sys.exit(1)"],
-            "timeout_s": 2,
-        }])
-        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        result = {}
-        thread = threading.Thread(target=lambda: result.setdefault(
-            "decision", self.host.gate_final("task-1", "attempt-1", "finished")))
-        thread.start()
-        for _ in range(40):
-            if (self.project / "validator-start").exists():
-                break
-            time.sleep(0.01)
-        self.assertTrue((self.project / "validator-start").exists())
-        self.host.pause("task-1")
-        thread.join(timeout=2)
-        self.assertEqual(result["decision"].kind, "paused")
+    def test_missing_runner_does_not_block_independent_work(self):
+        self.task(validators=[{"id": "check", "command": ["./check"]}])
+        self.assertEqual(self.host.gate_final("task-1", "attempt-1", "done").kind, "continue")
+
+    def test_legacy_renderer_uses_last_message_and_explicit_final_wins(self):
+        for phases in ((None, None), ("commentary", "final_answer"),
+                       ("final_answer", None)):
+            with self.subTest(phases=phases):
+                host = supervisor.HostSupervisor(self.base / ("host-" + str(phases)))
+                host.create_task("render", self.project, [])
+                renderer = client.SupervisedRenderer(host, "render")
+                for phase, text in zip(phases, ("first", "last")):
+                    renderer.consume({"method": "item/completed", "params": {
+                        "item": {"type": "agentMessage", "phase": phase, "text": text}}})
+                result = renderer.consume({"method": "turn/completed", "params": {
+                    "turn": {"status": "completed"}}})
+                expected = "first" if phases[0] == "final_answer" else "last"
+                self.assertEqual(result[0]["content"], expected)
+
+    def test_pending_interrupt_prevents_every_automatic_decision(self):
+        for mode in ("paused", "cancelled"):
+            for case in ("action", "unauthorized", "blocker", "final", "validator"):
+                with self.subTest(mode=mode, case=case):
+                    task_id = mode + "-" + case
+                    actions = [{"id": "a", "operation": "merge" if case == "unauthorized" else "write"}]
+                    self.host.create_task(task_id, self.project, actions,
+                        validators=[{"id": "v", "command": ["./check"]}] if case == "validator" else [],
+                        blockers=[{"owner_action": "Choose region"}] if case == "blocker" else [])
+                    if case in ("blocker", "final", "validator"):
+                        self.host.complete_action(task_id, "a", evidence={"host": True})
+                    self.host._request_interrupt(task_id, mode)
+                    decision = self.host.gate_final(task_id, "try", "done")
+                    self.assertEqual(decision.kind, mode)
+                    self.assertFalse(decision.release)
+                    self.assertEqual(self.host.visible_messages(task_id), [])
+
+    def test_pause_publication_is_serialized_with_blocker_decision(self):
+        self.task(blockers=[{"owner_action": "Choose region"}])
+        self.host.complete_action("task-1", "write-doc", evidence={"host": True})
+        started, published = threading.Event(), threading.Event()
+        threads = []
+        original = self.host._remaining
+
+        def publish():
+            started.set()
+            self.host._request_interrupt("task-1", "paused")
+            published.set()
+
+        def remaining(task):
+            thread = threading.Thread(target=publish)
+            threads.append(thread)
+            thread.start()
+            self.assertTrue(started.wait(1))
+            # Publication must wait for the complete decision transaction.
+            self.assertFalse(published.wait(0.05))
+            return original(task)
+
+        try:
+            with mock.patch.object(self.host, "_remaining", side_effect=remaining):
+                decision = self.host.gate_final("task-1", "attempt-1", "done")
+            self.assertEqual(decision.kind, "blocker")
+        finally:
+            for thread in threads:
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+        self.assertTrue(published.is_set())
 
     def test_resume_does_not_clear_a_pending_pause_request(self):
         self.task()

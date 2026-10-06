@@ -10,6 +10,12 @@ The POC uses atomic replacement for task state, fsynced append-only audit events
 
 ## Boundary and limitations
 
+Validator execution is disabled in this PR. Once independent authorized work is finished, a task with required validators returns `validation_unavailable`, preserves the withheld candidate, records the owner action, and produces no success receipts. Retrying or restarting cannot bypass this condition. There is no local subprocess fallback, executable snapshot, or recursive workspace copy.
+
+The owner-selected container runner is tracked in [issue #8](https://github.com/dpitcock/agent-canvas/issues/8) for a separate PR. It must isolate host state and credentials, stage only bounded declared inputs, enforce resource/network limits, and prove receipt binding and teardown through hostile-code integration tests before validation-backed completion is enabled.
+
+Automatic decisions hold the task lock and interrupt lock in that order until their state and audit records are persisted. Interrupt publication uses the same interrupt lock: an interrupt published first wins; an interrupt arriving after a committed decision cannot retroactively retract it. No project code executes in this critical section.
+
 The locally generated Codex App Server protocol schema exposes `turn/start`, `item/agentMessage/delta`, and `turn/completed`, supporting this renderer design. This POC exercises the renderer with an event fixture; it does not launch a real App Server turn or modify the desktop app.
 
 The guarantee holds only when users interact through this custom client and the agent lacks filesystem access to its host-state root. File permissions alone do not protect a state directory from another process running as the same operating-system identity. The existing Codex desktop app is outside this interception boundary.
@@ -22,6 +28,6 @@ Upstream desktop support needs: a host-owned final-message interceptor, durable 
 
 ## Test results
 
-Executed: `python3 -m unittest discover -s tests -v` (58 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
+Executed: `python3 -m unittest discover -s tests -v` (53 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
 
-The supervised tests cover the ten required scenarios through the host API and an App Server-shaped renderer event stream. Unrun: a live Codex App Server model turn, desktop-app interception, and an operating-system-separated service-account deployment. Those require a deliberately deployed custom client and host boundary; they are not represented as passing checks.
+Tests cover host action gating, recovery, authorization, multi-project isolation, interrupt ordering, legacy/final message selection, and fail-closed validation. Tests of the removed local runner were replaced with no-execution and restart regressions; the smaller count does not represent successful sandbox validation. Unrun/deferred: isolated validator execution, validation-backed completion, a live Codex App Server model turn, desktop-app interception, and an operating-system-separated service-account deployment.

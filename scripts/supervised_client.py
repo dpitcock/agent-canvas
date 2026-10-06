@@ -14,6 +14,7 @@ class SupervisedRenderer:
         self.project = project
         self._deltas = []
         self._completed_messages = []
+        self._final_message = None
 
     def consume(self, event):
         method = event.get("method")
@@ -27,9 +28,9 @@ class SupervisedRenderer:
                 # so retain the last completed message as a compatibility fallback.
                 phase = item.get("phase")
                 if phase == "final_answer":
-                    self._completed_messages = [item.get("text", "")]
+                    self._final_message = item.get("text", "")
                 elif phase is None:
-                    self._completed_messages.append(item.get("text", ""))
+                    self._completed_messages = [item.get("text", "")]
                 return []
         if method != "turn/completed":
             return [{"kind": "progress", "event": event}]
@@ -37,12 +38,14 @@ class SupervisedRenderer:
         if status != "completed":
             self._deltas = []
             self._completed_messages = []
+            self._final_message = None
             return [{"kind": "turn_incomplete", "status": status,
                      "message": "Turn did not complete; host state remains recoverable."}]
-        content = "".join(self._completed_messages or self._deltas)
+        content = self._final_message if self._final_message is not None else "".join(self._completed_messages or self._deltas)
         decision = self.supervisor.gate_final(self.task_id, str(uuid.uuid4()), content, project=self.project)
         self._deltas = []
         self._completed_messages = []
+        self._final_message = None
         if decision.release:
             return [{"kind": "final", "content": decision.message, "decision": decision.kind}]
         if decision.kind == "continue":

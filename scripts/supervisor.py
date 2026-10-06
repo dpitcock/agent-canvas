@@ -8,11 +8,8 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
-import subprocess
 import tempfile
 import time
-import signal
 from contextlib import contextmanager
 import fcntl
 
@@ -343,93 +340,14 @@ class HostSupervisor:
             self._event(task_id, "action_completed", project=task["project"], action_id=action_id, evidence=action["evidence"])
             self._event(task_id, "child_evidence_joined", project=task["project"], action_id=action_id, child_task_id=child_task_id)
 
-    @staticmethod
-    def _validator_binary(command, project):
-        candidate = Path(command[0])
-        if candidate.is_absolute():
-            return candidate.resolve()
-        if "/" in command[0]:
-            return (Path(project) / candidate).resolve()
-        executable = shutil.which(command[0])
-        return Path(executable).resolve() if executable else candidate
-
-    def _prepared_validator_command(self, command, project):
-        """Bind project-relative executables before a workspace process can replace them."""
-        binary = self._validator_binary(command, project)
-        binary_bytes = binary.read_bytes() if binary.is_file() else None
-        binary_digest = hashlib.sha256(binary_bytes).hexdigest() if binary_bytes is not None else None
-        raw = Path(command[0]) if Path(command[0]).is_absolute() else Path(project) / command[0]
-        lexical = Path(os.path.abspath(raw))
-        try:
-            lexical.relative_to(Path(project).resolve())
-            workspace_binary = "/" in command[0] or Path(command[0]).is_absolute()
-        except ValueError:
-            workspace_binary = False
-        if binary_bytes is None or not workspace_binary:
-            return command, binary_digest, None
-        context_root = Path(tempfile.mkdtemp(prefix="validator-", dir=self.root))
-        source_parent = lexical.parent
-        copy_parent = context_root / "context"
-        copy_path = copy_parent / lexical.name
-        try:
-            shutil.copytree(source_parent, copy_parent, symlinks=False)
-            if hashlib.sha256(copy_path.read_bytes()).hexdigest() != binary_digest:
-                raise ValueError("Validator snapshot did not preserve executable bytes")
-            copy_path.chmod(binary.stat().st_mode & 0o777)
-        except BaseException:
-            shutil.rmtree(context_root, ignore_errors=True)
-            raise
-        return [str(copy_path), *command[1:]], binary_digest, context_root
-
-    def _validator_receipt(self, validator, project):
-        command = validator.get("command")
-        if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
-            raise ValueError("Host validator command must be a nonempty argument list")
-        timeout = validator.get("timeout_s", 30)
-        if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 300:
-            raise ValueError("Host validator timeout_s must be between 0 and 300")
-        run_command, binary_digest, protected_copy = self._prepared_validator_command(command, project)
-        try:
-            with tempfile.TemporaryFile(mode="w+b") as stdout, tempfile.TemporaryFile(mode="w+b") as stderr:
-                try:
-                    run = subprocess.Popen(run_command, stdout=stdout, stderr=stderr, cwd=project,
-                                           start_new_session=True)
-                    status = run.wait(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    os.killpg(run.pid, signal.SIGKILL)
-                    run.wait()
-                    status = "timeout"
-                stdout.seek(0)
-                output_bytes = stdout.read(8192)
-                if len(output_bytes) < 8192:
-                    stderr.seek(0)
-                    output_bytes += stderr.read(8192 - len(output_bytes))
-                output = output_bytes.decode("utf-8", errors="replace")
-        finally:
-            if protected_copy is not None:
-                shutil.rmtree(protected_copy, ignore_errors=True)
-        return {"command": command, "command_digest": _digest(command), "binary_digest": binary_digest,
-                "exit_status": status, "output": output, "digest": hashlib.sha256(output.encode()).hexdigest(),
-                "timeout_s": timeout, "version": validator.get("version", "host-configured")}
-
-    def _validate(self, task):
-        for validator in task["validators"]:
-            validator_id = validator.get("id")
-            if not validator_id:
-                raise ValueError("Host validators require an id")
-            receipt = self._validator_receipt(validator, task["project"])
-            task["evidence"]["validators"][validator_id] = receipt
-            self._event(task["task_id"], "validator_received", project=task["project"], validator_id=validator_id, receipt=receipt)
-            if receipt["exit_status"] != 0:
-                self._save_task(task)
-                return validator_id, receipt
-        return None
-
     def gate_final(self, task_id, attempt_id, content, *, project=None):
-        with self._locked_task(task_id, project) as task:
+        with self._locked_task(task_id, project) as task, self._locked_interrupt(task_id, project) as interrupt_path:
+            # All automatic decisions serialize with interrupt publication. No untrusted
+            # code or long-running validators execute while these locks are held.
+            interruption = self._read(interrupt_path)["status"] if interrupt_path.exists() else None
             self._event(task_id, "final_attempt", project=task["project"], attempt_id=attempt_id, content_digest=hashlib.sha256(content.encode()).hexdigest())
             if task["status"] in TERMINAL_STATUSES | {"paused"}:
-                if task["status"] == "paused" and self._interrupt_status(task_id, project=task["project"]) == "cancelled":
+                if task["status"] == "paused" and interruption == "cancelled":
                     task["status"] = "cancelled"
                     self._save_task(task)
                     self._event(task_id, "cancelled", project=task["project"], source="final_interrupt")
@@ -439,7 +357,6 @@ class HostSupervisor:
                                       "content_digest": hashlib.sha256(content.encode()).hexdigest(),
                                       "withheld_at": _now()}
             self._save_task(task)
-            interruption = self._interrupt_status(task_id, project=task["project"])
             if interruption:
                 task["status"] = interruption
                 self._save_task(task)
@@ -471,22 +388,14 @@ class HostSupervisor:
                 self._save_task(task)
                 self._event(task_id, "blocker_delivered", project=task["project"], blocker_id=blocker.get("id"))
                 return Decision("blocker", release=True, message=message)
-            validator_failure = self._validate(task)
-            interruption = self._interrupt_status(task_id, project=task["project"])
-            if interruption:
-                task["status"] = interruption
+            if task["validators"]:
+                message = ("Owner action required: deploy the container validator runner from the "
+                           "follow-up PR, then retry validation. Local validator execution is disabled.")
+                task["validation_blocker"] = {"reason": "isolated_runner_unavailable",
+                                              "owner_action": message}
                 self._save_task(task)
-                self._event(task_id, interruption, project=task["project"], source="validator_interrupt")
-                return Decision(interruption, message="Automatic continuation is disabled until an explicit resume.")
-            if validator_failure:
-                validator_id, receipt = validator_failure
-                remediation = {"id": f"validator:{validator_id}", "kind": "validator_remediation",
-                               "validator_id": validator_id, "exit_status": receipt["exit_status"],
-                               "output": receipt["output"], "digest": receipt["digest"]}
-                self._event(task_id, "continuation_queued", project=task["project"], reason="validator_failed",
-                            next_action=remediation)
-                return Decision("continue", message=f"Host validator {validator_id} failed; repair it and retry.",
-                                next_action=remediation)
+                self._event(task_id, "validation_unavailable", project=task["project"])
+                return Decision("validation_unavailable", message=message)
             task["visible_messages"].append(content)
             task["status"] = "complete"
             task.pop("withheld_final", None)
