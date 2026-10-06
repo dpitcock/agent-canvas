@@ -138,6 +138,27 @@ class SupervisedTasks(unittest.TestCase):
         receipt = self.host.task("task-1")["evidence"]["validators"]["relative-binary"]
         self.assertEqual(receipt["binary_digest"], expected_digest)
 
+    def test_validator_snapshot_preserves_sibling_runtime_context(self):
+        binary = self.project / "bin" / "check"
+        binary.parent.mkdir()
+        (binary.parent / "marker").write_text("present\n")
+        binary.write_text("#!/bin/sh\ntest \"$(cat \"$(dirname \"$0\")/marker\")\" = present\n")
+        binary.chmod(0o700)
+        self.task(validators=[{"id": "sibling", "command": ["./bin/check"], "timeout_s": 2}])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        self.assertTrue(self.host.gate_final("task-1", "attempt-1", "finished").release)
+
+    def test_validator_timeout_kills_descendant_processes(self):
+        self.task(validators=[{
+            "id": "descendant",
+            "command": ["/bin/sh", "-c", "(sleep 0.2; touch child-survived) & sleep 1"],
+            "timeout_s": 0.05,
+        }])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        self.assertEqual(self.host.gate_final("task-1", "attempt-1", "finished").kind, "continue")
+        time.sleep(0.3)
+        self.assertFalse((self.project / "child-survived").exists())
+
     def test_absolute_workspace_validator_receipt_binds_the_executable_that_ran(self):
         binary = self.project / "bin" / "check"
         binary.parent.mkdir()
