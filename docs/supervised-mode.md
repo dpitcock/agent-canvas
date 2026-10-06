@@ -28,6 +28,6 @@ Upstream desktop support needs: a host-owned final-message interceptor, durable 
 
 ## Test results
 
-Executed: `python3 -m unittest discover -s tests -v` (56 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
+Executed: `python3 -m unittest discover -s tests -v` (57 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
 
 Tests cover host action gating, recovery, authorization, multi-project isolation, interrupt ordering, legacy/final message selection, and fail-closed validation. Tests of the removed local runner were replaced with no-execution and restart regressions; the smaller count does not represent successful sandbox validation. Unrun/deferred: isolated validator execution, validation-backed completion, a live Codex App Server model turn, desktop-app interception, and an operating-system-separated service-account deployment.

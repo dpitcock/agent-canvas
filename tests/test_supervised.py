@@ -317,6 +317,25 @@ class SupervisedTasks(unittest.TestCase):
 
 
 class SupervisedInstallation(unittest.TestCase):
+    def test_override_read_is_pinned_when_project_root_is_swapped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            (project / ".owner-override").write_text("OWNER_OVERRIDE=pause")
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / ".owner-override").write_text("OWNER_OVERRIDE=reset")
+            actual_open = installer.os.open
+            def swap(path, flags, *args, **kwargs):
+                if Path(path).name == ".owner-override":
+                    project.rename(base / "original")
+                    project.symlink_to(outside, target_is_directory=True)
+                return actual_open(path, flags, *args, **kwargs)
+            with mock.patch.object(installer.os, "open", side_effect=swap):
+                result = installer.root_owner_override(project)
+            self.assertEqual(result["modes"], ["pause"])
+
     def test_override_swap_at_open_cannot_follow_an_external_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

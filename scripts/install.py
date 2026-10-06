@@ -32,14 +32,25 @@ OWNER_OVERRIDE_MODES = {"pause", "bypass-review", "reset"}
 
 def root_owner_override(root):
     """Parse only a regular .owner-override at this target's root."""
-    path = Path(root) / ".owner-override"
-    if not path.exists() and not path.is_symlink():
-        return None
-    safe_destination(Path(root), path)
+    # Pin each directory component without following symlinks, then open the
+    # leaf relative to the pinned root. Path checks followed by open are racy.
+    root = Path(os.path.abspath(root))
+    directory = os.open(root.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        for component in root.parts[1:]:
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=directory)
+            os.close(directory)
+            directory = child
+        try:
+            descriptor = os.open(".owner-override", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                 dir_fd=directory)
+        except FileNotFoundError:
+            return None
     except OSError as error:
         raise ValueError("Owner Override must be a regular file, not a symlink") from error
+    finally:
+        os.close(directory)
     with os.fdopen(descriptor, "rb") as source_file:
         if not stat.S_ISREG(os.fstat(source_file.fileno()).st_mode):
             raise ValueError("Owner Override must be a regular file at the project root")
