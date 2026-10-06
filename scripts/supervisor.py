@@ -82,6 +82,11 @@ class HostSupervisor:
             raise ValueError(f"Unknown or ambiguous task: {task_id}")
         return matches[0]
 
+    def _interrupt_path(self, task_id, project=None):
+        """Return host-owned cancellation state without taking the task lock."""
+        path = self._task_path(task_id, project)
+        return path.with_name(path.stem + ".interrupt.json")
+
     @staticmethod
     def _write(path, value):
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -143,17 +148,15 @@ class HostSupervisor:
         self._project_event(project, "owner_override_imported", modes=normalized, source_digest=source_digest)
         for path in sorted((self._project_dir(project) / "tasks").glob("*.json")):
             task_id = path.stem
-            with self._locked_task(task_id, project) as task:
-                if task["status"] in TERMINAL_STATUSES:
-                    continue
-                if "reset" in normalized:
-                    task["status"] = "cancelled"
-                    self._save_task(task)
-                    self._event(task_id, "owner_override_reset", project=task["project"])
-                elif "pause" in normalized and task["status"] == "active":
-                    task["status"] = "paused"
-                    self._save_task(task)
-                    self._event(task_id, "owner_override_paused", project=task["project"])
+            task = self._read(path)
+            if task["status"] in TERMINAL_STATUSES:
+                continue
+            if "reset" in normalized:
+                self.cancel(task_id, project=project)
+                self._event(task_id, "owner_override_reset", project=task["project"])
+            elif "pause" in normalized and task["status"] == "active":
+                self.pause(task_id, project=project)
+                self._event(task_id, "owner_override_paused", project=task["project"])
         return current
 
     def _project_for_task(self, task_id, project=None):
@@ -219,6 +222,33 @@ class HostSupervisor:
                 yield self._read(path)
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def _locked_interrupt(self, task_id, project=None):
+        path = self._interrupt_path(task_id, project)
+        lock_path = path.with_name(path.name + ".lock")
+        with lock_path.open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield path
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _request_interrupt(self, task_id, status, *, project=None):
+        with self._locked_interrupt(task_id, project) as path:
+            self._write(path, {"status": status, "requested_at": _now()})
+
+    def _clear_interrupt(self, task_id, *, project=None):
+        with self._locked_interrupt(task_id, project) as path:
+            path.unlink(missing_ok=True)
+
+    def _interrupt_status(self, task_id, *, project=None):
+        with self._locked_interrupt(task_id, project) as path:
+            if not path.exists():
+                return None
+            value = self._read(path)
+            status = value.get("status")
+            return status if status in {"paused", "cancelled"} else None
 
     def _remaining(self, task):
         return [(action_id, action) for action_id, action in task["actions"].items() if action["status"] != "complete"]
@@ -287,12 +317,6 @@ class HostSupervisor:
             self._event(task_id, "child_evidence_joined", project=task["project"], action_id=action_id, child_task_id=child_task_id)
 
     @staticmethod
-    def _output_text(value):
-        if isinstance(value, bytes):
-            return value.decode("utf-8", errors="replace")
-        return value or ""
-
-    @staticmethod
     def _validator_binary(command, project):
         candidate = Path(command[0])
         if candidate.is_absolute():
@@ -302,6 +326,26 @@ class HostSupervisor:
         executable = shutil.which(command[0])
         return Path(executable).resolve() if executable else candidate
 
+    def _prepared_validator_command(self, command, project):
+        """Bind project-relative executables before a workspace process can replace them."""
+        binary = self._validator_binary(command, project)
+        binary_bytes = binary.read_bytes() if binary.is_file() else None
+        binary_digest = hashlib.sha256(binary_bytes).hexdigest() if binary_bytes is not None else None
+        if binary_bytes is None or "/" not in command[0] or Path(command[0]).is_absolute():
+            return command, binary_digest, None
+        descriptor, copy_name = tempfile.mkstemp(prefix="validator-", dir=self.root)
+        copy_path = Path(copy_name)
+        try:
+            with os.fdopen(descriptor, "wb") as out:
+                out.write(binary_bytes)
+                out.flush()
+                os.fsync(out.fileno())
+            copy_path.chmod(binary.stat().st_mode & 0o777)
+        except BaseException:
+            copy_path.unlink(missing_ok=True)
+            raise
+        return [str(copy_path), *command[1:]], binary_digest, copy_path
+
     def _validator_receipt(self, validator, project):
         command = validator.get("command")
         if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
@@ -309,16 +353,24 @@ class HostSupervisor:
         timeout = validator.get("timeout_s", 30)
         if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 300:
             raise ValueError("Host validator timeout_s must be between 0 and 300")
+        run_command, binary_digest, protected_copy = self._prepared_validator_command(command, project)
         try:
-            run = subprocess.run(command, capture_output=True, text=True, timeout=timeout,
-                                 check=False, cwd=project)
-            output = (run.stdout + run.stderr)[:8192]
-            status = run.returncode
-        except subprocess.TimeoutExpired as error:
-            output = (self._output_text(error.stdout) + self._output_text(error.stderr))[:8192]
-            status = "timeout"
-        binary = self._validator_binary(command, project)
-        binary_digest = hashlib.sha256(binary.read_bytes()).hexdigest() if binary.is_file() else None
+            with tempfile.TemporaryFile(mode="w+b") as stdout, tempfile.TemporaryFile(mode="w+b") as stderr:
+                try:
+                    run = subprocess.run(run_command, stdout=stdout, stderr=stderr, timeout=timeout,
+                                         check=False, cwd=project)
+                    status = run.returncode
+                except subprocess.TimeoutExpired:
+                    status = "timeout"
+                stdout.seek(0)
+                output_bytes = stdout.read(8192)
+                if len(output_bytes) < 8192:
+                    stderr.seek(0)
+                    output_bytes += stderr.read(8192 - len(output_bytes))
+                output = output_bytes.decode("utf-8", errors="replace")
+        finally:
+            if protected_copy is not None:
+                protected_copy.unlink(missing_ok=True)
         return {"command": command, "command_digest": _digest(command), "binary_digest": binary_digest,
                 "exit_status": status, "output": output, "digest": hashlib.sha256(output.encode()).hexdigest(),
                 "timeout_s": timeout, "version": validator.get("version", "host-configured")}
@@ -381,6 +433,12 @@ class HostSupervisor:
                             next_action=remediation)
                 return Decision("continue", message=f"Host validator {validator_id} failed; repair it and retry.",
                                 next_action=remediation)
+            interruption = self._interrupt_status(task_id, project=task["project"])
+            if interruption:
+                task["status"] = interruption
+                self._save_task(task)
+                self._event(task_id, interruption, project=task["project"], source="validator_interrupt")
+                return Decision(interruption, message="Automatic continuation is disabled until an explicit resume.")
             task["visible_messages"].append(content)
             task["status"] = "complete"
             task.pop("withheld_final", None)
@@ -419,15 +477,20 @@ class HostSupervisor:
         return Decision("continue", next_action={"id": action_id, **{k: v for k, v in action.items() if k not in {"attempts", "evidence", "status"}}})
 
     def pause(self, task_id, *, project=None):
+        self._request_interrupt(task_id, "paused", project=project)
         with self._locked_task(task_id, project) as task:
             if task["status"] in TERMINAL_STATUSES:
+                self._clear_interrupt(task_id, project=task["project"])
                 self._event(task_id, "terminal_transition_ignored", project=task["project"], requested="pause")
+                return
+            if task["status"] == "paused":
                 return
             task["status"] = "paused"
             self._save_task(task)
             self._event(task_id, "paused", project=task["project"])
 
     def resume(self, task_id, *, project=None):
+        self._clear_interrupt(task_id, project=project)
         with self._locked_task(task_id, project) as task:
             if task["status"] != "paused":
                 if task["status"] in TERMINAL_STATUSES:
@@ -438,8 +501,10 @@ class HostSupervisor:
             self._event(task_id, "resumed", project=task["project"])
 
     def cancel(self, task_id, *, project=None):
+        self._request_interrupt(task_id, "cancelled", project=project)
         with self._locked_task(task_id, project) as task:
             if task["status"] in TERMINAL_STATUSES:
+                self._clear_interrupt(task_id, project=task["project"])
                 self._event(task_id, "terminal_transition_ignored", project=task["project"], requested="cancel")
                 return
             task["status"] = "cancelled"
