@@ -14,12 +14,14 @@ The locally generated Codex App Server protocol schema exposes `turn/start`, `it
 
 The guarantee holds only when users interact through this custom client and the agent lacks filesystem access to its host-state root. File permissions alone do not protect a state directory from another process running as the same operating-system identity. The existing Codex desktop app is outside this interception boundary.
 
-Project-local prompts, task files, configuration, and workflow overrides are not completion authority. A trusted owner bypass, if introduced, must arrive through a separately authenticated host channel; this POC does not treat `.owner-override` or any workspace file as permission to release a final message.
+During an applied supervised install or upgrade, the host installer may import the target root's regular `.owner-override` as an immutable host snapshot. It never follows a symlink, searches elsewhere, or watches later workspace changes. `pause` pauses active tasks and starts future tasks paused; `reset` cancels nonterminal tasks while preserving their audit history; and `bypass-review` remains PR-governance-only. A later root-file edit takes effect only after another owner-run applied supervised upgrade imports a new snapshot.
+
+Project-local prompts, task files, configuration, and workflow overrides are not completion authority by themselves. The host-only `release_withheld_final` operation is the emergency final-message escape hatch: it releases exactly one host-stored candidate and durably records the owner, reason, attempt ID, and content digest. It is unavailable from workspace configuration.
 
 Upstream desktop support needs: a host-owned final-message interceptor, durable host task state, callbacks for completion and recovery/compaction, a way to suppress default final rendering, cancellation propagation, and child-turn evidence/join events.
 
 ## Test results
 
-Executed: `python3 -m unittest discover -s tests -v` (43 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
+Executed: `python3 -m unittest discover -s tests -v` (48 tests) and `python3 -m py_compile scripts/install.py scripts/supervisor.py scripts/supervised_client.py`.
 
 The supervised tests cover the ten required scenarios through the host API and an App Server-shaped renderer event stream. Unrun: a live Codex App Server model turn, desktop-app interception, and an operating-system-separated service-account deployment. Those require a deliberately deployed custom client and host boundary; they are not represented as passing checks.

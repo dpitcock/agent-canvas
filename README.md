@@ -198,6 +198,18 @@ python3 scripts/install.py /path/to/sibling-project --upgrade --apply --supervis
 
 Registration creates or reuses the project’s host-owned registration; it does not create a task, grant new agent permissions, start a turn, alter global credentials, or modify the Codex desktop app. The custom client must start each supervised task with the project identity and route every App Server turn through its renderer. It creates the host task with its authorized actions and validator definitions, then renders a final response only after the supervisor returns a release decision.
 
+#### Owner escape hatch in supervised projects
+
+During an applied `--supervised` install or upgrade, the installer reads only a regular `.owner-override` at the target project’s root and imports an immutable snapshot into host-owned state. It does not follow symlinks, read parent/sibling/home overrides, or watch the file after installation. Edit the root file and run the same applied supervised upgrade again from the protected host context to import a new snapshot; an agent changing the workspace file alone cannot change host behavior.
+
+| Root `.owner-override` mode | Host-supervised behavior |
+| --- | --- |
+| `pause` | Existing active supervised tasks are paused; tasks created while the imported snapshot remains active begin paused. An explicit host resume is required. |
+| `reset` | Existing nonterminal supervised tasks are cancelled, retaining their audit history and implementation work. Start a new host task with a new authorization snapshot. |
+| `bypass-review` | Remains a PR-governance choice only; it never permits a coding agent to release a final message. |
+
+For an emergency release, the host client may use `HostSupervisor.release_withheld_final(task_id, owner=..., reason=..., project=...)`. It releases exactly the host-stored candidate final, records the owner, reason, attempt ID, and digest in the audit log, and consumes that candidate. This is deliberately unavailable from a workspace task file or agent-editable configuration.
+
 The default state path is `~/.agent-canvas-supervisor`, but use `--supervisor-state-dir` for a protected host deployment. The installer rejects a state directory inside or enclosing the project. Uninstalling Agent Canvas intentionally preserves host audit state.
 
 This is not enforcement for sessions opened directly in the existing Codex desktop app: that UI does not currently use the custom renderer. The POC validates the host gate against App Server-shaped events, not a live model turn. See [the supervised-mode design](docs/supervised-mode.md) for the full limitation and upstream capability list.

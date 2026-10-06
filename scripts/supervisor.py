@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +19,7 @@ import fcntl
 DEFAULT_PROHIBITED = ("push", "publish", "pr_create", "merge", "destructive", "credential_change",
                       "config_change", "external_message")
 TERMINAL_STATUSES = {"complete", "blocked", "cancelled"}
+OWNER_OVERRIDE_MODES = {"pause", "bypass-review", "reset"}
 
 
 class Decision:
@@ -57,6 +59,16 @@ class HostSupervisor:
 
     def _registration(self, project):
         return self._project_dir(project) / "registration.json"
+
+    def _project_event(self, project, event_type, **details):
+        event = {"at": _now(), "type": event_type, "project": str(Path(project).resolve()), **details}
+        path = self._project_dir(project) / "audit.jsonl"
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as out:
+            out.write(json.dumps(event, sort_keys=True) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+        return event
 
     def _task_path(self, task_id, project=None):
         _validate_task_id(task_id)
@@ -117,6 +129,33 @@ class HostSupervisor:
         self._write(registration, value)
         return value
 
+    def import_owner_override(self, project, modes, *, source_digest):
+        """Import a one-time, owner-provided workspace snapshot into host state."""
+        project = Path(project).resolve()
+        current = self.provision(project)
+        if not isinstance(modes, (list, tuple, set)) or any(mode not in OWNER_OVERRIDE_MODES for mode in modes):
+            raise ValueError("Unknown owner override mode")
+        if not isinstance(source_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", source_digest):
+            raise ValueError("Owner override snapshot requires a SHA-256 source digest")
+        normalized = sorted(set(modes))
+        current["owner_override"] = {"modes": normalized, "source_digest": source_digest, "imported_at": _now()}
+        self._write(self._registration(project), current)
+        self._project_event(project, "owner_override_imported", modes=normalized, source_digest=source_digest)
+        for path in sorted((self._project_dir(project) / "tasks").glob("*.json")):
+            task_id = path.stem
+            with self._locked_task(task_id, project) as task:
+                if task["status"] in TERMINAL_STATUSES:
+                    continue
+                if "reset" in normalized:
+                    task["status"] = "cancelled"
+                    self._save_task(task)
+                    self._event(task_id, "owner_override_reset", project=task["project"])
+                elif "pause" in normalized and task["status"] == "active":
+                    task["status"] = "paused"
+                    self._save_task(task)
+                    self._event(task_id, "owner_override_paused", project=task["project"])
+        return current
+
     def _project_for_task(self, task_id, project=None):
         return self._task_path(task_id, project).parents[1]
 
@@ -153,11 +192,14 @@ class HostSupervisor:
         authorization = {"revision": 1, "permitted_operations": sorted(set(permitted_operations)),
                          "prohibited_operations": list(DEFAULT_PROHIBITED)}
         authorization["digest"] = _digest(authorization)
-        task = {"schema_version": 1, "task_id": task_id, "project": registration["project"], "status": "active",
+        task = {"schema_version": 1, "task_id": task_id, "project": registration["project"],
+                "status": "paused" if "pause" in registration.get("owner_override", {}).get("modes", []) else "active",
                 "authorization": authorization, "actions": action_map, "validators": list(validators),
                 "blockers": list(blockers), "evidence": {"validators": {}}, "visible_messages": []}
         self._write(path, task)
         self._event(task_id, "task_created", project=project, authorization_digest=authorization["digest"])
+        if task["status"] == "paused":
+            self._event(task_id, "owner_override_paused", project=project)
         return task
 
     def task(self, task_id, *, project=None):
@@ -299,6 +341,10 @@ class HostSupervisor:
             self._event(task_id, "final_attempt", project=task["project"], attempt_id=attempt_id, content_digest=hashlib.sha256(content.encode()).hexdigest())
             if task["status"] in TERMINAL_STATUSES | {"paused"}:
                 return Decision(task["status"], message="Automatic continuation is disabled until an explicit resume.")
+            task["withheld_final"] = {"attempt_id": attempt_id, "content": content,
+                                      "content_digest": hashlib.sha256(content.encode()).hexdigest(),
+                                      "withheld_at": _now()}
+            self._save_task(task)
             remaining = self._remaining(task)
             authorized = [(action_id, action) for action_id, action in remaining
                           if self._operation_allowed(task, action.get("operation"))]
@@ -337,8 +383,27 @@ class HostSupervisor:
                                 next_action=remediation)
             task["visible_messages"].append(content)
             task["status"] = "complete"
+            task.pop("withheld_final", None)
             self._save_task(task)
             self._event(task_id, "final_released", project=task["project"], attempt_id=attempt_id)
+            return Decision("complete", release=True, message=content)
+
+    def release_withheld_final(self, task_id, *, owner, reason, project=None):
+        """Release exactly one stored candidate through a host-only owner action."""
+        if not isinstance(owner, str) or not owner.strip() or not isinstance(reason, str) or not reason.strip():
+            raise ValueError("Owner release requires a nonempty owner and reason")
+        with self._locked_task(task_id, project) as task:
+            withheld = task.get("withheld_final")
+            if not isinstance(withheld, dict) or not isinstance(withheld.get("content"), str):
+                raise ValueError("No withheld final is available for owner release")
+            content = withheld["content"]
+            task["visible_messages"].append(content)
+            task["status"] = "complete"
+            task.pop("withheld_final", None)
+            self._save_task(task)
+            self._event(task_id, "owner_override_final_released", project=task["project"],
+                        attempt_id=withheld.get("attempt_id"), content_digest=withheld.get("content_digest"),
+                        owner=owner.strip(), reason=reason.strip())
             return Decision("complete", release=True, message=content)
 
     def visible_messages(self, task_id, *, project=None):

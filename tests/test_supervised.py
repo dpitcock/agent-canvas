@@ -55,6 +55,16 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(decision.next_action["id"], "write-doc")
         self.assertNotIn("I am done", self.host.visible_messages("task-1"))
 
+    def test_host_owner_can_release_a_specific_withheld_candidate(self):
+        self.task()
+        self.assertEqual(self.host.gate_final("task-1", "attempt-1", "I am done").kind, "continue")
+        released = self.host.release_withheld_final("task-1", owner="Dennis", reason="Emergency handoff")
+        self.assertTrue(released.release)
+        self.assertEqual(released.message, "I am done")
+        self.assertEqual(self.host.visible_messages("task-1"), ["I am done"])
+        events = [event["type"] for event in self.host.audit("task-1")]
+        self.assertIn("owner_override_final_released", events)
+
     def test_workspace_task_file_claim_cannot_complete_host_action(self):
         self.task()
         (self.project / "tasks.md").write_text("write-doc: complete\n")
@@ -207,6 +217,71 @@ class SupervisedTasks(unittest.TestCase):
 
 
 class SupervisedInstallation(unittest.TestCase):
+    def test_supervised_install_imports_a_root_owner_override_as_a_host_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            override = project / ".owner-override"
+            override.write_text('OWNER_OVERRIDE="pause,bypass-review" # host import\n')
+            state_dir = base / "host-state"
+
+            installer.install(project, source=installer.SOURCE, home=base / "home", apply=True,
+                              supervised=True, supervisor_state_dir=state_dir)
+
+            host = supervisor.HostSupervisor(state_dir)
+            registration = host.provision(project)
+            self.assertEqual(registration["owner_override"]["modes"], ["bypass-review", "pause"])
+            self.assertEqual(registration["owner_override"]["source_digest"],
+                             supervisor.hashlib.sha256(override.read_bytes()).hexdigest())
+            override.write_text("OWNER_OVERRIDE=\n")
+            self.assertEqual(host.provision(project)["owner_override"]["modes"], ["bypass-review", "pause"])
+            task = host.create_task("task-1", project, [{"id": "write-doc", "operation": "write"}])
+            self.assertEqual(task["status"], "paused")
+
+    def test_supervised_upgrade_imports_only_the_target_root_owner_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            state_dir = base / "host-state"
+            installer.install(project, source=installer.SOURCE, home=base / "home")
+            (project / ".owner-override").write_text("reset\n")
+
+            installer.upgrade(project, source=installer.SOURCE, home=base / "home", apply=True,
+                              supervised=True, supervisor_state_dir=state_dir)
+
+            registration = supervisor.HostSupervisor(state_dir).provision(project)
+            self.assertEqual(registration["owner_override"]["modes"], ["reset"])
+
+    def test_imported_reset_cancels_existing_nonterminal_host_tasks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            state_dir = base / "host-state"
+            installer.install(project, source=installer.SOURCE, home=base / "home", supervised=True,
+                              supervisor_state_dir=state_dir)
+            host = supervisor.HostSupervisor(state_dir)
+            host.create_task("task-1", project, [{"id": "write-doc", "operation": "write"}])
+            (project / ".owner-override").write_text("OWNER_OVERRIDE=reset\n")
+
+            installer.upgrade(project, source=installer.SOURCE, home=base / "home", apply=True,
+                              supervised=True, supervisor_state_dir=state_dir)
+
+            self.assertEqual(host.task("task-1", project=project)["status"], "cancelled")
+            self.assertIn("owner_override_reset", [event["type"] for event in host.audit("task-1", project=project)])
+
+    def test_supervised_install_rejects_a_symlinked_owner_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            outside = base / "outside-override"
+            outside.write_text("OWNER_OVERRIDE=pause\n")
+            (project / ".owner-override").symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                installer.install(project, source=installer.SOURCE, home=base / "home", apply=True,
+                                  supervised=True, supervisor_state_dir=base / "host-state")
+
     def test_install_and_upgrade_register_only_with_explicit_supervised_option(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
