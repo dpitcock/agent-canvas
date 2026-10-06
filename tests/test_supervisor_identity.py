@@ -47,7 +47,24 @@ class IdentityTests(unittest.TestCase):
         outside.write_text("OWNER_OVERRIDE=reset")
         os.link(outside, self.a / ".owner-override")
         with self.assertRaisesRegex(ValueError, "shared|link"):
+                installer.root_owner_override(self.a)
+
+    def test_override_rejects_oversized_and_growing_input(self):
+        path = self.a / ".owner-override"
+        path.write_bytes(b"x" * (65536 + 1))
+        with self.assertRaisesRegex(ValueError, "size|large|limit"):
             installer.root_owner_override(self.a)
+        path.write_text("OWNER_OVERRIDE=pause")
+        actual = os.fstat
+        def grow(descriptor):
+            info = actual(descriptor)
+            if info.st_ino == path.stat().st_ino:
+                with path.open("ab") as out:
+                    out.write(b"x" * 65536)
+            return info
+        with mock.patch.object(installer.os, "fstat", side_effect=grow):
+            with self.assertRaisesRegex(ValueError, "size|large|limit"):
+                installer.root_owner_override(self.a)
 
     def test_provision_cannot_overwrite_a_concurrent_override_import(self):
         entered, allow_write, imported = threading.Event(), threading.Event(), threading.Event()

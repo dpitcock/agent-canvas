@@ -208,7 +208,7 @@ Required validation currently fails closed: after independent work completes, th
 
 During an applied `--supervised` install or upgrade, the installer reads only a regular `.owner-override` at the target project’s root and imports an immutable snapshot into host-owned state. It does not follow symlinks, read parent/sibling/home overrides, or watch the file after installation. Edit the root file and run the same applied supervised upgrade again from the protected host context to import a new snapshot; an agent changing the workspace file alone cannot change host behavior.
 
-The installer pins directory descriptors, verifies the opened root against its host registration, and rejects hard-linked override files as shared files.
+The installer pins directory descriptors, verifies the opened root against its host registration, rejects hard-linked override files as shared files, and bounds override input to 64 KiB (including growth during reading).
 
 | Root `.owner-override` mode | Host-supervised behavior |
 | --- | --- |

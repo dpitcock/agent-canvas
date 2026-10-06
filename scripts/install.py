@@ -28,6 +28,7 @@ def digest(value):
 
 
 OWNER_OVERRIDE_MODES = {"pause", "bypass-review", "reset"}
+OWNER_OVERRIDE_MAX_BYTES = 65536
 
 
 def root_owner_override(root, *, expected_identity=None):
@@ -64,7 +65,11 @@ def root_owner_override(root, *, expected_identity=None):
             raise ValueError("Owner Override must be a regular file at the project root")
         if info.st_nlink != 1:
             raise ValueError("Owner Override must not be a shared hard-linked file")
-        source = source_file.read()
+        if info.st_size > OWNER_OVERRIDE_MAX_BYTES:
+            raise ValueError("Owner Override exceeds the 64 KiB size limit")
+        source = source_file.read(OWNER_OVERRIDE_MAX_BYTES + 1)
+        if len(source) > OWNER_OVERRIDE_MAX_BYTES:
+            raise ValueError("Owner Override exceeds the 64 KiB size limit")
     assignment, legacy = None, []
     for raw in source.decode("utf-8").splitlines():
         quote, kept = None, []
