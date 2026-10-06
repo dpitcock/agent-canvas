@@ -160,6 +160,33 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(result["decision"].kind, "paused")
         self.assertEqual(self.host.visible_messages("task-1"), [])
 
+    def test_pause_wins_over_failed_validator_remediation(self):
+        self.task(validators=[{
+            "id": "slow-failure",
+            "command": [sys.executable, "-c", "import pathlib, sys, time; pathlib.Path('validator-start').touch(); time.sleep(0.2); sys.exit(1)"],
+            "timeout_s": 2,
+        }])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault(
+            "decision", self.host.gate_final("task-1", "attempt-1", "finished")))
+        thread.start()
+        for _ in range(40):
+            if (self.project / "validator-start").exists():
+                break
+            time.sleep(0.01)
+        self.assertTrue((self.project / "validator-start").exists())
+        self.host.pause("task-1")
+        thread.join(timeout=2)
+        self.assertEqual(result["decision"].kind, "paused")
+
+    def test_resume_does_not_clear_a_pending_pause_request(self):
+        self.task()
+        self.host._request_interrupt("task-1", "paused")
+        with self.assertRaisesRegex(ValueError, "pending"):
+            self.host.resume("task-1")
+        self.assertEqual(self.host.gate_final("task-1", "attempt-1", "finished").kind, "paused")
+
     def test_genuine_blocker_is_released_only_after_independent_actions_finish(self):
         self.task(blockers=[{"id": "owner-choice", "owner_action": "Choose the deployment region."}])
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "blocked").kind, "continue")

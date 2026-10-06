@@ -397,6 +397,12 @@ class HostSupervisor:
                                       "content_digest": hashlib.sha256(content.encode()).hexdigest(),
                                       "withheld_at": _now()}
             self._save_task(task)
+            interruption = self._interrupt_status(task_id, project=task["project"])
+            if interruption:
+                task["status"] = interruption
+                self._save_task(task)
+                self._event(task_id, interruption, project=task["project"], source="final_interrupt")
+                return Decision(interruption, message="Automatic continuation is disabled until an explicit resume.")
             remaining = self._remaining(task)
             authorized = [(action_id, action) for action_id, action in remaining
                           if self._operation_allowed(task, action.get("operation"))]
@@ -424,6 +430,12 @@ class HostSupervisor:
                 self._event(task_id, "blocker_delivered", project=task["project"], blocker_id=blocker.get("id"))
                 return Decision("blocker", release=True, message=message)
             validator_failure = self._validate(task)
+            interruption = self._interrupt_status(task_id, project=task["project"])
+            if interruption:
+                task["status"] = interruption
+                self._save_task(task)
+                self._event(task_id, interruption, project=task["project"], source="validator_interrupt")
+                return Decision(interruption, message="Automatic continuation is disabled until an explicit resume.")
             if validator_failure:
                 validator_id, receipt = validator_failure
                 remediation = {"id": f"validator:{validator_id}", "kind": "validator_remediation",
@@ -433,12 +445,6 @@ class HostSupervisor:
                             next_action=remediation)
                 return Decision("continue", message=f"Host validator {validator_id} failed; repair it and retry.",
                                 next_action=remediation)
-            interruption = self._interrupt_status(task_id, project=task["project"])
-            if interruption:
-                task["status"] = interruption
-                self._save_task(task)
-                self._event(task_id, interruption, project=task["project"], source="validator_interrupt")
-                return Decision(interruption, message="Automatic continuation is disabled until an explicit resume.")
             task["visible_messages"].append(content)
             task["status"] = "complete"
             task.pop("withheld_final", None)
@@ -490,15 +496,21 @@ class HostSupervisor:
             self._event(task_id, "paused", project=task["project"])
 
     def resume(self, task_id, *, project=None):
-        self._clear_interrupt(task_id, project=project)
-        with self._locked_task(task_id, project) as task:
-            if task["status"] != "paused":
-                if task["status"] in TERMINAL_STATUSES:
-                    raise ValueError("A terminal task cannot resume")
-                raise ValueError("Only a paused task can resume")
-            task["status"] = "active"
-            self._save_task(task)
-            self._event(task_id, "resumed", project=task["project"])
+        # Hold the interrupt lock through the state transition so a concurrent pause
+        # cannot have its durable request erased by an invalid resume.
+        with self._locked_interrupt(task_id, project) as interrupt_path:
+            pending = self._read(interrupt_path).get("status") if interrupt_path.exists() else None
+            with self._locked_task(task_id, project) as task:
+                if task["status"] != "paused":
+                    if task["status"] in TERMINAL_STATUSES:
+                        raise ValueError("A terminal task cannot resume")
+                    if pending == "paused":
+                        raise ValueError("A pause transition is pending")
+                    raise ValueError("Only a paused task can resume")
+                interrupt_path.unlink(missing_ok=True)
+                task["status"] = "active"
+                self._save_task(task)
+                self._event(task_id, "resumed", project=task["project"])
 
     def cancel(self, task_id, *, project=None):
         self._request_interrupt(task_id, "cancelled", project=project)
