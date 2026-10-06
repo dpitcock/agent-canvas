@@ -45,8 +45,9 @@ class StagingTests(unittest.TestCase):
             (project / "safe.txt").write_text("safe")
             (project / "hard.txt").hardlink_to(project / "safe.txt")
             (project / "link.txt").symlink_to("safe.txt")
+            os.mkfifo(project / "blocked.fifo")
             pinned = executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project))
-            for declared in ("../safe.txt", "link.txt", "hard.txt"):
+            for declared in ("../safe.txt", "link.txt", "hard.txt", "blocked.fifo"):
                 with self.subTest(declared=declared):
                     with self.assertRaises(executor.InputRejected):
                         executor.stage_inputs(pinned, [declared], Path(staging), max_bytes=1024, max_files=2)
@@ -101,6 +102,15 @@ class RuntimeValidationTests(unittest.TestCase):
         self.assertEqual(len(mounts), 1)
         self.assertIn("dst=/inputs,readonly", mounts[0])
         self.assertNotIn(str(request.project), " ".join(plan))
+        self.assertIn("--pull=never", plan)
+
+    def test_rejects_unbounded_or_invalid_resource_limits(self):
+        image = "example/tool@sha256:" + "a" * 64
+        for changes in ({"pids": -1}, {"pids": 257}, {"memory": "0m"}, {"memory": "2g"}, {"cpus": "0"}, {"cpus": "4.1"}):
+            with self.subTest(changes=changes):
+                with self.assertRaises(executor.ConfigurationError):
+                    executor.ExecutionRequest(action_id="action", attempt_id="attempt", project=Path("/tmp/project"),
+                                              image=image, command=["true"], inputs=[], **changes)
 
 
 @unittest.skipUnless(os.environ.get("AGENT_CANVAS_CONTAINER_IMAGE"), "set a digest-pinned container image to run integration tests")
@@ -115,7 +125,7 @@ class DockerIntegrationTests(unittest.TestCase):
             request = executor.ExecutionRequest(
                 action_id="integration", attempt_id="one", project=project,
                 image=os.environ["AGENT_CANVAS_CONTAINER_IMAGE"], inputs=["fixture.txt"],
-                command=["/bin/sh", "-c", "test \"$(id -u)\" = 65532 && test ! -w fixture.txt && "
+                command=["/bin/sh", "-c", "test \"$(id -u)\" = 65532 && test \"$(cat fixture.txt)\" = \"trusted stage\" && test ! -w fixture.txt && "
                          "test ! -e /var/run/docker.sock && test -w /outputs && ! wget -q -T 1 http://1.1.1.1"],
                 timeout_s=10,
             )

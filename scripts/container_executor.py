@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import shutil
 import stat
@@ -114,7 +115,7 @@ def _open_relative(root_fd, parts):
     try:
         for index, part in enumerate(parts):
             last = index == len(parts) - 1
-            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
             if not last:
                 flags |= os.O_DIRECTORY
             next_fd = os.open(part, flags, dir_fd=current)
@@ -143,7 +144,9 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
     if not parent.is_dir():
         raise ConfigurationError("staging parent must exist and be host-owned")
     root = Path(tempfile.mkdtemp(prefix="agent-canvas-input-", dir=parent))
-    root.chmod(0o700)
+    # The forced non-root container user must traverse the bind mount.  Direct
+    # host enumeration stays disabled, while the mount itself is read-only.
+    root.chmod(0o711)
     manifest, copied, total = [], [], 0
     try:
         for declared_path in paths:
@@ -156,7 +159,8 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
                 if before.st_size < 0 or before.st_size > max_bytes - total:
                     raise InputRejected("input bytes exceed the staging limit")
                 target = root.joinpath(*parts)
-                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                target.parent.mkdir(mode=0o711, parents=True, exist_ok=True)
+                target.parent.chmod(0o711)
                 # The path was derived solely from safe components under root.
                 digest = hashlib.sha256()
                 copied_bytes = 0
@@ -171,11 +175,11 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
                     output.flush()
                     os.fsync(output.fileno())
                 after = os.fstat(fd)
-                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-                    after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                    after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
                 ) or copied_bytes != before.st_size:
                     raise InputRejected("input changed while it was staged")
-                os.chmod(target, 0o400)
+                os.chmod(target, 0o444)
                 copied.append(declared_path)
                 manifest.append({"path": declared_path, "bytes": copied_bytes, "sha256": digest.hexdigest()})
             finally:
@@ -215,6 +219,17 @@ class ExecutionRequest:
             raise ConfigurationError("timeout must be between one and 300 seconds")
         if not isinstance(self.max_output_bytes, int) or not 0 <= self.max_output_bytes <= 1_048_576:
             raise ConfigurationError("output limit must be between zero and one MiB")
+        if not isinstance(self.pids, int) or not 1 <= self.pids <= 256:
+            raise ConfigurationError("process limit must be between one and 256")
+        memory = re.fullmatch(r"([1-9][0-9]*)([mMgG])", self.memory) if isinstance(self.memory, str) else None
+        if not memory or not 16 <= int(memory.group(1)) * (1024 if memory.group(2).lower() == "g" else 1) <= 1024:
+            raise ConfigurationError("memory limit must be between 16m and 1g")
+        try:
+            cpus = float(self.cpus)
+        except (TypeError, ValueError) as error:
+            raise ConfigurationError("CPU limit must be numeric") from error
+        if not 0 < cpus <= 4:
+            raise ConfigurationError("CPU limit must be greater than zero and at most four")
         object.__setattr__(self, "command", tuple(self.command))
         object.__setattr__(self, "inputs", tuple(self.inputs))
 
@@ -265,7 +280,7 @@ class ContainerExecutor:
         staged = Path(staged_inputs).resolve()
         if not staged.is_dir():
             raise ConfigurationError("a host-owned staging directory is required")
-        return [cls.RUNTIME, "create", "--name", name, "--network", "none", "--user", "65532:65532",
+        return [cls.RUNTIME, "create", "--pull=never", "--name", name, "--network", "none", "--user", "65532:65532",
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only", "--pids-limit", str(request.pids),
                 "--memory", request.memory, "--cpus", request.cpus, "--ulimit", "nofile=64:64",
                 "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m", "--tmpfs", "/outputs:rw,noexec,nosuid,nodev,size=16m",

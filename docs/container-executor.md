@@ -22,6 +22,12 @@ socket, no host state, no host home, no inherited environment, no project
 mount, no network, no Linux capabilities, a non-root user, a read-only root,
 bounded tmpfs, memory, CPUs, pids, files, runtime, and captured output.
 
+The stage permits traversal and read access through declared paths while it
+exists so the fixed container UID can consume it.  Declared input must not
+contain data that an untrusted validator—or another host user able to discover
+the temporary path—must not read.  It remains a host-owned, read-only container
+mount; the executor deletes it after execution.
+
 The returned receipt binds the action and attempt identifiers, staged-input
 digest, exact command, pinned image, observed runtime version, status,
 timeout/cancellation state, and bounded output digest.  `receipt.matches()`
