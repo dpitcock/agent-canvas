@@ -147,6 +147,24 @@ class HostSupervisor:
             raise ValueError("Host registration project directory identity mismatch")
         return project
 
+    @contextmanager
+    def _pinned_registered_project(self, project):
+        """Keep the registered project directory open while a validator runs."""
+        project = self._registered_project(project)
+        registration = self._read(self._registration(project))
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(project, flags)
+        except OSError as error:
+            raise ValueError("Supervised project directory cannot be opened safely") from error
+        try:
+            status = os.fstat(descriptor)
+            if {"device": status.st_dev, "inode": status.st_ino} != registration.get("identity"):
+                raise ValueError("Host registration project directory identity mismatch")
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
     def _task_path(self, task_id, project=None):
         self._validate_task_id(task_id)
         if project is not None:
@@ -342,16 +360,21 @@ class HostSupervisor:
             self._event(task_id, "action_completed", project=task["project"], action_id=action_id, evidence=action["evidence"])
             self._event(task_id, "child_evidence_joined", project=task["project"], action_id=action_id, child_task_id=child_task_id)
 
-    def _validator_receipt(self, validator, *, project=None):
+    def _validator_receipt(self, validator, *, project=None, project_descriptor=None):
         command = validator.get("command")
         if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
             raise ValueError("Host validator command must be a nonempty argument list")
         timeout = validator.get("timeout_s", 30)
         if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 300:
             raise ValueError("Host validator timeout_s must be between 0 and 300")
+        run_options = {"capture_output": True, "text": True, "timeout": timeout, "check": False, "cwd": project}
+        if project_descriptor is not None:
+            def change_to_registered_project():
+                os.fchdir(project_descriptor)
+
+            run_options.update(cwd=None, pass_fds=(project_descriptor,), preexec_fn=change_to_registered_project)
         try:
-            run = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False,
-                                 cwd=project)
+            run = subprocess.run(command, **run_options)
             output = (_text_output(run.stdout) + _text_output(run.stderr))[:8192]
             status = run.returncode
         except subprocess.TimeoutExpired as error:
@@ -365,14 +388,15 @@ class HostSupervisor:
 
     def _validate(self, task):
         receipts = {}
-        for validator in task["validators"]:
-            validator_id = validator.get("id")
-            if not validator_id:
-                raise ValueError("Host validators require an id")
-            receipt = self._validator_receipt(validator, project=task["project"])
-            receipts[validator_id] = receipt
-            if receipt["exit_status"] != 0:
-                return False, receipts
+        with self._pinned_registered_project(task["project"]) as project_descriptor:
+            for validator in task["validators"]:
+                validator_id = validator.get("id")
+                if not validator_id:
+                    raise ValueError("Host validators require an id")
+                receipt = self._validator_receipt(validator, project_descriptor=project_descriptor)
+                receipts[validator_id] = receipt
+                if receipt["exit_status"] != 0:
+                    return False, receipts
         return True, receipts
 
     def gate_final(self, task_id, attempt_id, content, *, project=None):

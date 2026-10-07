@@ -288,6 +288,32 @@ class InstallSmoke(unittest.TestCase):
             self.assertTrue(pack.exists())
             self.assertTrue(alias.is_symlink())
 
+    def test_preserve_uninstall_keeps_pack_for_rejected_recorded_adapter_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            def local_pack(destination, revision):
+                skill = destination / "skills/example"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("example")
+
+            target = base / "project"
+            installer.install(target, skills=True, home=base / "home", downloader=local_pack)
+            pack = target / "skills/addyosmani-agent-skills"
+            alias = target / ".agents/skills/example"
+            alias.symlink_to("../../skills/addyosmani-agent-skills/skills/example")
+            state_path = target / ".agent-canvas/state.json"
+            state = json.loads(state_path.read_text())
+            state["adapters"]["links"][".agents/skills/example"] = (
+                "../../skills/addyosmani-agent-skills/skills/example"
+            )
+            state_path.write_text(json.dumps(state))
+
+            uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertTrue(pack.exists())
+            self.assertTrue(alias.is_symlink())
+
     def test_preserve_uninstall_removes_unchanged_pack_with_approved_opencode_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -390,6 +416,28 @@ class InstallSmoke(unittest.TestCase):
             self.assertFalse((target / "AGENTS.md").exists())
             self.assertFalse(state_path.exists())
             self.assertEqual(adapter.read_text(), "preserve")
+
+    def test_remove_all_recovers_standard_adapter_links_without_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            pack = target / "skills/addyosmani-agent-skills"
+            (pack / "skills/example").mkdir(parents=True)
+            (pack / "skills/example/SKILL.md").write_text("example")
+            codex_link = target / ".agents/skills/addy-example"
+            cline_link = target / ".cline/skills/example"
+            unrelated = target / ".agents/skills/addy-unrelated"
+            codex_link.parent.mkdir(parents=True)
+            cline_link.parent.mkdir(parents=True)
+            codex_link.symlink_to("../../skills/addyosmani-agent-skills/skills/example")
+            cline_link.symlink_to("../../skills/addyosmani-agent-skills/skills/example")
+            unrelated.symlink_to("../../elsewhere")
+
+            uninstaller.uninstall(target, mode="remove-all", apply=True)
+
+            self.assertFalse(pack.exists())
+            self.assertFalse(codex_link.exists() or codex_link.is_symlink())
+            self.assertFalse(cline_link.exists() or cline_link.is_symlink())
+            self.assertTrue(unrelated.is_symlink())
 
     def test_remove_all_recovers_when_state_has_wrong_field_types(self):
         with tempfile.TemporaryDirectory() as directory:

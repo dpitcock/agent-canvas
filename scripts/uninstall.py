@@ -157,8 +157,9 @@ def pack_fingerprint(pack):
 
 def unrecorded_adapter_references_pack(root, state, pack):
     """Return whether an unrecorded supported adapter symlink points into pack."""
-    links = state.get("adapters", {}).get("links", {}) if isinstance(state, dict) else {}
-    recorded = set(links) if isinstance(links, dict) else set()
+    # Entries rejected by adapter_links() cannot authorize removal and must not
+    # hide a surviving link from this reference scan.
+    recorded = set(adapter_links(state))
     try:
         pack_root = pack.resolve(strict=True)
     except OSError:
@@ -180,6 +181,35 @@ def unrecorded_adapter_references_pack(root, state, pack):
                 except (OSError, ValueError):
                     pass
     return False
+
+
+def installer_adapter_links(root, pack):
+    """Return discoverable standard adapter links that point at ``pack``."""
+    try:
+        pack_root = pack.resolve(strict=True)
+    except OSError:
+        return []
+    found = []
+    for directory in ADAPTER_DIRS:
+        adapter_dir = root / directory
+        safe_path(root, adapter_dir)
+        if not adapter_dir.is_dir() or adapter_dir.is_symlink():
+            continue
+        for path in adapter_dir.iterdir():
+            name = path.name
+            skill_name = name.removeprefix("addy-") if directory == ".agents/skills" else name
+            expected = Path("../../skills/addyosmani-agent-skills/skills") / skill_name
+            if (not path.is_symlink()
+                    or not skill_name
+                    or (directory == ".agents/skills" and not name.startswith("addy-"))
+                    or os.readlink(path) != str(expected)):
+                continue
+            try:
+                path.resolve(strict=False).relative_to(pack_root)
+                found.append(path)
+            except (OSError, ValueError):
+                pass
+    return found
 
 
 def followup_without_agent_canvas_block(text):
@@ -302,6 +332,10 @@ def uninstall(target, *, mode="preserve", apply=False):
                 pack_referenced_by_modified_adapter = True
             except (OSError, ValueError):
                 pass
+
+    if mode == "remove-all":
+        for path in installer_adapter_links(root, pack):
+            planned_removal(root, path, actions, apply)
 
     # A legacy or malformed adapter record cannot authorize unlinking a link,
     # but a changed link under a supported adapter directory can still retain a

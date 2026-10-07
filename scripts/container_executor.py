@@ -147,12 +147,36 @@ class PinnedProject:
         self.close()
 
 
-@dataclass(frozen=True)
+@dataclass
 class StagedInputs:
     root: Path
     files: tuple[str, ...]
     digest: str
     byte_count: int
+    _parent_fd: int
+    _stage_fd: int
+
+    def visible_root(self):
+        """Return ``root`` only while the retained parent still names this stage."""
+        if self._parent_fd is None or self._stage_fd is None:
+            raise ConfigurationError("staging snapshot is no longer pinned")
+        expected = os.fstat(self._stage_fd)
+        try:
+            through_parent = os.stat(self.root.name, dir_fd=self._parent_fd, follow_symlinks=False)
+            visible = os.lstat(self.root)
+        except OSError as error:
+            raise ConfigurationError("staging parent changed while preparing the snapshot") from error
+        identity = (expected.st_dev, expected.st_ino)
+        if identity != (through_parent.st_dev, through_parent.st_ino) or identity != (visible.st_dev, visible.st_ino):
+            raise ConfigurationError("staging parent changed while preparing the snapshot")
+        return self.root
+
+    def close(self):
+        for attribute in ("_stage_fd", "_parent_fd"):
+            fd = getattr(self, attribute)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, attribute, None)
 
 
 def _open_relative(root_fd, parts):
@@ -186,15 +210,17 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
     if len(paths) > max_files:
         raise InputRejected("declared input count exceeds the staging limit")
     parent_fd = _open_staging_parent(staging_parent)
+    stage_fd = None
+    root = None
     try:
         root = _create_stage(parent_fd, staging_parent)
-    finally:
-        os.close(parent_fd)
-    # The forced non-root container user must traverse the bind mount.  Direct
-    # host enumeration stays disabled, while the mount itself is read-only.
-    root.chmod(0o711)
-    manifest, copied, total = [], [], 0
-    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        stage_fd = os.open(root.name, flags, dir_fd=parent_fd)
+        snapshot = StagedInputs(root, (), "", 0, parent_fd, stage_fd)
+        # The forced non-root container user must traverse the bind mount.  Direct
+        # host enumeration stays disabled, while the mount itself is read-only.
+        snapshot.visible_root().chmod(0o711)
+        manifest, copied, total = [], [], 0
         for declared_path in paths:
             parts = _safe_relative(declared_path)
             fd = _open_relative(project.fd, parts)
@@ -204,15 +230,17 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
                     raise InputRejected("only singly-linked regular files may be staged")
                 if before.st_size < 0 or before.st_size > max_bytes - total:
                     raise InputRejected("input bytes exceed the staging limit")
-                target = root.joinpath(*parts)
+                target = snapshot.visible_root().joinpath(*parts)
                 target.parent.mkdir(mode=0o711, parents=True, exist_ok=True)
                 ancestor = root
                 for part in parts[:-1]:
                     ancestor /= part
+                    snapshot.visible_root()
                     ancestor.chmod(0o711)
                 # The path was derived solely from safe components under root.
                 digest = hashlib.sha256()
                 copied_bytes = 0
+                snapshot.visible_root()
                 with os.fdopen(os.dup(fd), "rb", closefd=True) as source, target.open("xb") as output:
                     while chunk := source.read(64 * 1024):
                         copied_bytes += len(chunk)
@@ -228,16 +256,27 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
                     after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
                 ) or copied_bytes != before.st_size:
                     raise InputRejected("input changed while it was staged")
+                snapshot.visible_root()
                 os.chmod(target, 0o444)
                 copied.append(declared_path)
                 manifest.append({"path": declared_path, "bytes": copied_bytes, "sha256": digest.hexdigest()})
             finally:
                 os.close(fd)
         digest = _sha256(_canonical(manifest))
-        return StagedInputs(root, tuple(copied), digest, total)
+        snapshot.files, snapshot.digest, snapshot.byte_count = tuple(copied), digest, total
+        return snapshot
     except Exception as error:
-        if not _remove_tree(root):
+        safely_visible = root is not None and stage_fd is not None
+        if safely_visible:
+            try:
+                snapshot.visible_root()
+            except ConfigurationError:
+                safely_visible = False
+        if safely_visible and not _remove_tree(root):
             raise ConfigurationError("rejected input stage cleanup could not be confirmed") from error
+        if stage_fd is not None:
+            os.close(stage_fd)
+        os.close(parent_fd)
         raise
 
 
@@ -405,7 +444,9 @@ class ContainerExecutor:
                 cancelled, status = True, "cancelled"
             else:
                 create_attempted = True
-                created = subprocess.run(cls.plan(request, snapshot.root, name), capture_output=True, timeout=10, check=False)
+                created = subprocess.run(
+                    cls.plan(request, snapshot.visible_root(), name), capture_output=True, timeout=10, check=False
+                )
                 if created.returncode:
                     raise ConfigurationError("Docker rejected the required isolation configuration")
                 if cancellation is not None and cancellation.is_set():
@@ -446,7 +487,10 @@ class ContainerExecutor:
             cleanup_ok = True
             if create_attempted:
                 cleanup_ok = cls._remove_container(name)
-            stage_removed = cls._remove_stage(snapshot.root)
+            try:
+                stage_removed = cls._remove_stage(snapshot.visible_root())
+            finally:
+                snapshot.close()
             if not cleanup_ok or not stage_removed:
                 raise ConfigurationError("Docker or host staging cleanup could not be confirmed")
         return ExecutionReceipt.build(action_id=request.action_id, attempt_id=request.attempt_id, input_digest=snapshot.digest,

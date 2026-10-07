@@ -2,6 +2,7 @@
 import importlib.util
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest import mock
@@ -22,6 +23,34 @@ executor = load_executor()
 
 
 class StagingTests(unittest.TestCase):
+    def test_rejects_staging_parent_replacement_after_snapshot_creation(self):
+        """The snapshot pathname must not be redirected after its parent is pinned."""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project, host_owned = base / "project", base / "host-owned"
+            project.mkdir()
+            host_owned.mkdir()
+            (project / "input.txt").write_text("authorized")
+            staging_parent = host_owned / "staging"
+            replacement = host_owned / "replacement"
+            staging_parent.mkdir(mode=0o700)
+            replacement.mkdir(mode=0o700)
+            original_create = executor._create_stage
+
+            def replace_parent(parent_fd, parent_path):
+                root = original_create(parent_fd, parent_path)
+                staging_parent.rename(host_owned / "old-staging")
+                replacement.rename(staging_parent)
+                (staging_parent / root.name).mkdir(mode=0o700)
+                return root
+
+            with mock.patch.object(executor.uuid, "uuid4", return_value=SimpleNamespace(hex="fixed")):
+                with mock.patch.object(executor, "_create_stage", side_effect=replace_parent):
+                    with executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project)) as pinned:
+                        with self.assertRaisesRegex(executor.ConfigurationError, "staging parent changed"):
+                            executor.stage_inputs(pinned, ["input.txt"], staging_parent, max_bytes=1024, max_files=1)
+            self.assertFalse((staging_parent / "agent-canvas-input-fixed" / "input.txt").exists())
+
     def test_rejects_symlinked_staging_parent_before_creating_snapshot(self):
         """Replacing a staging parent with a link must not redirect the bind mount."""
         with tempfile.TemporaryDirectory() as directory:

@@ -219,6 +219,33 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(receipt["exit_status"], 0)
         self.assertEqual(receipt["output"], "project-owned input\n")
 
+    def test_host_validator_remains_in_registered_directory_if_project_path_is_replaced(self):
+        """A path replacement just before spawn must not validate the substitute project."""
+        (self.project / "validator-input.txt").write_text("registered project\n")
+        replacement = self.base / "replacement"
+        replacement.mkdir()
+        (replacement / "validator-input.txt").write_text("replacement project\n")
+        self.task(validators=[{
+            "id": "check-pinned-project-cwd",
+            "command": [sys.executable, "-c", "from pathlib import Path; print(Path('validator-input.txt').read_text().strip())"],
+            "timeout_s": 2,
+        }])
+        task = self.host.task("task-1")
+        run = supervisor.subprocess.run
+
+        def replace_project_before_spawn(*args, **kwargs):
+            self.project.rename(self.base / "registered-project")
+            replacement.rename(self.project)
+            return run(*args, **kwargs)
+
+        with patch.object(supervisor.subprocess, "run", side_effect=replace_project_before_spawn):
+            valid, receipts = self.host._validate(task)
+
+        self.assertTrue(valid)
+        receipt = receipts["check-pinned-project-cwd"]
+        self.assertEqual(receipt["exit_status"], 0)
+        self.assertEqual(receipt["output"], "registered project\n")
+
     def test_genuine_blocker_is_released_only_after_independent_actions_finish(self):
         self.task(blockers=[{"id": "owner-choice", "owner_action": "Choose the deployment region."}])
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "blocked").kind, "continue")
@@ -299,7 +326,7 @@ class SupervisedTasks(unittest.TestCase):
                 transitioned = threading.Event()
                 result = []
 
-                def blocking_validator(_validator, *, project=None):
+                def blocking_validator(_validator, *, project=None, project_descriptor=None):
                     validator_started.set()
                     self.assertTrue(allow_validator_to_finish.wait(timeout=5))
                     return {"exit_status": 0}
