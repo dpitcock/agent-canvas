@@ -459,6 +459,21 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual([event["type"] for event in audit_events].count("final_attempt"), 1)
         self.assertEqual([event["type"] for event in audit_events].count("continuation_queued"), 1)
 
+    def test_renderer_never_evicts_completed_turns_before_task_completion(self):
+        self.task()
+        renderer = client.SupervisedRenderer(self.host, "task-1")
+        original = {"method": "turn/completed", "params": {
+            "turn": {"id": "turn-original", "status": "completed"}
+        }}
+        renderer.consume(original)
+        for index in range(129):
+            renderer.consume({"method": "turn/completed", "params": {
+                "turn": {"id": f"turn-{index}", "status": "completed"}
+            }})
+
+        self.assertEqual(renderer.consume(original), [])
+        self.assertEqual([event["type"] for event in self.host.audit("task-1")].count("final_attempt"), 130)
+
     def test_renderer_discards_malformed_completed_turn_ids_without_gating(self):
         self.task()
         renderer = client.SupervisedRenderer(self.host, "task-1")

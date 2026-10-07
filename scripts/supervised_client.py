@@ -4,12 +4,8 @@
 Callers render the dictionaries returned by ``consume``. Agent-message deltas are
 never returned until HostSupervisor.gate_final releases them after turn/completed.
 """
-from collections import deque
 import threading
 import uuid
-
-
-_COMPLETED_TURN_CACHE_SIZE = 128
 
 
 class SupervisedRenderer:
@@ -21,7 +17,6 @@ class SupervisedRenderer:
         self._completed_message_ids = set()
         self._completed_messages = []
         self._completed_turn_ids = set()
-        self._completed_turn_order = deque()
         self._completed_turn_lock = threading.Lock()
 
     def consume(self, event):
@@ -112,11 +107,8 @@ class SupervisedRenderer:
         self._completed_messages.clear()
 
     def _remember_completed_turn(self, turn_id):
-        """Remember a bounded number of terminal protocol turns for replay suppression."""
+        """Remember every completed turn for this renderer/task lifetime."""
         self._completed_turn_ids.add(turn_id)
-        self._completed_turn_order.append(turn_id)
-        if len(self._completed_turn_order) > _COMPLETED_TURN_CACHE_SIZE:
-            self._completed_turn_ids.discard(self._completed_turn_order.popleft())
 
     @staticmethod
     def _turn_completion_id(event):
