@@ -64,9 +64,18 @@ class SupervisedRenderer:
         if self._turn_status(event) != "completed":
             self._reset_messages()
             return [{"kind": "progress", "event": self._sanitized_turn_completion(event)}]
-        decision = self.supervisor.gate_final(
-            self.task_id, str(uuid.uuid4()), self._select_final_message(), project=self.project
-        )
+        final_message = self._select_final_message()
+        if not final_message:
+            self._reset_messages()
+            return [{"kind": "progress", "event": self._sanitized_turn_completion(event)}]
+        try:
+            decision = self.supervisor.gate_final(
+                self.task_id, str(uuid.uuid4()), final_message, project=self.project
+            )
+        except Exception:
+            with self._completed_turn_lock:
+                self._completed_turn_ids.discard(turn_id)
+            raise
         self._reset_messages()
         if decision.release:
             return [{"kind": "final", "content": decision.message, "decision": decision.kind}]

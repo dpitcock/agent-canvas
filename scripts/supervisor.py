@@ -342,7 +342,7 @@ class HostSupervisor:
             self._event(task_id, "action_completed", project=task["project"], action_id=action_id, evidence=action["evidence"])
             self._event(task_id, "child_evidence_joined", project=task["project"], action_id=action_id, child_task_id=child_task_id)
 
-    def _validator_receipt(self, validator):
+    def _validator_receipt(self, validator, *, project=None):
         command = validator.get("command")
         if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
             raise ValueError("Host validator command must be a nonempty argument list")
@@ -350,7 +350,8 @@ class HostSupervisor:
         if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 300:
             raise ValueError("Host validator timeout_s must be between 0 and 300")
         try:
-            run = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+            run = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False,
+                                 cwd=project)
             output = (_text_output(run.stdout) + _text_output(run.stderr))[:8192]
             status = run.returncode
         except subprocess.TimeoutExpired as error:
@@ -368,7 +369,7 @@ class HostSupervisor:
             validator_id = validator.get("id")
             if not validator_id:
                 raise ValueError("Host validators require an id")
-            receipt = self._validator_receipt(validator)
+            receipt = self._validator_receipt(validator, project=task["project"])
             receipts[validator_id] = receipt
             if receipt["exit_status"] != 0:
                 return False, receipts

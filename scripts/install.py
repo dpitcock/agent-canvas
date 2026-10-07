@@ -223,43 +223,56 @@ def read_state(root):
         return None
     try:
         state = json.loads(path.read_text())
-        assert state["schema_version"] == 1
-        assert isinstance(state["options"], dict)
-        assert set(state["options"]) == {"workspace", "environment", "role", "slack"}
-        assert all(isinstance(v, str) for v in state["options"].values())
-        assert state["options"]["environment"] in {"local", "dev", "production"}
-        assert state["options"]["role"] in {"application", "toolkit-authoring"}
-        assert isinstance(state["baselines"], dict) and set(state["baselines"]) <= set(MANAGED)
-        assert all(v is None or isinstance(v, str) for v in state["baselines"].values())
-        assert isinstance(state["pending"], dict) and set(state["pending"]) <= set(MANAGED)
-        assert all(isinstance(v, dict) and isinstance(v["incoming"], str) for v in state["pending"].values())
-        assert isinstance(state["resolutions"], list)
+        if not isinstance(state, dict) or state.get("schema_version") != 1:
+            raise ValueError
+        options = state.get("options")
+        if not (isinstance(options, dict) and set(options) == {"workspace", "environment", "role", "slack"}
+                and all(isinstance(value, str) for value in options.values())
+                and options["environment"] in {"local", "dev", "production"}
+                and options["role"] in {"application", "toolkit-authoring"}):
+            raise ValueError
+        baselines = state.get("baselines")
+        if not (isinstance(baselines, dict) and set(baselines) <= set(MANAGED)
+                and all(value is None or isinstance(value, str) for value in baselines.values())):
+            raise ValueError
+        pending = state.get("pending")
+        if not (isinstance(pending, dict) and set(pending) <= set(MANAGED)
+                and all(isinstance(value, dict) and isinstance(value.get("incoming"), str)
+                        for value in pending.values()) and isinstance(state.get("resolutions"), list)):
+            raise ValueError
         if "provenance" in state:
             provenance = state["provenance"]
-            assert isinstance(provenance, dict)
-            assert set(provenance) <= {"managed_files", "gitignore_entries"}
-            assert isinstance(provenance.get("managed_files", []), list)
-            assert set(provenance.get("managed_files", [])) <= set(MANAGED)
-            assert isinstance(provenance.get("gitignore_entries", []), list)
-            assert all(entry in IGNORE or re.fullmatch(r"/\.cline/skills/[^/]+", entry)
-                       for entry in provenance.get("gitignore_entries", []))
+            if not (isinstance(provenance, dict) and set(provenance) <= {"managed_files", "gitignore_entries"}
+                    and isinstance(provenance.get("managed_files", []), list)
+                    and set(provenance.get("managed_files", [])) <= set(MANAGED)
+                    and isinstance(provenance.get("gitignore_entries", []), list)
+                    and all(entry in IGNORE or re.fullmatch(r"/\.cline/skills/[^/]+", entry)
+                            for entry in provenance.get("gitignore_entries", []))):
+                raise ValueError
         if "supervised" in state:
             supervised = state["supervised"]
-            assert isinstance(supervised, dict) and supervised.get("enabled") is True
-            assert isinstance(supervised.get("state_dir"), str)
-            assert re.fullmatch(r"[0-9a-f]{64}", supervised.get("registration_digest", ""))
+            if not (isinstance(supervised, dict) and supervised.get("enabled") is True
+                    and isinstance(supervised.get("state_dir"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", supervised.get("registration_digest", ""))):
+                raise ValueError
         if "adapters" in state:
             adapter = state["adapters"]
-            assert isinstance(adapter, dict) and isinstance(adapter["links"], dict)
-            assert isinstance(adapter["pending"], list) and all(isinstance(item, str) for item in adapter["pending"])
+            if not (isinstance(adapter, dict) and isinstance(adapter.get("links"), dict)
+                    and isinstance(adapter.get("pending"), list)
+                    and all(isinstance(item, str) for item in adapter["pending"])):
+                raise ValueError
             for name, target in adapter["links"].items():
-                assert isinstance(name, str) and isinstance(target, str) and name == str(Path(name))
-                assert str(Path(name).parent) in ADAPTERS.values() and Path(name).name not in {".", ".."}
+                if not (isinstance(name, str) and isinstance(target, str) and name == str(Path(name))
+                        and str(Path(name).parent) in ADAPTERS.values() and Path(name).name not in {".", ".."}):
+                    raise ValueError
                 expected = Path("../../skills/addyosmani-agent-skills/skills") / Path(target).name
-                assert target == str(expected) and Path(target).name not in {".", ".."}
+                if target != str(expected) or Path(target).name in {".", ".."}:
+                    raise ValueError
             if "pack" in adapter:
-                assert re.fullmatch(r"[0-9a-f]{64}", adapter["pack"]["fingerprint"])
-                assert re.fullmatch(r"[0-9a-fA-F]{40}", adapter["pack"]["revision"])
+                pack = adapter["pack"]
+                if not (isinstance(pack, dict) and re.fullmatch(r"[0-9a-f]{64}", pack.get("fingerprint", ""))
+                        and re.fullmatch(r"[0-9a-fA-F]{40}", pack.get("revision", ""))):
+                    raise ValueError
         return state
     except (ValueError, KeyError, TypeError, AssertionError) as error:
         raise ValueError(f"Cannot read upgrade history in {path}; preserve it and repair or restore it") from error

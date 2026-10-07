@@ -249,6 +249,45 @@ class InstallSmoke(unittest.TestCase):
             self.assertTrue(pack.exists())
             self.assertTrue(link.is_symlink())
 
+    def test_managed_file_replaced_with_directory_is_preserved_or_removed_by_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            for mode, should_exist in (("preserve", True), ("remove-all", False)):
+                with self.subTest(mode=mode):
+                    target = base / mode
+                    installer.install(target, home=base / "home")
+                    managed = target / "AGENTS.md"
+                    managed.unlink()
+                    managed.mkdir()
+
+                    uninstaller.uninstall(target, mode=mode, apply=True)
+
+                    self.assertEqual(managed.exists(), should_exist)
+                    if should_exist:
+                        self.assertTrue(managed.is_dir())
+
+    def test_preserve_uninstall_keeps_pack_referenced_by_unrecorded_adapter_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            def local_pack(destination, revision):
+                skill = destination / "skills/example"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("example")
+
+            target = base / "project"
+            installer.install(target, skills=True, home=base / "home", downloader=local_pack)
+            pack = target / "skills/addyosmani-agent-skills"
+            alias = target / ".cline/skills/unrecorded"
+            alias.parent.mkdir(parents=True, exist_ok=True)
+            alias.symlink_to("../../skills/addyosmani-agent-skills/skills/example")
+
+            uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertTrue(pack.exists())
+            self.assertTrue(alias.is_symlink())
+
     def test_preserve_uninstall_removes_unchanged_pack_with_approved_opencode_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

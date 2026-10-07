@@ -155,6 +155,33 @@ def pack_fingerprint(pack):
     return hashlib.sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()
 
 
+def unrecorded_adapter_references_pack(root, state, pack):
+    """Return whether an unrecorded supported adapter symlink points into pack."""
+    links = state.get("adapters", {}).get("links", {}) if isinstance(state, dict) else {}
+    recorded = set(links) if isinstance(links, dict) else set()
+    try:
+        pack_root = pack.resolve(strict=True)
+    except OSError:
+        return False
+    for directory in ADAPTER_DIRS:
+        adapter_dir = root / directory
+        safe_path(root, adapter_dir)
+        if not adapter_dir.is_dir() or adapter_dir.is_symlink():
+            continue
+        for base, dirs, files in os.walk(adapter_dir, followlinks=False):
+            for name in dirs + files:
+                path = Path(base) / name
+                relative = path.relative_to(root).as_posix()
+                if relative in recorded or not path.is_symlink():
+                    continue
+                try:
+                    path.resolve(strict=False).relative_to(pack_root)
+                    return True
+                except (OSError, ValueError):
+                    pass
+    return False
+
+
 def followup_without_agent_canvas_block(text):
     if BEGIN not in text and END not in text:
         return text, False
@@ -251,7 +278,7 @@ def uninstall(target, *, mode="preserve", apply=False):
             else:
                 actions.append(f"PRESERVE {name}: it is a symlink")
             continue
-        owned_unchanged = (name in baselines and baselines[name] is not None
+        owned_unchanged = (path.is_file() and name in baselines and baselines[name] is not None
                            and path.read_text() == baselines[name]
                            and name in managed_files)
         if mode == "remove-all" or owned_unchanged:
@@ -296,6 +323,8 @@ def uninstall(target, *, mode="preserve", apply=False):
                     pack_referenced_by_modified_adapter = True
                 except (OSError, ValueError):
                     pass
+        if unrecorded_adapter_references_pack(root, state, pack):
+            pack_referenced_by_modified_adapter = True
 
     adapters_state = state.get("adapters") if isinstance(state, dict) else None
     pack_record = adapters_state.get("pack") if isinstance(adapters_state, dict) else None

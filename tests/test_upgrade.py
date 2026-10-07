@@ -2,6 +2,8 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -15,6 +17,28 @@ def snapshot(root):
 
 
 class UpgradeSmoke(unittest.TestCase):
+    def test_optimized_python_rejects_invalid_saved_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            state_path = root / installer.STATE
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(json.dumps({"schema_version": 999}))
+            program = f'''\
+import importlib.util
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("installer", {str(Path(__file__).resolve().parents[1] / "scripts/install.py")!r})
+installer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(installer)
+try:
+    installer.read_state(Path({str(root)!r}))
+except ValueError:
+    pass
+else:
+    raise SystemExit("invalid state was accepted")
+'''
+            run = subprocess.run([sys.executable, "-O", "-c", program], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+
     def test_upgrade_records_provenance_for_new_managed_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

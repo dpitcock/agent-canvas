@@ -202,6 +202,23 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(receipt["exit_status"], 0)
         self.assertIn("digest", receipt)
 
+    def test_host_validator_executes_from_the_registered_project(self):
+        """Relative validator paths must resolve from the task's registered project."""
+        (self.project / "validator-input.txt").write_text("project-owned input\n")
+        self.task(validators=[{
+            "id": "check-project-cwd",
+            "command": [sys.executable, "-c", "from pathlib import Path; print(Path('validator-input.txt').read_text().strip())"],
+            "timeout_s": 2,
+        }])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+
+        decision = self.host.gate_final("task-1", "attempt-1", "finished")
+
+        self.assertTrue(decision.release)
+        receipt = self.host.task("task-1")["evidence"]["validators"]["check-project-cwd"]
+        self.assertEqual(receipt["exit_status"], 0)
+        self.assertEqual(receipt["output"], "project-owned input\n")
+
     def test_genuine_blocker_is_released_only_after_independent_actions_finish(self):
         self.task(blockers=[{"id": "owner-choice", "owner_action": "Choose the deployment region."}])
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "blocked").kind, "continue")
@@ -282,7 +299,7 @@ class SupervisedTasks(unittest.TestCase):
                 transitioned = threading.Event()
                 result = []
 
-                def blocking_validator(_validator):
+                def blocking_validator(_validator, *, project=None):
                     validator_started.set()
                     self.assertTrue(allow_validator_to_finish.wait(timeout=5))
                     return {"exit_status": 0}
@@ -394,6 +411,9 @@ class SupervisedTasks(unittest.TestCase):
         self.task()
         renderer = self.renderer()
         self.assertEqual(renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "secret final"}}), [])
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": {"item": {
+            "id": "candidate", "type": "agentMessage", "text": "safe candidate"
+        }}}), [])
         output = renderer.consume({"method": "turn/completed", "params": {"turnId": "turn-1", "status": "completed"}})
         self.assertEqual(output[0]["kind"], "continuation")
         events = [event["type"] for event in self.host.audit("task-1")]
@@ -417,7 +437,9 @@ class SupervisedTasks(unittest.TestCase):
         renderer = self.renderer()
 
         for event in (
-            {"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": "secret final"}}},
+            {"method": "item/completed", "params": {"item": {
+                "id": "candidate", "type": "agentMessage", "text": "secret final"
+            }}},
             {"method": "item/agentMessage/completed", "params": {"text": "another secret final"}},
         ):
             with self.subTest(method=event["method"]):
@@ -551,6 +573,58 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(output[0]["content"], "phase unknown")
         self.assertNotIn("never release", str(output))
 
+    def test_renderer_does_not_gate_a_completed_turn_without_a_selectable_final(self):
+        """Commentary-only turns stay nonterminal until a final candidate arrives."""
+        self.task()
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        renderer = self.renderer()
+
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": {"item": {
+            "id": "commentary", "type": "agentMessage", "phase": "commentary", "text": "not final"
+        }}}), [])
+        output = renderer.consume({"method": "turn/completed", "params": {
+            "turnId": "turn-without-final", "status": "completed"
+        }})
+
+        self.assertEqual(output, [{"kind": "progress", "event": {
+            "method": "turn/completed", "params": {"status": "completed"}
+        }}])
+        self.assertEqual(self.host.task("task-1")["status"], "active")
+        self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit("task-1")])
+
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": {"item": {
+            "id": "final", "type": "agentMessage", "phase": "final_answer", "text": "real final"
+        }}}), [])
+        self.assertEqual(renderer.consume({"method": "turn/completed", "params": {
+            "turnId": "turn-with-final", "status": "completed"
+        }}), [{"kind": "final", "content": "real final", "decision": "complete"}])
+
+    def test_renderer_retries_a_completion_after_the_gate_raises(self):
+        """A transient gate failure leaves the same completion eligible for replay."""
+        self.task()
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        renderer = self.renderer()
+        completion = {"method": "turn/completed", "params": {"turnId": "retry-turn", "status": "completed"}}
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": {"item": {
+            "id": "final", "type": "agentMessage", "phase": "final_answer", "text": "retry final"
+        }}}), [])
+        original_gate = self.host.gate_final
+        gate_attempts = 0
+
+        def transient_gate(*args, **kwargs):
+            nonlocal gate_attempts
+            gate_attempts += 1
+            if gate_attempts == 1:
+                raise RuntimeError("temporary failure")
+            return original_gate(*args, **kwargs)
+
+        with patch.object(self.host, "gate_final", side_effect=transient_gate):
+            with self.assertRaisesRegex(RuntimeError, "temporary failure"):
+                renderer.consume(completion)
+            output = renderer.consume(completion)
+
+        self.assertEqual(output, [{"kind": "final", "content": "retry final", "decision": "complete"}])
+
     def test_renderer_ignores_malformed_agent_message_notifications_without_leaking_text(self):
         self.task()
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
@@ -627,6 +701,9 @@ class SupervisedTasks(unittest.TestCase):
         completion = {"method": "turn/completed", "params": {
             "turn": {"id": "turn-1", "status": "completed"}
         }}
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": {"item": {
+            "id": "candidate", "type": "agentMessage", "text": "safe candidate"
+        }}}), [])
 
         first = renderer.consume(completion)
         replay = renderer.consume(completion)
@@ -643,8 +720,14 @@ class SupervisedTasks(unittest.TestCase):
         original = {"method": "turn/completed", "params": {
             "turn": {"id": "turn-original", "status": "completed"}
         }}
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": {"item": {
+            "id": "item-original", "type": "agentMessage", "text": "safe candidate"
+        }}}), [])
         renderer.consume(original)
         for index in range(129):
+            self.assertEqual(renderer.consume({"method": "item/completed", "params": {"item": {
+                "id": f"item-{index}", "type": "agentMessage", "text": "safe candidate"
+            }}}), [])
             renderer.consume({"method": "turn/completed", "params": {
                 "turn": {"id": f"turn-{index}", "status": "completed"}
             }})
