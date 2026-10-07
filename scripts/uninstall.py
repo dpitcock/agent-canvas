@@ -109,21 +109,24 @@ def valid_state(state):
     return True
 
 
-def adapter_links(state):
+def adapter_links(state, *, require_installer_target=True):
     """Return only state entries whose paths are known adapter link locations."""
     adapters = state.get("adapters") if isinstance(state, dict) else None
     links = adapters.get("links") if isinstance(adapters, dict) else None
     if not isinstance(links, dict):
         return {}
-    return {
-        relative: expected
-        for relative, expected in links.items()
-        if isinstance(relative, str)
-        and isinstance(expected, str)
-        and str(Path(relative)) == relative
-        and str(Path(relative).parent) in ADAPTER_DIRS
-        and Path(relative).name not in {"", ".", ".."}
-    }
+    owned = {}
+    for relative, expected in links.items():
+        if not (isinstance(relative, str) and isinstance(expected, str)
+                and str(Path(relative)) == relative
+                and str(Path(relative).parent) in ADAPTER_DIRS):
+            continue
+        name = Path(relative).name
+        target = Path("../../skills/addyosmani-agent-skills/skills") / name
+        if name not in {"", ".", ".."} and (
+                not require_installer_target or expected == str(target)):
+            owned[relative] = expected
+    return owned
 
 
 def pack_fingerprint(pack):
@@ -248,7 +251,7 @@ def uninstall(target, *, mode="preserve", apply=False):
 
     pack = root / "skills/addyosmani-agent-skills"
     pack_referenced_by_modified_adapter = False
-    adapters = adapter_links(state)
+    adapters = adapter_links(state, require_installer_target=mode != "remove-all")
     for relative, expected in adapters.items():
         path = root / relative
         safe_path(root, path)

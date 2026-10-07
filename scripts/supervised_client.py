@@ -103,7 +103,6 @@ class SupervisedRenderer:
 
     def _reset_messages(self):
         self._message_buffers.clear()
-        self._completed_message_ids.clear()
         self._completed_messages.clear()
 
     def _remember_completed_turn(self, turn_id):

@@ -314,6 +314,25 @@ class InstallSmoke(unittest.TestCase):
             self.assertFalse(owned.exists() or owned.is_symlink())
             self.assertEqual(unrelated.read_text(), "do not remove")
 
+    def test_preserve_uninstall_keeps_adapter_link_with_non_installer_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            target.mkdir()
+            link = target / ".agents/skills/company"
+            link.parent.mkdir(parents=True)
+            link.symlink_to("../../elsewhere")
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "baselines": {},
+                "adapters": {"links": {".agents/skills/company": "../../elsewhere"}},
+            }))
+
+            uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertTrue(link.is_symlink())
+
     def test_remove_all_recovers_from_damaged_state_using_fixed_targets_only(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

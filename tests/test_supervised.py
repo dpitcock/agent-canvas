@@ -122,6 +122,25 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(recovered.recover("task-1").next_action["id"], "write-doc")
         self.assertEqual(recovered.claim_action("task-1", "write-doc", "lease-2").kind, "reconcile")
 
+    def test_restart_recovers_abandoned_validation_for_a_fresh_final_attempt(self):
+        """A process crash after persisting validation must not require a manual resume."""
+        self.task(validators=[{"id": "check", "command": [sys.executable, "-c", "print('ok')"], "timeout_s": 2}])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        with self.host._locked_task("task-1") as task:
+            task["status"] = "validating"
+            task["validation_attempt"] = "interrupted-attempt"
+            self.host._save_task(task)
+
+        restarted = supervisor.HostSupervisor(self.base / "host-state")
+        recovered = restarted.recover("task-1")
+
+        self.assertEqual(recovered.kind, "active")
+        self.assertEqual(restarted.task("task-1")["status"], "active")
+        self.assertNotIn("validation_attempt", restarted.task("task-1"))
+        decision = restarted.gate_final("task-1", "fresh-attempt", "finished")
+        self.assertTrue(decision.release)
+        self.assertEqual(decision.kind, "complete")
+
     def test_valid_completion_runs_fresh_host_validator_then_releases_buffer(self):
         self.task(validators=[{"id": "check", "command": [sys.executable, "-c", "print('ok')"], "timeout_s": 2}])
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
@@ -441,6 +460,36 @@ class SupervisedTasks(unittest.TestCase):
         output = renderer.consume({"method": "turn/completed", "params": {"turnId": "turn-1", "status": "completed"}})
 
         self.assertEqual(output[0]["content"], "safe final")
+
+    def test_renderer_ignores_replayed_completed_items_after_a_continuation(self):
+        """A stale item replay cannot replace a later turn's approved final answer."""
+        self.task()
+        renderer = client.SupervisedRenderer(self.host, "task-1")
+        withheld = {"method": "item/completed", "params": {"item": {
+            "id": "first-final", "type": "agentMessage", "phase": "final_answer",
+            "text": "withheld first attempt"
+        }}}
+
+        self.assertEqual(renderer.consume(withheld), [])
+        first = renderer.consume({"method": "turn/completed", "params": {
+            "turnId": "turn-1", "status": "completed"
+        }})
+        self.assertEqual(first[0]["kind"], "continuation")
+
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": {"item": {
+            "id": "second-final", "type": "agentMessage", "phase": "final_answer",
+            "text": "approved second attempt"
+        }}}), [])
+        self.assertEqual(renderer.consume(withheld), [])
+
+        output = renderer.consume({"method": "turn/completed", "params": {
+            "turnId": "turn-2", "status": "completed"
+        }})
+
+        self.assertEqual(output, [{
+            "kind": "final", "content": "approved second attempt", "decision": "complete"
+        }])
 
     def test_renderer_deduplicates_a_replayed_completed_turn_before_gating(self):
         """A replay after a continuation must not queue that action a second time."""

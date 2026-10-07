@@ -371,13 +371,19 @@ class HostSupervisor:
         return self.task(task_id, project=project)["visible_messages"]
 
     def recover(self, task_id, *, project=None):
-        task = self.task(task_id, project=project)
-        remaining = self._remaining(task)
-        if task["status"] != "active" or not remaining:
-            return Decision(task["status"])
-        action_id, action = remaining[0]
-        self._event(task_id, "recovered", project=task["project"], action_id=action_id)
-        return Decision("continue", next_action={"id": action_id, **{k: v for k, v in action.items() if k not in {"attempts", "evidence", "status"}}})
+        with self._locked_task(task_id, project=project) as task:
+            if task["status"] == "validating":
+                attempt_id = task.pop("validation_attempt", None)
+                task["status"] = "active"
+                self._save_task(task)
+                self._event(task_id, "validation_recovered", project=task["project"], attempt_id=attempt_id)
+                return Decision("active", message="Abandoned host validation was recovered; final delivery may be retried.")
+            remaining = self._remaining(task)
+            if task["status"] != "active" or not remaining:
+                return Decision(task["status"])
+            action_id, action = remaining[0]
+            self._event(task_id, "recovered", project=task["project"], action_id=action_id)
+            return Decision("continue", next_action={"id": action_id, **{k: v for k, v in action.items() if k not in {"attempts", "evidence", "status"}}})
 
     def pause(self, task_id, *, project=None):
         with self._locked_task(task_id, project=project) as task:
