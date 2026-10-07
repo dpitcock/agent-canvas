@@ -208,6 +208,47 @@ class InstallSmoke(unittest.TestCase):
 
             self.assertEqual((target / "AGENTS.md").read_text(), content)
 
+    def test_preserve_uninstall_keeps_legacy_ignore_entries_without_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            target.mkdir()
+            (target / ".gitignore").write_text("/.owner-override\n")
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({"schema_version": 1, "baselines": {}}))
+
+            uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertEqual((target / ".gitignore").read_text(), "/.owner-override\n")
+
+    def test_preserve_uninstall_keeps_pack_referenced_by_modified_adapter_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            pack = target / "skills/addyosmani-agent-skills"
+            (pack / "skills/example").mkdir(parents=True)
+            (pack / "skills/other").mkdir()
+            (pack / "skills/example/SKILL.md").write_text("example")
+            (pack / "skills/other/SKILL.md").write_text("other")
+            link = target / ".agents/skills/example"
+            link.parent.mkdir(parents=True)
+            link.symlink_to("../../skills/addyosmani-agent-skills/skills/other")
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "baselines": {},
+                "adapters": {
+                    "links": {".agents/skills/example": "../../skills/addyosmani-agent-skills/skills/example"},
+                    "pending": [],
+                    "pack": {"fingerprint": uninstaller.pack_fingerprint(pack), "revision": "a" * 40},
+                },
+            }))
+
+            uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertTrue(pack.exists())
+            self.assertTrue(link.is_symlink())
+
     def test_preserve_uninstall_removes_unchanged_pack_with_approved_opencode_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

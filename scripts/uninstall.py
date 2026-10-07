@@ -179,11 +179,8 @@ def remove_ignore_entries(root, state, actions, apply):
     if isinstance(provenance, dict):
         entries = set(provenance.get("gitignore_entries", []))
     else:
-        # State written before provenance tracking used the historical fixed set.
-        entries = set(IGNORE)
-        for relative in adapter_links(state):
-            if relative.startswith(".cline/skills/"):
-                entries.add("/.cline/skills/" + Path(relative).name)
+        # Legacy state cannot prove which ignore entries the installer created.
+        entries = set()
     allowed = set(IGNORE)
     allowed.update("/.cline/skills/" + Path(relative).name
                    for relative in adapter_links(state)
@@ -249,6 +246,8 @@ def uninstall(target, *, mode="preserve", apply=False):
         else:
             actions.append(f"PRESERVE {name}: not proven to be an unchanged Agent Canvas file")
 
+    pack = root / "skills/addyosmani-agent-skills"
+    pack_referenced_by_modified_adapter = False
     adapters = adapter_links(state)
     for relative, expected in adapters.items():
         path = root / relative
@@ -258,8 +257,12 @@ def uninstall(target, *, mode="preserve", apply=False):
             planned_removal(root, path, actions, apply)
         elif path.exists() or path.is_symlink():
             actions.append(f"PRESERVE {relative}: owned link was changed")
+            try:
+                path.resolve(strict=False).relative_to(pack.resolve())
+                pack_referenced_by_modified_adapter = True
+            except (OSError, ValueError):
+                pass
 
-    pack = root / "skills/addyosmani-agent-skills"
     adapters_state = state.get("adapters") if isinstance(state, dict) else None
     pack_record = adapters_state.get("pack") if isinstance(adapters_state, dict) else None
     pack_matches = bool(pack_record and pack.is_dir() and pack_fingerprint(pack) == pack_record.get("fingerprint"))
@@ -273,6 +276,8 @@ def uninstall(target, *, mode="preserve", apply=False):
     if pack and pack.exists():
         if mode == "remove-all":
             planned_removal(root, pack, actions, apply)
+        elif pack_referenced_by_modified_adapter:
+            actions.append("PRESERVE skills/addyosmani-agent-skills: preserved adapter link may reference it")
         elif pack_matches:
             planned_removal(root, pack, actions, apply)
         else:

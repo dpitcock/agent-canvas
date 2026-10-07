@@ -202,6 +202,13 @@ class RuntimeValidationTests(unittest.TestCase):
         with mock.patch.object(executor.subprocess, "run", side_effect=executor.subprocess.TimeoutExpired("docker", 10)):
             self.assertFalse(executor.ContainerExecutor._remove_container("agent-canvas-test"))
 
+    def test_container_cleanup_removes_anonymous_volumes(self):
+        """Dropping -v would leave image-declared anonymous volumes behind."""
+        removed = mock.Mock(returncode=0)
+        with mock.patch.object(executor.subprocess, "run", return_value=removed) as run:
+            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test"))
+        self.assertEqual(run.call_args.args[0], ["docker", "rm", "-f", "-v", "agent-canvas-test"])
+
     def test_container_cleanup_accepts_confirmed_absence_after_create_ambiguity(self):
         failed_remove = mock.Mock(returncode=1)
         absent = mock.Mock(returncode=1, stderr=b"Error: No such container: agent-canvas-test\n")

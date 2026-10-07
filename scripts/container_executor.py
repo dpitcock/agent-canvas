@@ -321,7 +321,7 @@ class ContainerExecutor:
     def _remove_container(cls, name):
         """Best-effort Docker cleanup whose failure remains a failed execution."""
         try:
-            removed = subprocess.run([cls.RUNTIME, "rm", "-f", name], capture_output=True, timeout=10, check=False)
+            removed = subprocess.run([cls.RUNTIME, "rm", "-f", "-v", name], capture_output=True, timeout=10, check=False)
         except (OSError, subprocess.SubprocessError):
             return False
         if removed.returncode == 0:

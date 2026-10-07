@@ -4,7 +4,12 @@
 Callers render the dictionaries returned by ``consume``. Agent-message deltas are
 never returned until HostSupervisor.gate_final releases them after turn/completed.
 """
+from collections import deque
+import threading
 import uuid
+
+
+_COMPLETED_TURN_CACHE_SIZE = 128
 
 
 class SupervisedRenderer:
@@ -15,6 +20,9 @@ class SupervisedRenderer:
         self._message_buffers = {}
         self._completed_message_ids = set()
         self._completed_messages = []
+        self._completed_turn_ids = set()
+        self._completed_turn_order = deque()
+        self._completed_turn_lock = threading.Lock()
 
     def consume(self, event):
         if not isinstance(event, dict):
@@ -27,6 +35,14 @@ class SupervisedRenderer:
             return []
         if method != "turn/completed":
             return [{"kind": "progress", "event": event}]
+        turn_id = self._turn_completion_id(event)
+        if turn_id is None:
+            self._reset_messages()
+            return [{"kind": "progress", "event": self._sanitized_turn_completion(event)}]
+        with self._completed_turn_lock:
+            if turn_id in self._completed_turn_ids:
+                return []
+            self._remember_completed_turn(turn_id)
         if self._turn_status(event) != "completed":
             self._reset_messages()
             return [{"kind": "progress", "event": self._sanitized_turn_completion(event)}]
@@ -94,6 +110,32 @@ class SupervisedRenderer:
         self._message_buffers.clear()
         self._completed_message_ids.clear()
         self._completed_messages.clear()
+
+    def _remember_completed_turn(self, turn_id):
+        """Remember a bounded number of terminal protocol turns for replay suppression."""
+        self._completed_turn_ids.add(turn_id)
+        self._completed_turn_order.append(turn_id)
+        if len(self._completed_turn_order) > _COMPLETED_TURN_CACHE_SIZE:
+            self._completed_turn_ids.discard(self._completed_turn_order.popleft())
+
+    @staticmethod
+    def _turn_completion_id(event):
+        """Return one well-formed completion ID, rejecting missing or conflicting fields."""
+        params = event.get("params")
+        if not isinstance(params, dict):
+            return None
+        turn = params.get("turn")
+        nested_id = turn.get("id") if isinstance(turn, dict) else None
+        direct_id = params.get("turnId")
+        identifiers = [identifier for identifier in (nested_id, direct_id) if identifier is not None]
+        if not identifiers or any(
+            not isinstance(identifier, str) or not identifier.strip() or len(identifier) > 512
+            for identifier in identifiers
+        ):
+            return None
+        if any(identifier != identifiers[0] for identifier in identifiers[1:]):
+            return None
+        return identifiers[0]
 
     @classmethod
     def _sanitized_turn_completion(cls, event):
