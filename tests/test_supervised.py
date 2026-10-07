@@ -444,6 +444,18 @@ class SupervisedTasks(unittest.TestCase):
 
         self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit("task-1")])
 
+    def test_renderer_suppresses_unknown_completed_items_before_the_host_gate(self):
+        """Non-agent item types can still contain assistant content."""
+        self.task()
+        renderer = self.renderer()
+
+        output = renderer.consume({"method": "item/completed", "params": {"item": {
+            "type": "message", "role": "assistant", "text": "secret answer",
+        }}})
+
+        self.assertEqual(output, [])
+        self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit("task-1")])
+
     def test_renderer_rejects_messages_and_completions_outside_its_thread_and_turn(self):
         """Sibling events cannot supply text or complete this supervised task."""
         self.task()
@@ -545,9 +557,7 @@ class SupervisedTasks(unittest.TestCase):
         renderer = self.renderer()
 
         self.assertEqual(renderer.consume({"method": "item/agentMessage/delta", "params": None}), [])
-        self.assertEqual(renderer.consume({"method": "item/completed", "params": None}), [
-            {"kind": "progress", "event": {"method": "item/completed", "params": None}}
-        ])
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": None}), [])
         self.assertEqual(renderer.consume({
             "method": "item/agentMessage/delta", "params": {"delta": "unmatched secret"}
         }), [])

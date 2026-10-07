@@ -47,6 +47,10 @@ class SupervisedRenderer:
             return []
         if self._complete_agent_message(event):
             return []
+        if isinstance(method, str) and method.startswith("item/"):
+            # Other response-item types may also carry assistant content, but
+            # only completed agent messages have a safe gated representation.
+            return []
         if method != "turn/completed":
             return [{"kind": "progress", "event": event}]
         turn_id = self._turn_completion_id(event)
