@@ -177,7 +177,12 @@ class HostSupervisor:
         matches = []
         for project_dir in projects.iterdir():
             self._state_directory(project_dir, description="project state directory")
-            tasks = self._state_directory(project_dir / "tasks", description="task state directory")
+            tasks_path = project_dir / "tasks"
+            try:
+                tasks_path.lstat()
+            except FileNotFoundError:
+                continue
+            tasks = self._state_directory(tasks_path, description="task state directory")
             candidate = self._state_file(tasks / f"{task_id}.json", description="task state")
             if candidate.is_file():
                 matches.append(candidate)
@@ -294,6 +299,10 @@ class HostSupervisor:
 
     def create_task(self, task_id, project, actions, *, validators=(), blockers=(), permitted_operations=("read", "write", "delegate")):
         self._validate_task_id(task_id)
+        actions = list(actions)
+        validators = list(validators)
+        blockers = list(blockers)
+        permitted_operations = tuple(permitted_operations)
         registration = self.provision(project)
         path = self._state_file(self._tasks_dir(project, create=True) / f"{task_id}.json", description="task state")
         action_map = {}
@@ -302,6 +311,9 @@ class HostSupervisor:
             action_id = action.pop("id", None)
             if not action_id or action_id in action_map:
                 raise ValueError("actions require unique ids")
+            operation = action.get("operation")
+            if operation not in permitted_operations or operation in DEFAULT_PROHIBITED:
+                raise ValueError("action operation is not permitted by task authorization")
             action_map[action_id] = {**action, "status": "pending", "attempts": [], "evidence": None}
         definition = self._task_definition(action_map, validators, blockers, permitted_operations)
         with self._locked_task(task_id, project=project, create=True):

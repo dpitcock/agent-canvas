@@ -82,7 +82,7 @@ class SupervisedTasks(unittest.TestCase):
         )
 
         changed_definitions = (
-            {"actions": [{"id": "delete-doc", "operation": "delete"}]},
+            {"actions": [{"id": "read-doc", "operation": "read"}]},
             {"validators": [{"id": "lint", "command": ["python3", "-m", "compileall"]}]},
             {"blockers": [{"id": "approval", "required": False}]},
             {"permitted_operations": ("read", "write", "delegate")},
@@ -97,6 +97,28 @@ class SupervisedTasks(unittest.TestCase):
                         blockers=changed.get("blockers", blockers),
                         permitted_operations=changed.get("permitted_operations", ("read", "write")),
                     )
+
+    def test_task_creation_rejects_actions_outside_its_authorization(self):
+        for task_id, action, permitted_operations in (
+            ("publish-task", {"id": "publish", "operation": "publish"}, ("read", "write")),
+            ("push-task", {"id": "push", "operation": "push"}, ("read", "write", "push")),
+        ):
+            with self.subTest(action=action):
+                with self.assertRaisesRegex(ValueError, "authorization"):
+                    self.host.create_task(task_id, self.project, [action],
+                                          permitted_operations=permitted_operations)
+
+    def test_task_creation_preserves_generator_definitions(self):
+        actions = ({"id": "write-doc", "operation": "write"} for _ in range(1))
+        validators = ({"id": "check", "command": ["true"]} for _ in range(1))
+        blockers = ({"id": "owner", "owner_action": "Approve."} for _ in range(1))
+
+        task = self.host.create_task("task-1", self.project, actions,
+                                     validators=validators, blockers=blockers)
+
+        self.assertEqual(list(task["actions"]), ["write-doc"])
+        self.assertEqual(task["validators"], [{"id": "check", "command": ["true"]}])
+        self.assertEqual(task["blockers"], [{"id": "owner", "owner_action": "Approve."}])
 
     def test_rejects_project_nested_state_directory_without_creating_it(self):
         """Creating state before the project-boundary check would leave this directory behind."""
@@ -893,6 +915,32 @@ class SupervisedInstallation(unittest.TestCase):
 
 
 class MultipleProjects(unittest.TestCase):
+    def test_unqualified_lookup_skips_registered_project_without_tasks_yet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            alpha, beta = base / "alpha", base / "beta"
+            alpha.mkdir()
+            beta.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", alpha, [{"id": "one", "operation": "write"}])
+            host.provision(beta)
+
+            self.assertEqual(host.task("task-1")["project"], str(alpha.resolve()))
+
+    def test_unqualified_lookup_rejects_malformed_existing_tasks_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            alpha, beta = base / "alpha", base / "beta"
+            alpha.mkdir()
+            beta.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", alpha, [{"id": "one", "operation": "write"}])
+            host.provision(beta)
+            (host._project_dir(beta) / "tasks").write_text("not a directory")
+
+            with self.assertRaisesRegex(ValueError, "task state directory must be a directory"):
+                host.task("task-1")
+
     def test_same_task_id_is_isolated_by_project(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

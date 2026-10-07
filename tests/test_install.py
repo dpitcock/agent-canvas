@@ -572,6 +572,25 @@ class InstallSmoke(unittest.TestCase):
             self.assertFalse(state_path.exists())
             self.assertIn("PRESERVE .gitignore: it is not a regular file", actions)
 
+    def test_preserve_uninstall_keeps_non_regular_followup_and_completes_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            target.mkdir()
+            (target / "INSTALL-FOLLOWUP.md").mkdir()
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "baselines": {},
+                "provenance": {"managed_files": [], "gitignore_entries": []},
+            }))
+
+            _, actions = uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertTrue((target / "INSTALL-FOLLOWUP.md").is_dir())
+            self.assertFalse(state_path.exists())
+            self.assertIn("PRESERVE INSTALL-FOLLOWUP.md: it is not a regular file", actions)
+
     def test_preserve_uninstall_keeps_preexisting_matching_files_and_ignore_entries(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

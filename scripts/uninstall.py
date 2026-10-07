@@ -276,6 +276,9 @@ def remove_followup_block(root, actions, apply):
     if path.is_symlink():
         actions.append("PRESERVE INSTALL-FOLLOWUP.md: it is a symlink")
         return
+    if not path.is_file():
+        actions.append("PRESERVE INSTALL-FOLLOWUP.md: it is not a regular file")
+        return
     updated, found = followup_without_agent_canvas_block(path.read_text())
     if found is None:
         actions.append("PRESERVE INSTALL-FOLLOWUP.md: Agent Canvas markers are malformed")
