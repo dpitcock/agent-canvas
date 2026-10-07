@@ -1,11 +1,13 @@
 """Offline upgrade behavior tests: temporary files, no network or subprocesses."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("upgrade_installer", Path(__file__).resolve().parents[1] / "scripts/install.py")
 installer = importlib.util.module_from_spec(spec)
@@ -17,6 +19,25 @@ def snapshot(root):
 
 
 class UpgradeSmoke(unittest.TestCase):
+    def test_install_rejects_fifo_state_without_reading_it(self):
+        """A FIFO state file must not block an install before it is rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            state_path = root / installer.STATE
+            state_path.parent.mkdir(parents=True)
+            os.mkfifo(state_path)
+
+            original_read_text = Path.read_text
+
+            def read_text(path, *args, **kwargs):
+                if path == state_path:
+                    raise AssertionError("state FIFO was read")
+                return original_read_text(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", read_text):
+                with self.assertRaisesRegex(ValueError, "non-regular .agent-canvas/state.json"):
+                    installer.install(root)
+
     def test_optimized_python_rejects_invalid_saved_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

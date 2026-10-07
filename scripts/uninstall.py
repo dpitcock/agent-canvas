@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 
 
 MANAGED = (
@@ -68,10 +69,12 @@ def read_state(root, *, allow_damaged=False):
     state_path = root / STATE
     try:
         safe_path(root, state_path)
-        if not state_path.exists():
+        try:
+            state_mode = state_path.lstat().st_mode
+        except FileNotFoundError:
             return None
-        if state_path.is_symlink():
-            raise ValueError("Cannot safely read a symlinked .agent-canvas/state.json")
+        if not stat.S_ISREG(state_mode):
+            raise ValueError("Cannot safely read a non-regular .agent-canvas/state.json")
         state = json.loads(state_path.read_text())
         if not valid_state(state):
             raise ValueError

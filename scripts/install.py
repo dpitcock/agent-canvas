@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import stat
 
 SOURCE = Path(__file__).resolve().parents[1]
 IGNORE = ("/.owner-override", "/.agents/skills/addy-*/", "/skills/addyosmani-agent-skills/")
@@ -219,8 +220,12 @@ def apply_adapters(operations, provenance=None):
 def read_state(root):
     path = root / STATE
     safe_destination(root, path)
-    if not path.exists():
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
         return None
+    if not stat.S_ISREG(mode):
+        raise ValueError("Cannot safely read a non-regular .agent-canvas/state.json")
     try:
         state = json.loads(path.read_text())
         if not isinstance(state, dict) or state.get("schema_version") != 1:

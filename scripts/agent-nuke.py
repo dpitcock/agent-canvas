@@ -44,6 +44,9 @@ def nuke_path(root, path, actions, apply):
             remove_path(path)
             remove_empty_parents(root, path)
         return
+    if not path.is_dir():
+        actions.append(f"PRESERVE SPECIAL {path.relative_to(root)}")
+        return
     for child in sorted(path.iterdir(), key=lambda item: item.name):
         nuke_path(root, child, actions, apply)
     if path.exists() and path.is_dir() and not any(path.iterdir()):

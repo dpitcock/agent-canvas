@@ -536,6 +536,21 @@ class InstallSmoke(unittest.TestCase):
             self.assertFalse((target / ".agent-canvas").exists() or (target / ".agent-canvas").is_symlink())
             self.assertEqual((external / "state.json").read_text(), "{not valid json")
 
+    def test_uninstall_rejects_fifo_state_without_reading_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir(parents=True)
+            os.mkfifo(state_path)
+
+            with patch.object(Path, "read_text", side_effect=AssertionError("state FIFO was read")):
+                with self.assertRaisesRegex(ValueError, "Cannot safely read"):
+                    uninstaller.uninstall(target, mode="preserve", apply=True)
+                _, actions = uninstaller.uninstall(target, mode="remove-all", apply=True)
+
+            self.assertFalse(state_path.exists())
+            self.assertIn("REMOVE .agent-canvas/state.json", actions)
+
     def test_preserve_uninstall_ignores_unrecognized_gitignore_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "project"
@@ -674,6 +689,20 @@ class InstallSmoke(unittest.TestCase):
             self.assertEqual((root / "config.toml").read_text(), '[application]\nport = 8080\n')
             self.assertEqual((root / "hooks.json").read_text(), '{"hooks": ["pre-commit"]}')
             self.assertFalse((root / "AGENTS.md").exists())
+
+    def test_agent_nuke_preserves_special_file_replacements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            special = root / "AGENTS.md"
+            os.mkfifo(special)
+            (root / "CLAUDE.md").write_text("remove")
+
+            _, actions = agent_nuke.nuke(root, apply=True)
+
+            self.assertTrue(special.exists())
+            self.assertFalse((root / "CLAUDE.md").exists())
+            self.assertIn("PRESERVE SPECIAL AGENTS.md", actions)
 
 
 if __name__ == "__main__":

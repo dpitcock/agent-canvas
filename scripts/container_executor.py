@@ -60,6 +60,44 @@ def _remove_tree(path):
     return not Path(path).exists()
 
 
+def _remove_tree_fd(directory_fd):
+    """Remove a tree only through a descriptor retained by the caller."""
+    try:
+        for name in os.listdir(directory_fd):
+            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISDIR(entry.st_mode):
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    _remove_tree_fd(child)
+                finally:
+                    os.close(child)
+                os.rmdir(name, dir_fd=directory_fd)
+            else:
+                os.unlink(name, dir_fd=directory_fd)
+    except OSError:
+        return False
+    return True
+
+
+def _open_or_create_parent(root_fd, parts):
+    """Open the parent of safe relative parts without using a pathname."""
+    current = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            try:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=current)
+            except FileNotFoundError:
+                os.mkdir(part, mode=0o711, dir_fd=current)
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=current)
+            os.close(current)
+            current = next_fd
+            os.fchmod(current, 0o711)
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
 def _open_staging_parent(path):
     """Return a descriptor for a private, host-owned staging directory."""
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -171,6 +209,22 @@ class StagedInputs:
             raise ConfigurationError("staging parent changed while preparing the snapshot")
         return self.root
 
+    def remove(self):
+        """Remove this stage only if its retained parent still names its FD."""
+        if self._parent_fd is None or self._stage_fd is None:
+            return False
+        try:
+            expected = os.fstat(self._stage_fd)
+            named = os.stat(self.root.name, dir_fd=self._parent_fd, follow_symlinks=False)
+            if (expected.st_dev, expected.st_ino) != (named.st_dev, named.st_ino):
+                return False
+            if not _remove_tree_fd(self._stage_fd):
+                return False
+            os.rmdir(self.root.name, dir_fd=self._parent_fd)
+            return True
+        except OSError:
+            return False
+
     def close(self):
         for attribute in ("_stage_fd", "_parent_fd"):
             fd = getattr(self, attribute)
@@ -219,7 +273,7 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
         snapshot = StagedInputs(root, (), "", 0, parent_fd, stage_fd)
         # The forced non-root container user must traverse the bind mount.  Direct
         # host enumeration stays disabled, while the mount itself is read-only.
-        snapshot.visible_root().chmod(0o711)
+        os.fchmod(stage_fd, 0o711)
         manifest, copied, total = [], [], 0
         for declared_path in paths:
             parts = _safe_relative(declared_path)
@@ -230,18 +284,18 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
                     raise InputRejected("only singly-linked regular files may be staged")
                 if before.st_size < 0 or before.st_size > max_bytes - total:
                     raise InputRejected("input bytes exceed the staging limit")
-                target = snapshot.visible_root().joinpath(*parts)
-                target.parent.mkdir(mode=0o711, parents=True, exist_ok=True)
-                ancestor = root
-                for part in parts[:-1]:
-                    ancestor /= part
-                    snapshot.visible_root()
-                    ancestor.chmod(0o711)
+                target_parent = _open_or_create_parent(stage_fd, parts)
                 # The path was derived solely from safe components under root.
                 digest = hashlib.sha256()
                 copied_bytes = 0
-                snapshot.visible_root()
-                with os.fdopen(os.dup(fd), "rb", closefd=True) as source, target.open("xb") as output:
+                try:
+                    target_fd = os.open(
+                        parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        0o600, dir_fd=target_parent,
+                    )
+                finally:
+                    os.close(target_parent)
+                with os.fdopen(os.dup(fd), "rb", closefd=True) as source, os.fdopen(target_fd, "wb", closefd=True) as output:
                     while chunk := source.read(64 * 1024):
                         copied_bytes += len(chunk)
                         total += len(chunk)
@@ -251,13 +305,12 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
                         output.write(chunk)
                     output.flush()
                     os.fsync(output.fileno())
+                    os.fchmod(output.fileno(), 0o444)
                 after = os.fstat(fd)
                 if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
                     after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
                 ) or copied_bytes != before.st_size:
                     raise InputRejected("input changed while it was staged")
-                snapshot.visible_root()
-                os.chmod(target, 0o444)
                 copied.append(declared_path)
                 manifest.append({"path": declared_path, "bytes": copied_bytes, "sha256": digest.hexdigest()})
             finally:
@@ -266,13 +319,10 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
         snapshot.files, snapshot.digest, snapshot.byte_count = tuple(copied), digest, total
         return snapshot
     except Exception as error:
-        safely_visible = root is not None and stage_fd is not None
-        if safely_visible:
-            try:
-                snapshot.visible_root()
-            except ConfigurationError:
-                safely_visible = False
-        if safely_visible and not _remove_tree(root):
+        cleanup_ok = root is None
+        if root is not None and stage_fd is not None:
+            cleanup_ok = snapshot.remove()
+        if not cleanup_ok:
             raise ConfigurationError("rejected input stage cleanup could not be confirmed") from error
         if stage_fd is not None:
             os.close(stage_fd)
@@ -492,7 +542,7 @@ class ContainerExecutor:
             if create_attempted:
                 cleanup_ok = cls._remove_container(name)
             try:
-                stage_removed = cls._remove_stage(snapshot.visible_root())
+                stage_removed = snapshot.remove()
             finally:
                 snapshot.close()
             if not cleanup_ok or not stage_removed:

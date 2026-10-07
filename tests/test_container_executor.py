@@ -23,8 +23,8 @@ executor = load_executor()
 
 
 class StagingTests(unittest.TestCase):
-    def test_rejects_staging_parent_replacement_after_snapshot_creation(self):
-        """The snapshot pathname must not be redirected after its parent is pinned."""
+    def test_parent_replacement_after_snapshot_creation_does_not_redirect_stage_io(self):
+        """The descriptor-owned stage remains isolated even if its visible path moves."""
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             project, host_owned = base / "project", base / "host-owned"
@@ -47,9 +47,12 @@ class StagingTests(unittest.TestCase):
             with mock.patch.object(executor.uuid, "uuid4", return_value=SimpleNamespace(hex="fixed")):
                 with mock.patch.object(executor, "_create_stage", side_effect=replace_parent):
                     with executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project)) as pinned:
-                        with self.assertRaisesRegex(executor.ConfigurationError, "staging parent changed"):
-                            executor.stage_inputs(pinned, ["input.txt"], staging_parent, max_bytes=1024, max_files=1)
+                        snapshot = executor.stage_inputs(pinned, ["input.txt"], staging_parent, max_bytes=1024, max_files=1)
+            self.assertEqual((host_owned / "old-staging" / "agent-canvas-input-fixed" / "input.txt").read_text(), "authorized")
             self.assertFalse((staging_parent / "agent-canvas-input-fixed" / "input.txt").exists())
+            self.assertTrue(snapshot.remove())
+            self.assertFalse((host_owned / "old-staging" / "agent-canvas-input-fixed").exists())
+            snapshot.close()
 
     def test_rejects_symlinked_staging_parent_before_creating_snapshot(self):
         """Replacing a staging parent with a link must not redirect the bind mount."""
@@ -134,7 +137,7 @@ class StagingTests(unittest.TestCase):
             project.mkdir()
             (project / "input.txt").write_text("input")
             with executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project)) as pinned:
-                with mock.patch.object(executor.shutil, "rmtree", side_effect=OSError("busy")):
+                with mock.patch.object(executor, "_remove_tree_fd", return_value=False):
                     with self.assertRaises(executor.ConfigurationError):
                         executor.stage_inputs(pinned, ["missing.txt"], Path(staging), max_bytes=1024, max_files=1)
 
