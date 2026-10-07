@@ -158,6 +158,36 @@ class SupervisedTasks(unittest.TestCase):
         self.host.cancel("task-1")
         self.assertEqual(self.host.gate_final("task-1", "attempt-2", "done").kind, "cancelled")
 
+    def test_pause_and_cancel_preserve_completed_and_blocked_terminal_states(self):
+        terminal_cases = (
+            ("complete", (), "finished"),
+            ("blocked", [{"id": "owner-choice", "owner_action": "Choose the deployment region."}], "blocked"),
+        )
+        for expected_status, blockers, final_content in terminal_cases:
+            with self.subTest(status=expected_status):
+                task_id = f"task-{expected_status}"
+                self.host.create_task(task_id, self.project, actions=[{"id": "write-doc", "operation": "write"}],
+                                      blockers=blockers)
+                self.host.complete_action(task_id, "write-doc", evidence={"receipt": "host-observed"})
+                self.host.gate_final(task_id, "terminal-final", final_content)
+
+                self.host.pause(task_id)
+                self.assertEqual(self.host.task(task_id)["status"], expected_status)
+                self.host.cancel(task_id)
+                self.assertEqual(self.host.task(task_id)["status"], expected_status)
+                with self.assertRaisesRegex(ValueError, "Only a paused task can resume"):
+                    self.host.resume(task_id)
+
+    def test_pause_cannot_make_a_cancelled_task_resumable(self):
+        self.task()
+        self.host.cancel("task-1")
+
+        self.host.pause("task-1")
+
+        self.assertEqual(self.host.task("task-1")["status"], "cancelled")
+        with self.assertRaisesRegex(ValueError, "Only a paused task can resume"):
+            self.host.resume("task-1")
+
     def test_crash_after_dispatch_requires_reconciliation_not_duplicate_dispatch(self):
         self.task(actions=[{"id": "send", "operation": "write", "side_effect": True}])
         self.assertEqual(self.host.claim_action("task-1", "send", "attempt-1").kind, "dispatch")
@@ -254,6 +284,64 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(output[0]["kind"], "continuation")
         self.assertNotIn("secret final", str(output))
 
+    def test_renderer_releases_only_the_last_completed_agent_message_item(self):
+        self.task()
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        renderer = client.SupervisedRenderer(self.host, "task-1")
+
+        for event in (
+            {"method": "item/agentMessage/delta", "params": {"itemId": "draft", "delta": "discard me"}},
+            {"method": "item/completed", "params": {"item": {"id": "draft", "type": "agentMessage"}}},
+            {"method": "item/agentMessage/delta", "params": {"itemId": "final", "delta": "release me"}},
+            {"method": "item/completed", "params": {"item": {"id": "final", "type": "agentMessage"}}},
+        ):
+            self.assertEqual(renderer.consume(event), [])
+
+        output = renderer.consume({"method": "turn/completed", "params": {"status": "completed"}})
+
+        self.assertEqual(output, [{"kind": "final", "content": "release me", "decision": "complete"}])
+
+    def test_renderer_ignores_malformed_agent_message_notifications_without_leaking_text(self):
+        self.task()
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        renderer = client.SupervisedRenderer(self.host, "task-1")
+
+        self.assertEqual(renderer.consume({"method": "item/agentMessage/delta", "params": None}), [])
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": None}), [
+            {"kind": "progress", "event": {"method": "item/completed", "params": None}}
+        ])
+        self.assertEqual(renderer.consume({
+            "method": "item/agentMessage/delta", "params": {"delta": "unmatched secret"}
+        }), [])
+        self.assertEqual(renderer.consume({
+            "method": "item/agentMessage/delta", "params": {"itemId": "final", "delta": "safe final"}
+        }), [])
+        self.assertEqual(renderer.consume({
+            "method": "item/completed", "params": {"item": {"id": "final", "type": "agentMessage"}}
+        }), [])
+
+        output = renderer.consume({"method": "turn/completed", "params": {}})
+
+        self.assertEqual(output[0]["content"], "safe final")
+        self.assertNotIn("unmatched secret", str(output))
+
+    def test_renderer_ignores_late_deltas_after_an_agent_message_item_completes(self):
+        self.task()
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        renderer = client.SupervisedRenderer(self.host, "task-1")
+
+        for event in (
+            {"method": "item/agentMessage/delta", "params": {"itemId": "final", "delta": "safe final"}},
+            {"method": "item/completed", "params": {"item": {"id": "final", "type": "agentMessage"}}},
+            {"method": "item/agentMessage/delta", "params": {"itemId": "final", "delta": " late text"}},
+            {"method": "item/completed", "params": {"item": {"id": "final", "type": "agentMessage"}}},
+        ):
+            self.assertEqual(renderer.consume(event), [])
+
+        output = renderer.consume({"method": "turn/completed", "params": {}})
+
+        self.assertEqual(output[0]["content"], "safe final")
+
     def test_failed_or_interrupted_turn_completion_discards_partial_text_without_gating(self):
         for status in ("failed", "interrupted"):
             with self.subTest(status=status):
@@ -261,7 +349,9 @@ class SupervisedTasks(unittest.TestCase):
                 self.host.create_task(task_id, self.project, actions=[{"id": "write-doc", "operation": "write"}])
                 self.host.complete_action(task_id, "write-doc", evidence={"receipt": "host-observed"})
                 renderer = client.SupervisedRenderer(self.host, task_id)
-                renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "partial text"}})
+                renderer.consume({"method": "item/agentMessage/delta", "params": {
+                    "itemId": "partial", "delta": "partial text"
+                }})
 
                 output = renderer.consume({"method": "turn/completed", "params": {"status": status}})
 
@@ -269,7 +359,12 @@ class SupervisedTasks(unittest.TestCase):
                 self.assertNotIn("final_attempt", [
                     event["type"] for event in self.host.audit(task_id) if event["task_id"] == task_id
                 ])
-                renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "complete text"}})
+                renderer.consume({"method": "item/agentMessage/delta", "params": {
+                    "itemId": "final", "delta": "complete text"
+                }})
+                renderer.consume({"method": "item/completed", "params": {
+                    "item": {"id": "final", "type": "agentMessage"}
+                }})
                 output = renderer.consume({"method": "turn/completed", "params": {"status": "completed"}})
                 self.assertEqual(output[0]["content"], "complete text")
 

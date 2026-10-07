@@ -22,6 +22,7 @@ FOLLOWUP = "INSTALL-FOLLOWUP.md"
 BEGIN = "<!-- agent-canvas:upgrade:start -->"
 END = "<!-- agent-canvas:upgrade:end -->"
 IGNORE = {"/.owner-override", "/.agents/skills/addy-*/", "/skills/addyosmani-agent-skills/"}
+ADAPTER_DIRS = {".agents/skills", ".cline/skills"}
 
 
 def root_path(target):
@@ -63,20 +64,66 @@ def remove_empty_parents(root, path):
         parent = parent.parent
 
 
-def read_state(root):
+def read_state(root, *, allow_damaged=False):
     state_path = root / STATE
-    safe_path(root, state_path)
-    if not state_path.exists():
-        return None
-    if state_path.is_symlink():
-        raise ValueError("Cannot safely read a symlinked .agent-canvas/state.json")
     try:
+        safe_path(root, state_path)
+        if not state_path.exists():
+            return None
+        if state_path.is_symlink():
+            raise ValueError("Cannot safely read a symlinked .agent-canvas/state.json")
         state = json.loads(state_path.read_text())
-        if state.get("schema_version") != 1 or not isinstance(state.get("baselines"), dict):
+        if not valid_state(state):
             raise ValueError
         return state
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        if allow_damaged:
+            return None
         raise ValueError("Cannot safely read .agent-canvas/state.json; use --mode remove-all after inspecting it") from error
+
+
+def valid_state(state):
+    if not isinstance(state, dict) or state.get("schema_version") != 1:
+        return False
+    baselines = state.get("baselines")
+    if not isinstance(baselines, dict) or any(
+            not isinstance(name, str) or not isinstance(value, (str, type(None)))
+            for name, value in baselines.items()):
+        return False
+    provenance = state.get("provenance")
+    if provenance is not None and (
+            not isinstance(provenance, dict)
+            or any(not isinstance(provenance.get(name, []), list)
+                   or not all(isinstance(value, str) for value in provenance.get(name, []))
+                   for name in ("managed_files", "gitignore_entries"))):
+        return False
+    adapters = state.get("adapters")
+    if adapters is not None:
+        if not isinstance(adapters, dict) or not isinstance(adapters.get("links", {}), dict):
+            return False
+        if any(not isinstance(relative, str) or not isinstance(expected, str)
+               for relative, expected in adapters["links"].items()):
+            return False
+        if "pack" in adapters and not isinstance(adapters["pack"], dict):
+            return False
+    return True
+
+
+def adapter_links(state):
+    """Return only state entries whose paths are known adapter link locations."""
+    adapters = state.get("adapters") if isinstance(state, dict) else None
+    links = adapters.get("links") if isinstance(adapters, dict) else None
+    if not isinstance(links, dict):
+        return {}
+    return {
+        relative: expected
+        for relative, expected in links.items()
+        if isinstance(relative, str)
+        and isinstance(expected, str)
+        and str(Path(relative)) == relative
+        and str(Path(relative).parent) in ADAPTER_DIRS
+        and Path(relative).name not in {"", ".", ".."}
+    }
 
 
 def pack_fingerprint(pack):
@@ -121,14 +168,19 @@ def remove_ignore_entries(root, state, actions, apply):
         actions.append("PRESERVE .gitignore: it is a symlink")
         return
     provenance = state.get("provenance")
-    if provenance is not None:
+    if isinstance(provenance, dict):
         entries = set(provenance.get("gitignore_entries", []))
     else:
         # State written before provenance tracking used the historical fixed set.
         entries = set(IGNORE)
-        for relative in state.get("adapters", {}).get("links", {}):
+        for relative in adapter_links(state):
             if relative.startswith(".cline/skills/"):
                 entries.add("/.cline/skills/" + Path(relative).name)
+    allowed = set(IGNORE)
+    allowed.update("/.cline/skills/" + Path(relative).name
+                   for relative in adapter_links(state)
+                   if relative.startswith(".cline/skills/"))
+    entries &= allowed
     old = path.read_text()
     kept = [line for line in old.splitlines(keepends=True) if line.rstrip("\r\n") not in entries]
     new = "".join(kept)
@@ -163,7 +215,8 @@ def uninstall(target, *, mode="preserve", apply=False):
     if mode not in {"preserve", "remove-all"}:
         raise ValueError("mode must be preserve or remove-all")
     root = root_path(target)
-    state = read_state(root) if (root / STATE).exists() else None
+    state_path = root / STATE
+    state = read_state(root, allow_damaged=mode == "remove-all") if (state_path.exists() or state_path.is_symlink()) else None
     actions = []
     baselines = state.get("baselines", {}) if state else {}
     provenance = state.get("provenance") if state else None
@@ -188,7 +241,7 @@ def uninstall(target, *, mode="preserve", apply=False):
         else:
             actions.append(f"PRESERVE {name}: not proven to be an unchanged Agent Canvas file")
 
-    adapters = state.get("adapters", {}).get("links", {}) if state else {}
+    adapters = adapter_links(state)
     for relative, expected in adapters.items():
         path = root / relative
         safe_path(root, path)
@@ -199,17 +252,18 @@ def uninstall(target, *, mode="preserve", apply=False):
             actions.append(f"PRESERVE {relative}: owned link was changed")
 
     pack = root / "skills/addyosmani-agent-skills"
-    pack_record = state.get("adapters", {}).get("pack") if state else None
+    adapters_state = state.get("adapters") if isinstance(state, dict) else None
+    pack_record = adapters_state.get("pack") if isinstance(adapters_state, dict) else None
     pack_matches = bool(pack_record and pack.is_dir() and pack_fingerprint(pack) == pack_record.get("fingerprint"))
     if pack.exists() or pack.is_symlink():
         if pack.is_symlink():
-            if mode == "remove-all" and state:
+            if mode == "remove-all":
                 planned_removal(root, pack, actions, apply)
             else:
                 actions.append("PRESERVE skills/addyosmani-agent-skills: it is a symlink")
             pack = None
     if pack and pack.exists():
-        if mode == "remove-all" and state:
+        if mode == "remove-all":
             planned_removal(root, pack, actions, apply)
         elif pack_matches:
             planned_removal(root, pack, actions, apply)
@@ -222,8 +276,10 @@ def uninstall(target, *, mode="preserve", apply=False):
         planned_removal(root, root / FOLLOWUP, actions, apply)
     elif state:
         remove_followup_block(root, actions, apply)
-    if state:
-        planned_removal(root, root / STATE, actions, apply)
+    if state or mode == "remove-all":
+        state_root = state_path.parent
+        planned_removal(root, state_root if not state_root.is_dir() or state_root.is_symlink() else state_path,
+                        actions, apply)
     if not actions:
         actions.append("NO AGENT CANVAS ARTIFACTS FOUND")
     return apply, actions

@@ -191,7 +191,7 @@ class InstallSmoke(unittest.TestCase):
             self.assertTrue(link.is_symlink())
             self.assertIn("PRESERVE skills/addyosmani-agent-skills: not proven to be an unchanged Agent Canvas pack", actions)
 
-    def test_remove_all_rejects_adapter_path_that_escapes_project(self):
+    def test_remove_all_ignores_adapter_path_that_escapes_project(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             target = base / "project"
@@ -206,10 +206,127 @@ class InstallSmoke(unittest.TestCase):
                 "adapters": {"links": {"../victim": "adapter-target"}},
             }))
 
-            with self.assertRaisesRegex(ValueError, "outside the project"):
-                uninstaller.uninstall(target, mode="remove-all", apply=True)
+            uninstaller.uninstall(target, mode="remove-all", apply=True)
 
             self.assertEqual(victim.read_text(), "do not remove")
+            self.assertFalse(state_path.exists())
+
+    def test_remove_all_ignores_adapter_records_outside_supported_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "project"
+            target.mkdir()
+            owned = target / ".agents/skills/addy-example"
+            owned.parent.mkdir(parents=True)
+            owned.symlink_to("../../skills/addyosmani-agent-skills/skills/example", target_is_directory=True)
+            unrelated = target / ".claude/skills/victim"
+            unrelated.parent.mkdir(parents=True)
+            unrelated.write_text("do not remove")
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "baselines": {},
+                "adapters": {"links": {
+                    ".agents/skills/addy-example": "../../skills/addyosmani-agent-skills/skills/example",
+                    ".claude/skills/victim": "adapter-target",
+                }},
+            }))
+
+            uninstaller.uninstall(target, mode="remove-all", apply=True)
+
+            self.assertFalse(owned.exists() or owned.is_symlink())
+            self.assertEqual(unrelated.read_text(), "do not remove")
+
+    def test_remove_all_recovers_from_damaged_state_using_fixed_targets_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "project"
+            target.mkdir()
+            (target / "AGENTS.md").write_text("remove")
+            adapter = target / ".agents/skills/untrusted-record"
+            adapter.parent.mkdir(parents=True)
+            adapter.write_text("preserve")
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text("{not valid json")
+
+            uninstaller.uninstall(target, mode="remove-all", apply=True)
+
+            self.assertFalse((target / "AGENTS.md").exists())
+            self.assertFalse(state_path.exists())
+            self.assertEqual(adapter.read_text(), "preserve")
+
+    def test_remove_all_recovers_when_state_has_wrong_field_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            target.mkdir()
+            (target / "AGENTS.md").write_text("remove")
+            (target / "skills/addyosmani-agent-skills").mkdir(parents=True)
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "baselines": {},
+                "provenance": "not an object",
+            }))
+
+            uninstaller.uninstall(target, mode="remove-all", apply=True)
+
+            self.assertFalse((target / "AGENTS.md").exists())
+            self.assertFalse(state_path.exists())
+
+    def test_remove_all_recovers_from_invalid_adapter_pack_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            target.mkdir()
+            (target / "AGENTS.md").write_text("remove")
+            (target / "skills/addyosmani-agent-skills").mkdir(parents=True)
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "baselines": {},
+                "adapters": {"links": {}, "pack": "not an object"},
+            }))
+
+            uninstaller.uninstall(target, mode="remove-all", apply=True)
+
+            self.assertFalse((target / "AGENTS.md").exists())
+            self.assertFalse(state_path.exists())
+
+    def test_remove_all_unlinks_a_symlinked_state_directory_without_following_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "project"
+            target.mkdir()
+            (target / "AGENTS.md").write_text("remove")
+            external = base / "external-state"
+            external.mkdir()
+            (external / "state.json").write_text("{not valid json")
+            (target / ".agent-canvas").symlink_to(external, target_is_directory=True)
+
+            uninstaller.uninstall(target, mode="remove-all", apply=True)
+
+            self.assertFalse((target / ".agent-canvas").exists() or (target / ".agent-canvas").is_symlink())
+            self.assertEqual((external / "state.json").read_text(), "{not valid json")
+
+    def test_preserve_uninstall_ignores_unrecognized_gitignore_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            target.mkdir()
+            (target / ".gitignore").write_text("important-entry\n")
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "baselines": {},
+                "provenance": {"gitignore_entries": ["important-entry"]},
+            }))
+
+            uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertEqual((target / ".gitignore").read_text(), "important-entry\n")
 
     def test_preserve_uninstall_keeps_preexisting_matching_files_and_ignore_entries(self):
         with tempfile.TemporaryDirectory() as directory:

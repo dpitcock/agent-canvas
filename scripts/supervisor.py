@@ -18,6 +18,7 @@ import fcntl
 
 DEFAULT_PROHIBITED = ("push", "publish", "pr_create", "merge", "destructive", "credential_change",
                       "config_change", "external_message")
+TERMINAL_STATUSES = frozenset(("complete", "blocked", "cancelled"))
 
 
 class Decision:
@@ -336,6 +337,8 @@ class HostSupervisor:
 
     def pause(self, task_id, *, project=None):
         with self._locked_task(task_id, project=project) as task:
+            if task["status"] in TERMINAL_STATUSES:
+                return
             task["status"] = "paused"
             self._save_task(task)
             self._event(task_id, "paused", project=task["project"])
@@ -350,6 +353,8 @@ class HostSupervisor:
 
     def cancel(self, task_id, *, project=None):
         with self._locked_task(task_id, project=project) as task:
+            if task["status"] in TERMINAL_STATUSES:
+                return
             task["status"] = "cancelled"
             self._save_task(task)
             self._event(task_id, "cancelled", project=task["project"])
