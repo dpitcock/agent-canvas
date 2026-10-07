@@ -9,12 +9,17 @@ import uuid
 
 
 class SupervisedRenderer:
-    def __init__(self, supervisor, task_id, *, project=None, thread_id=None, turn_id=None):
+    def __init__(
+        self, supervisor, task_id, *, project=None, thread_id=None, turn_id=None,
+        legacy_test_mode=False,
+    ):
         self.supervisor = supervisor
         self.task_id = task_id
         self.project = project
         if (thread_id is None) != (turn_id is None):
             raise ValueError("thread_id and turn_id must be bound together")
+        if thread_id is None and not legacy_test_mode:
+            raise ValueError("thread_id and turn_id are required outside legacy test mode")
         if thread_id is not None and (
             not self._valid_identifier(thread_id) or not self._valid_identifier(turn_id)
         ):

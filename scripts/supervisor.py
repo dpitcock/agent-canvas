@@ -85,11 +85,52 @@ class HostSupervisor:
         status = Path(project).stat()
         return {"device": status.st_dev, "inode": status.st_ino}
 
-    def _project_dir(self, project):
-        return self._projects_dir() / self._project_key(project)
+    @staticmethod
+    def _state_directory(path, *, create=False, description):
+        """Return a state directory only when it is a real directory, never a link."""
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            if not create:
+                raise ValueError(f"Supervisor {description} does not exist")
+            path.mkdir(mode=0o700)
+        else:
+            if path.is_symlink():
+                raise ValueError(f"Supervisor {description} must not be a symlink")
+            if not path.is_dir():
+                raise ValueError(f"Supervisor {description} must be a directory")
+        try:
+            path.chmod(0o700)
+        except OSError:
+            pass
+        return path
 
-    def _registration(self, project):
-        return self._project_dir(project) / "registration.json"
+    @staticmethod
+    def _state_file(path, *, required=False, description="state file"):
+        """Reject links and directories before a host-state file is read or replaced."""
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            if required:
+                raise ValueError(f"Supervisor {description} does not exist")
+            return path
+        if path.is_symlink():
+            raise ValueError(f"Supervisor {description} must not be a symlink")
+        if not path.is_file():
+            raise ValueError(f"Supervisor {description} must be a regular file")
+        return path
+
+    def _project_dir(self, project, *, create=False):
+        project_dir = self._projects_dir() / self._project_key(project)
+        return self._state_directory(project_dir, create=create, description="project state directory")
+
+    def _registration(self, project, *, create=False):
+        registration = self._project_dir(project, create=create) / "registration.json"
+        return self._state_file(registration, description="project registration")
+
+    def _tasks_dir(self, project, *, create=False):
+        project_dir = self._project_dir(project, create=create)
+        return self._state_directory(project_dir / "tasks", create=create, description="task state directory")
 
     def _registered_project(self, project):
         """Return a registered project only while its original directory still exists."""
@@ -110,41 +151,46 @@ class HostSupervisor:
         self._validate_task_id(task_id)
         if project is not None:
             project = self._registered_project(project)
-            path = self._project_dir(project) / "tasks" / f"{task_id}.json"
-            if not path.is_file():
+            path = self._state_file(self._tasks_dir(project) / f"{task_id}.json", description="task state")
+            if not path.exists():
                 raise ValueError(f"Unknown task: {task_id}")
             return path
         projects = self._projects_dir()
-        matches = list(projects.glob(f"*/tasks/{task_id}.json"))
+        matches = []
+        for project_dir in projects.iterdir():
+            self._state_directory(project_dir, description="project state directory")
+            tasks = self._state_directory(project_dir / "tasks", description="task state directory")
+            candidate = self._state_file(tasks / f"{task_id}.json", description="task state")
+            if candidate.is_file():
+                matches.append(candidate)
         if len(matches) != 1:
             raise ValueError(f"Unknown or ambiguous task: {task_id}")
         registration = self._read(matches[0].parents[1] / "registration.json")
         self._registered_project(registration.get("project"))
         return matches[0]
 
-    def _task_lock_path(self, task_id, project=None):
+    def _task_lock_path(self, task_id, project=None, *, create=False):
         self._validate_task_id(task_id)
         if project is not None:
             project = self._registered_project(project)
-            return self._project_dir(project) / "tasks" / f"{task_id}.lock"
-        return self._task_path(task_id).with_suffix(".lock")
+            return self._state_file(self._tasks_dir(project, create=create) / f"{task_id}.lock", description="task lock")
+        return self._state_file(self._task_path(task_id).with_suffix(".lock"), description="task lock")
 
     @contextmanager
-    def _locked_task(self, task_id, *, project=None):
+    def _locked_task(self, task_id, *, project=None, create=False):
         """Serialize one task's durable read-modify-write transitions."""
-        lock_path = self._task_lock_path(task_id, project)
-        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_path = self._task_lock_path(task_id, project, create=create)
         with lock_path.open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
-                path = self._task_path(task_id, project) if project is None else self._project_dir(project) / "tasks" / f"{task_id}.json"
+                path = self._task_path(task_id, project) if project is None else self._tasks_dir(project) / f"{task_id}.json"
                 yield self._read(path) if path.exists() else None
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     @staticmethod
     def _write(path, value):
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        HostSupervisor._state_file(path, description="state file")
         data = json.dumps(value, indent=2, sort_keys=True) + "\n"
         with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as out:
             out.write(data)
@@ -159,6 +205,7 @@ class HostSupervisor:
     @staticmethod
     def _read(path):
         try:
+            HostSupervisor._state_file(path, required=True, description="state file")
             return json.loads(path.read_text())
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"Host state is unreadable: {path}") from error
@@ -181,7 +228,7 @@ class HostSupervisor:
             raise ValueError("Supervisor state directory must be outside the project workspace")
         self._ensure_root()
         identity = self._project_identity(project)
-        registration = self._registration(project)
+        registration = self._registration(project, create=True)
         if registration.exists():
             current = self._read(registration)
             if current["project"] != str(project):
@@ -197,12 +244,11 @@ class HostSupervisor:
         return self._task_path(task_id, project).parents[1]
 
     def _event_path(self, task_id, project=None):
-        return self._project_for_task(task_id, project) / "audit.jsonl"
+        return self._state_file(self._project_for_task(task_id, project) / "audit.jsonl", description="audit log")
 
     def _event(self, task_id, event_type, *, project=None, **details):
         event = {"at": _now(), "type": event_type, "task_id": task_id, **details}
         path = self._event_path(task_id, project)
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as out:
             out.write(json.dumps(event, sort_keys=True) + "\n")
             out.flush()
@@ -216,8 +262,8 @@ class HostSupervisor:
     def create_task(self, task_id, project, actions, *, validators=(), blockers=(), permitted_operations=("read", "write", "delegate")):
         self._validate_task_id(task_id)
         registration = self.provision(project)
-        path = self._project_dir(project) / "tasks" / f"{task_id}.json"
-        with self._locked_task(task_id, project=project):
+        path = self._state_file(self._tasks_dir(project, create=True) / f"{task_id}.json", description="task state")
+        with self._locked_task(task_id, project=project, create=True):
             if path.exists():
                 return self._read(path)
             action_map = {}

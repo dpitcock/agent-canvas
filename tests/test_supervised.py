@@ -3,6 +3,7 @@ import importlib.util
 import multiprocessing
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import threading
@@ -51,6 +52,12 @@ class SupervisedTasks(unittest.TestCase):
     def task(self, actions=None, validators=(), blockers=()):
         return self.host.create_task("task-1", self.project, actions or [{"id": "write-doc", "operation": "write"}],
                                      validators=list(validators), blockers=list(blockers))
+
+    def renderer(self, task_id="task-1", **kwargs):
+        """Create a legacy unbound renderer only for protocol-fixture tests."""
+        return client.SupervisedRenderer(
+            self.host, task_id, legacy_test_mode=True, **kwargs
+        )
 
     def test_early_final_is_withheld_and_queues_exact_remaining_action(self):
         self.task()
@@ -116,6 +123,27 @@ class SupervisedTasks(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "symlink"):
             host.create_task("task-1", self.project, [{"id": "write-doc", "operation": "write"}])
+
+        self.assertEqual(list(self.project.iterdir()), [])
+
+    def test_rejects_symlinked_project_state_before_creating_task_files(self):
+        """A project-key link must not redirect registration or task state into a workspace."""
+        project_state = self.host._project_dir(self.project)
+        shutil.rmtree(project_state)
+        os.symlink(self.project, project_state)
+
+        with self.assertRaisesRegex(ValueError, "project state directory must not be a symlink"):
+            self.host.create_task("task-1", self.project, [{"id": "write-doc", "operation": "write"}])
+
+        self.assertEqual(list(self.project.iterdir()), [])
+
+    def test_rejects_non_directory_project_state_before_creating_task_files(self):
+        project_state = self.host._project_dir(self.project)
+        shutil.rmtree(project_state)
+        project_state.write_text("not a directory")
+
+        with self.assertRaisesRegex(ValueError, "project state directory must be a directory"):
+            self.host.create_task("task-1", self.project, [{"id": "write-doc", "operation": "write"}])
 
         self.assertEqual(list(self.project.iterdir()), [])
 
@@ -364,7 +392,7 @@ class SupervisedTasks(unittest.TestCase):
 
     def test_audit_log_records_all_gate_decisions_and_renderer_never_leaks_deltas(self):
         self.task()
-        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer = self.renderer()
         self.assertEqual(renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "secret final"}}), [])
         output = renderer.consume({"method": "turn/completed", "params": {"turnId": "turn-1", "status": "completed"}})
         self.assertEqual(output[0]["kind"], "continuation")
@@ -372,9 +400,21 @@ class SupervisedTasks(unittest.TestCase):
         self.assertIn("final_attempt", events)
         self.assertIn("continuation_queued", events)
 
+    def test_renderer_requires_a_thread_and_turn_binding_by_default(self):
+        """Production renderers cannot accept un-routed private notifications."""
+        self.task()
+
+        with self.assertRaisesRegex(ValueError, "thread_id and turn_id"):
+            client.SupervisedRenderer(self.host, "task-1")
+
+        renderer = client.SupervisedRenderer(
+            self.host, "task-1", thread_id="thread-1", turn_id="turn-1"
+        )
+        self.assertEqual((renderer.thread_id, renderer.turn_id), ("thread-1", "turn-1"))
+
     def test_renderer_withholds_completed_agent_message_notifications_until_the_gate(self):
         self.task()
-        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer = self.renderer()
 
         for event in (
             {"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": "secret final"}}},
@@ -389,7 +429,7 @@ class SupervisedTasks(unittest.TestCase):
     def test_renderer_suppresses_raw_response_items_before_the_host_gate(self):
         """Raw response items can carry assistant text and are never display-safe."""
         self.task()
-        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer = self.renderer()
 
         for item in (
             {"type": "message", "role": "assistant", "content": [{"text": "secret answer"}]},
@@ -408,14 +448,12 @@ class SupervisedTasks(unittest.TestCase):
         """Sibling events cannot supply text or complete this supervised task."""
         self.task()
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        unbound_renderer = client.SupervisedRenderer(self.host, "task-1")
+        unbound_renderer = self.renderer()
         self.assertEqual(unbound_renderer.consume({"method": "turn/completed", "params": {
             "threadId": "thread-b", "turn": {"id": "turn-b", "status": "completed"},
         }}), [])
         self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit("task-1")])
-        renderer = client.SupervisedRenderer(
-            self.host, "task-1", thread_id="thread-a", turn_id="turn-a"
-        )
+        renderer = self.renderer(thread_id="thread-a", turn_id="turn-a")
 
         for event in (
             {"method": "item/agentMessage/delta", "params": {
@@ -447,7 +485,7 @@ class SupervisedTasks(unittest.TestCase):
     def test_renderer_releases_only_the_last_completed_agent_message_item(self):
         self.task()
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer = self.renderer()
 
         for event in (
             {"method": "item/agentMessage/delta", "params": {"itemId": "draft", "delta": "discard me"}},
@@ -464,7 +502,7 @@ class SupervisedTasks(unittest.TestCase):
     def test_renderer_prefers_completed_final_answer_over_later_commentary(self):
         self.task()
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer = self.renderer()
 
         for event in (
             {"method": "item/completed", "params": {"item": {
@@ -484,7 +522,7 @@ class SupervisedTasks(unittest.TestCase):
     def test_renderer_uses_phase_unknown_completed_text_but_never_commentary(self):
         self.task()
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer = self.renderer()
 
         for event in (
             {"method": "item/completed", "params": {"item": {
@@ -504,7 +542,7 @@ class SupervisedTasks(unittest.TestCase):
     def test_renderer_ignores_malformed_agent_message_notifications_without_leaking_text(self):
         self.task()
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer = self.renderer()
 
         self.assertEqual(renderer.consume({"method": "item/agentMessage/delta", "params": None}), [])
         self.assertEqual(renderer.consume({"method": "item/completed", "params": None}), [
@@ -528,7 +566,7 @@ class SupervisedTasks(unittest.TestCase):
     def test_renderer_ignores_late_deltas_after_an_agent_message_item_completes(self):
         self.task()
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
-        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer = self.renderer()
 
         for event in (
             {"method": "item/agentMessage/delta", "params": {"itemId": "final", "delta": "safe final"}},
@@ -545,7 +583,7 @@ class SupervisedTasks(unittest.TestCase):
     def test_renderer_ignores_replayed_completed_items_after_a_continuation(self):
         """A stale item replay cannot replace a later turn's approved final answer."""
         self.task()
-        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer = self.renderer()
         withheld = {"method": "item/completed", "params": {"item": {
             "id": "first-final", "type": "agentMessage", "phase": "final_answer",
             "text": "withheld first attempt"
@@ -575,7 +613,7 @@ class SupervisedTasks(unittest.TestCase):
     def test_renderer_deduplicates_a_replayed_completed_turn_before_gating(self):
         """A replay after a continuation must not queue that action a second time."""
         self.task()
-        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer = self.renderer()
         completion = {"method": "turn/completed", "params": {
             "turn": {"id": "turn-1", "status": "completed"}
         }}
@@ -591,7 +629,7 @@ class SupervisedTasks(unittest.TestCase):
 
     def test_renderer_never_evicts_completed_turns_before_task_completion(self):
         self.task()
-        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer = self.renderer()
         original = {"method": "turn/completed", "params": {
             "turn": {"id": "turn-original", "status": "completed"}
         }}
@@ -606,7 +644,7 @@ class SupervisedTasks(unittest.TestCase):
 
     def test_renderer_discards_malformed_completed_turn_ids_without_gating(self):
         self.task()
-        renderer = client.SupervisedRenderer(self.host, "task-1")
+        renderer = self.renderer()
 
         for params in (
             {"status": "completed"},
@@ -626,7 +664,7 @@ class SupervisedTasks(unittest.TestCase):
                 task_id = f"task-{status}"
                 self.host.create_task(task_id, self.project, actions=[{"id": "write-doc", "operation": "write"}])
                 self.host.complete_action(task_id, "write-doc", evidence={"receipt": "host-observed"})
-                renderer = client.SupervisedRenderer(self.host, task_id)
+                renderer = self.renderer(task_id)
                 renderer.consume({"method": "item/agentMessage/delta", "params": {
                     "itemId": "partial", "delta": "partial text"
                 }})
@@ -667,7 +705,7 @@ class SupervisedTasks(unittest.TestCase):
                 task_id = f"task-{name}"
                 self.host.create_task(task_id, self.project, actions=[{"id": "write-doc", "operation": "write"}])
                 self.host.complete_action(task_id, "write-doc", evidence={"receipt": "host-observed"})
-                renderer = client.SupervisedRenderer(self.host, task_id)
+                renderer = self.renderer(task_id)
                 renderer.consume({"method": "item/agentMessage/delta", "params": {
                     "itemId": "candidate", "delta": "do not release"
                 }})
