@@ -27,7 +27,7 @@ class SupervisedRenderer:
             return []
         if method != "turn/completed":
             return [{"kind": "progress", "event": event}]
-        if self._turn_did_not_complete(event):
+        if self._turn_status(event) != "completed":
             self._reset_messages()
             return [{"kind": "progress", "event": self._sanitized_turn_completion(event)}]
         decision = self.supervisor.gate_final(
@@ -95,22 +95,20 @@ class SupervisedRenderer:
         self._completed_message_ids.clear()
         self._completed_messages.clear()
 
-    @staticmethod
-    def _sanitized_turn_completion(event):
-        """Expose a terminal status without forwarding the agent's failed output."""
-        params = event.get("params")
-        status = params.get("status") if isinstance(params, dict) else None
-        if status is None and isinstance(params, dict) and isinstance(params.get("turn"), dict):
-            status = params["turn"].get("status")
-        return {"method": "turn/completed", "params": {"status": str(status).lower()}}
+    @classmethod
+    def _sanitized_turn_completion(cls, event):
+        """Expose only a recognized terminal status, never agent-provided output."""
+        return {"method": "turn/completed", "params": {"status": cls._turn_status(event)}}
 
     @staticmethod
-    def _turn_did_not_complete(event):
-        """Failed and interrupted turns do not have a candidate final to gate."""
+    def _turn_status(event):
+        """Return the protocol's explicit terminal status, or a safe unknown value."""
         params = event.get("params")
         if not isinstance(params, dict):
-            return False
+            return "unknown"
         status = params.get("status")
         if status is None and isinstance(params.get("turn"), dict):
             status = params["turn"].get("status")
-        return str(status).lower() in {"failed", "interrupted"}
+        if isinstance(status, str) and status in {"completed", "failed", "interrupted", "cancelled"}:
+            return status
+        return "unknown"

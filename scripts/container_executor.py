@@ -360,41 +360,50 @@ class ContainerExecutor:
         output, truncated, timed_out, cancelled, status = b"", False, False, False, "launch_failed"
         create_attempted = False
         try:
-            create_attempted = True
-            created = subprocess.run(cls.plan(request, snapshot.root, name), capture_output=True, timeout=10, check=False)
-            if created.returncode:
-                raise ConfigurationError("Docker rejected the required isolation configuration")
-            process = subprocess.Popen([cls.RUNTIME, "start", "--attach", name], stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
-            deadline = time.monotonic() + request.timeout_s
-            selector = selectors.DefaultSelector()
-            selector.register(process.stdout, selectors.EVENT_READ)
-            while process.poll() is None:
+            # A cancellation before either Docker lifecycle transition must not
+            # start a new container.  Staging remains necessary to bind the
+            # cancelled receipt to the exact declared input snapshot.
+            if cancellation is not None and cancellation.is_set():
+                cancelled, status = True, "cancelled"
+            else:
+                create_attempted = True
+                created = subprocess.run(cls.plan(request, snapshot.root, name), capture_output=True, timeout=10, check=False)
+                if created.returncode:
+                    raise ConfigurationError("Docker rejected the required isolation configuration")
                 if cancellation is not None and cancellation.is_set():
-                    cancelled = True
-                    break
-                if time.monotonic() >= deadline:
-                    timed_out = True
-                    break
-                events = selector.select(timeout=min(0.05, max(0, deadline - time.monotonic())))
-                chunk = process.stdout.read1(4096) if events and process.stdout else b""
-                if chunk:
-                    available = request.max_output_bytes - len(output)
-                    output += chunk[:max(0, available)]
-                    truncated |= len(chunk) > available
-                    if truncated:
-                        break
+                    cancelled, status = True, "cancelled"
                 else:
-                    continue
-            selector.close()
-            if timed_out or cancelled or truncated:
-                subprocess.run([cls.RUNTIME, "kill", name], capture_output=True, timeout=10, check=False)
-            rest, _ = process.communicate(timeout=10)
-            if rest:
-                available = request.max_output_bytes - len(output)
-                output += rest[:max(0, available)]
-                truncated |= len(rest) > available
-            status = process.returncode if not (timed_out or cancelled) else ("timeout" if timed_out else "cancelled")
+                    process = subprocess.Popen([cls.RUNTIME, "start", "--attach", name], stdout=subprocess.PIPE,
+                                               stderr=subprocess.STDOUT, start_new_session=True)
+                    deadline = time.monotonic() + request.timeout_s
+                    selector = selectors.DefaultSelector()
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    while process.poll() is None:
+                        if cancellation is not None and cancellation.is_set():
+                            cancelled = True
+                            break
+                        if time.monotonic() >= deadline:
+                            timed_out = True
+                            break
+                        events = selector.select(timeout=min(0.05, max(0, deadline - time.monotonic())))
+                        chunk = process.stdout.read1(4096) if events and process.stdout else b""
+                        if chunk:
+                            available = request.max_output_bytes - len(output)
+                            output += chunk[:max(0, available)]
+                            truncated |= len(chunk) > available
+                            if truncated:
+                                break
+                        else:
+                            continue
+                    selector.close()
+                    if timed_out or cancelled or truncated:
+                        subprocess.run([cls.RUNTIME, "kill", name], capture_output=True, timeout=10, check=False)
+                    rest, _ = process.communicate(timeout=10)
+                    if rest:
+                        available = request.max_output_bytes - len(output)
+                        output += rest[:max(0, available)]
+                        truncated |= len(rest) > available
+                    status = process.returncode if not (timed_out or cancelled) else ("timeout" if timed_out else "cancelled")
         finally:
             cleanup_ok = True
             if create_attempted:

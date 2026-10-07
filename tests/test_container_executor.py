@@ -95,6 +95,61 @@ class StagingTests(unittest.TestCase):
 
 
 class RuntimeValidationTests(unittest.TestCase):
+    def test_pre_cancelled_execution_does_not_create_or_start_a_container(self):
+        """Removing the pre-create cancellation check would launch Docker."""
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as staging:
+            project = Path(directory) / "project"
+            project.mkdir()
+            (project / "input.txt").write_text("input")
+            request = executor.ExecutionRequest(
+                action_id="cancelled", attempt_id="before-create", project=project,
+                image="example/tool@sha256:" + "a" * 64, command=["tool"], inputs=["input.txt"],
+            )
+            cancellation = executor.threading.Event()
+            cancellation.set()
+            with mock.patch.object(executor.ContainerExecutor, "_check_runtime", return_value=("27", "sha256:image")), \
+                 mock.patch.object(executor.subprocess, "Popen", side_effect=AssertionError("container must not start")), \
+                 mock.patch.object(executor.subprocess, "run", side_effect=AssertionError("container must not be created")):
+                receipt = executor.ContainerExecutor.run(
+                    request, executor.ProjectIdentity.capture(project), Path(staging), cancellation=cancellation
+                )
+            self.assertTrue(receipt.cancelled)
+            self.assertEqual(receipt.exit_status, "cancelled")
+            self.assertFalse(receipt.timed_out)
+            self.assertTrue(receipt.verify())
+            self.assertEqual(list(Path(staging).iterdir()), [])
+
+    def test_cancellation_after_create_removes_container_without_starting_it(self):
+        """Removing the pre-start cancellation check would execute the created container."""
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as staging:
+            project = Path(directory) / "project"
+            project.mkdir()
+            (project / "input.txt").write_text("input")
+            request = executor.ExecutionRequest(
+                action_id="cancelled", attempt_id="before-start", project=project,
+                image="example/tool@sha256:" + "a" * 64, command=["tool"], inputs=["input.txt"],
+            )
+            cancellation = executor.threading.Event()
+
+            def docker_run(argv, **_kwargs):
+                if argv[1] == "create":
+                    cancellation.set()
+                    return mock.Mock(returncode=0)
+                if argv[1:3] == ["rm", "-f"]:
+                    return mock.Mock(returncode=0)
+                raise AssertionError(f"unexpected Docker command: {argv}")
+
+            with mock.patch.object(executor.ContainerExecutor, "_check_runtime", return_value=("27", "sha256:image")), \
+                 mock.patch.object(executor.subprocess, "run", side_effect=docker_run), \
+                 mock.patch.object(executor.subprocess, "Popen", side_effect=AssertionError("container must not start")):
+                receipt = executor.ContainerExecutor.run(
+                    request, executor.ProjectIdentity.capture(project), Path(staging), cancellation=cancellation
+                )
+            self.assertTrue(receipt.cancelled)
+            self.assertEqual(receipt.exit_status, "cancelled")
+            self.assertTrue(receipt.verify())
+            self.assertEqual(list(Path(staging).iterdir()), [])
+
     def test_requires_digest_pinned_image_and_rejects_host_fallback(self):
         with self.assertRaises(executor.ConfigurationError):
             executor.ExecutionRequest(action_id="a", attempt_id="one", project=Path("/tmp/project"),

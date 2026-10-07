@@ -324,7 +324,7 @@ class SupervisedTasks(unittest.TestCase):
         self.task()
         renderer = client.SupervisedRenderer(self.host, "task-1")
         self.assertEqual(renderer.consume({"method": "item/agentMessage/delta", "params": {"delta": "secret final"}}), [])
-        output = renderer.consume({"method": "turn/completed", "params": {}})
+        output = renderer.consume({"method": "turn/completed", "params": {"status": "completed"}})
         self.assertEqual(output[0]["kind"], "continuation")
         events = [event["type"] for event in self.host.audit("task-1")]
         self.assertIn("final_attempt", events)
@@ -340,7 +340,7 @@ class SupervisedTasks(unittest.TestCase):
         ):
             with self.subTest(method=event["method"]):
                 self.assertEqual(renderer.consume(event), [])
-        output = renderer.consume({"method": "turn/completed", "params": {}})
+        output = renderer.consume({"method": "turn/completed", "params": {"status": "completed"}})
         self.assertEqual(output[0]["kind"], "continuation")
         self.assertNotIn("secret final", str(output))
 
@@ -420,7 +420,7 @@ class SupervisedTasks(unittest.TestCase):
             "method": "item/completed", "params": {"item": {"id": "final", "type": "agentMessage"}}
         }), [])
 
-        output = renderer.consume({"method": "turn/completed", "params": {}})
+        output = renderer.consume({"method": "turn/completed", "params": {"status": "completed"}})
 
         self.assertEqual(output[0]["content"], "safe final")
         self.assertNotIn("unmatched secret", str(output))
@@ -438,7 +438,7 @@ class SupervisedTasks(unittest.TestCase):
         ):
             self.assertEqual(renderer.consume(event), [])
 
-        output = renderer.consume({"method": "turn/completed", "params": {}})
+        output = renderer.consume({"method": "turn/completed", "params": {"status": "completed"}})
 
         self.assertEqual(output[0]["content"], "safe final")
 
@@ -475,6 +475,35 @@ class SupervisedTasks(unittest.TestCase):
                 }})
                 output = renderer.consume({"method": "turn/completed", "params": {"status": "completed"}})
                 self.assertEqual(output[0]["content"], "complete text")
+
+    def test_non_successful_turn_statuses_discard_candidate_text_without_gating(self):
+        """Treat missing, cancelled, and unknown statuses as non-successful turns."""
+        cases = (
+            ("missing", {}, "unknown"),
+            ("cancelled", {"status": "cancelled"}, "cancelled"),
+            ("unknown", {"turn": {"status": "waiting-for-user"}}, "unknown"),
+            ("malformed", {"status": ["completed"]}, "unknown"),
+        )
+        for name, params, expected_status in cases:
+            with self.subTest(status=name):
+                task_id = f"task-{name}"
+                self.host.create_task(task_id, self.project, actions=[{"id": "write-doc", "operation": "write"}])
+                self.host.complete_action(task_id, "write-doc", evidence={"receipt": "host-observed"})
+                renderer = client.SupervisedRenderer(self.host, task_id)
+                renderer.consume({"method": "item/agentMessage/delta", "params": {
+                    "itemId": "candidate", "delta": "do not release"
+                }})
+                renderer.consume({"method": "item/completed", "params": {
+                    "item": {"id": "candidate", "type": "agentMessage"}
+                }})
+
+                output = renderer.consume({"method": "turn/completed", "params": params})
+
+                self.assertEqual(output, [{"kind": "progress", "event": {
+                    "method": "turn/completed", "params": {"status": expected_status}
+                }}])
+                self.assertNotIn("do not release", str(output))
+                self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit(task_id)])
 
 
 class SupervisedInstallation(unittest.TestCase):
