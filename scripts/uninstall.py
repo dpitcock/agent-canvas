@@ -121,10 +121,14 @@ def adapter_links(state, *, require_installer_target=True):
                 and str(Path(relative)) == relative
                 and str(Path(relative).parent) in ADAPTER_DIRS):
             continue
+        directory = str(Path(relative).parent)
         name = Path(relative).name
-        target = Path("../../skills/addyosmani-agent-skills/skills") / name
-        if name not in {"", ".", ".."} and (
-                not require_installer_target or expected == str(target)):
+        skill_name = name.removeprefix("addy-") if directory == ".agents/skills" else name
+        target = Path("../../skills/addyosmani-agent-skills/skills") / skill_name
+        if (name not in {"", ".", ".."}
+                and (directory != ".agents/skills" or name.startswith("addy-"))
+                and skill_name
+                and (not require_installer_target or expected == str(target))):
             owned[relative] = expected
     return owned
 
@@ -156,8 +160,14 @@ def followup_without_agent_canvas_block(text):
         return text, False
     if text.count(BEGIN) != 1 or text.count(END) != 1 or text.index(BEGIN) >= text.index(END):
         return text, None
-    updated = (text[:text.index(BEGIN)] + text[text.index(END) + len(END):]).strip()
-    return (updated + "\n") if updated else "", True
+    before = text[:text.index(BEGIN)]
+    after = text[text.index(END) + len(END):]
+    if before.endswith(("\r\n\r\n", "\n\n")):
+        if after.startswith("\r\n\r\n"):
+            after = after[4:]
+        elif after.startswith("\n\n"):
+            after = after[2:]
+    return before + after, True
 
 
 def planned_removal(root, path, actions, apply):
@@ -265,6 +275,27 @@ def uninstall(target, *, mode="preserve", apply=False):
                 pack_referenced_by_modified_adapter = True
             except (OSError, ValueError):
                 pass
+
+    # A legacy or malformed adapter record cannot authorize unlinking a link,
+    # but a changed link under a supported adapter directory can still retain a
+    # reference to this managed pack. Keep the pack in that ambiguous case.
+    if mode != "remove-all":
+        links = state.get("adapters", {}).get("links", {}) if isinstance(state, dict) else {}
+        if isinstance(links, dict):
+            for relative, expected in links.items():
+                if not (isinstance(relative, str) and isinstance(expected, str)
+                        and str(Path(relative)) == relative
+                        and str(Path(relative).parent) in ADAPTER_DIRS):
+                    continue
+                path = root / relative
+                safe_path(root, path)
+                if not path.is_symlink() or os.readlink(path) == expected:
+                    continue
+                try:
+                    path.resolve(strict=False).relative_to(pack.resolve())
+                    pack_referenced_by_modified_adapter = True
+                except (OSError, ValueError):
+                    pass
 
     adapters_state = state.get("adapters") if isinstance(state, dict) else None
     pack_record = adapters_state.get("pack") if isinstance(adapters_state, dict) else None

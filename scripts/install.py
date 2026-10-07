@@ -386,6 +386,7 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
         if state["pending"][name]["incoming"] != files[name]:
             raise ValueError(f"Package changed since this conflict was recorded: {name}; preview/apply the new proposal first")
     writes = {}
+    created_managed = set()
     for name, incoming in files.items():
         path = root / name
         local = path.read_text() if path.exists() else None
@@ -419,6 +420,8 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
             state["pending"].pop(name, None)
             if result != local:
                 writes[name] = result
+                if local is None:
+                    created_managed.add(name)
                 diff = "".join(difflib.unified_diff((local or "").splitlines(True), (result or "").splitlines(True),
                                                      fromfile=name, tofile=name + " (proposed)"))
                 actions.append(f"{'UPDATE' if apply else 'WOULD UPDATE'} {name}\n{diff}")
@@ -439,7 +442,12 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
-        apply_adapters(operations, state.setdefault("provenance", {}))
+        provenance = state.setdefault("provenance", {})
+        managed_files = provenance.setdefault("managed_files", [])
+        for name in sorted(created_managed):
+            if name not in managed_files:
+                managed_files.append(name)
+        apply_adapters(operations, provenance)
         save_state(root, state)
         upgrade_followup(root, actions, state["pending"], source=source, state=state)
     return apply, actions

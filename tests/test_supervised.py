@@ -64,6 +64,16 @@ class SupervisedTasks(unittest.TestCase):
         (self.project / "tasks.md").write_text("write-doc: complete\n")
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "done").kind, "continue")
 
+    def test_rejects_project_nested_state_directory_without_creating_it(self):
+        """Creating state before the project-boundary check would leave this directory behind."""
+        nested_state = self.project / "host-state"
+        host = supervisor.HostSupervisor(nested_state)
+
+        with self.assertRaisesRegex(ValueError, "outside"):
+            host.provision(self.project)
+
+        self.assertFalse(nested_state.exists())
+
     def test_unsafe_task_ids_are_rejected_before_task_path_lookup_or_creation(self):
         for task_id in ("../other", "task/child", ".", ""):
             with self.subTest(task_id=task_id):

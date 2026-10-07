@@ -15,6 +15,25 @@ def snapshot(root):
 
 
 class UpgradeSmoke(unittest.TestCase):
+    def test_upgrade_records_provenance_for_new_managed_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = self.source(base)
+            target = base / "project"
+            installer.install(target, source=source, home=base / "home", apply=True)
+
+            introduced = ".owner-override.example"
+            (target / introduced).unlink()
+            state = installer.read_state(target)
+            state["baselines"].pop(introduced)
+            state["provenance"]["managed_files"].remove(introduced)
+            installer.save_state(target, state)
+
+            installer.upgrade(target, source=source, apply=True)
+
+            self.assertTrue((target / introduced).is_file())
+            self.assertIn(introduced, installer.read_state(target)["provenance"]["managed_files"])
+
     def test_reverted_preview_refreshes_handoff_without_changing_project(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

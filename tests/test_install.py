@@ -443,6 +443,30 @@ class InstallSmoke(unittest.TestCase):
             self.assertTrue((target / "AGENTS.md").exists())
             self.assertEqual((target / ".gitignore").read_text(), preexisting_ignore + "\n")
 
+    def test_preserve_uninstall_accepts_installer_shaped_codex_adapter_target(self):
+        state = {
+            "adapters": {
+                "links": {
+                    ".agents/skills/addy-example": "../../skills/addyosmani-agent-skills/skills/example",
+                    ".cline/skills/example": "../../skills/addyosmani-agent-skills/skills/example",
+                },
+            },
+        }
+
+        self.assertEqual(uninstaller.adapter_links(state), state["adapters"]["links"])
+
+    def test_followup_block_removal_preserves_surrounding_whitespace(self):
+        original = (
+            "    Project-owned indented note\n\n"
+            f"{uninstaller.BEGIN}\nAgent Canvas content\n{uninstaller.END}\n\n"
+            "Trailing project note\n\n"
+        )
+
+        updated, found = uninstaller.followup_without_agent_canvas_block(original)
+
+        self.assertTrue(found)
+        self.assertEqual(updated, "    Project-owned indented note\n\nTrailing project note\n\n")
+
     def test_agent_nuke_preserves_plans_but_removes_agent_workflow_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"

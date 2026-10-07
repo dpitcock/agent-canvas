@@ -43,6 +43,8 @@ class HostSupervisor:
 
     def __init__(self, state_dir):
         self.root = Path(state_dir).expanduser().resolve()
+
+    def _ensure_root(self):
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             self.root.chmod(0o700)
@@ -157,6 +159,7 @@ class HostSupervisor:
             pass
         else:
             raise ValueError("Supervisor state directory must be outside the project workspace")
+        self._ensure_root()
         identity = self._project_identity(project)
         registration = self._registration(project)
         if registration.exists():
