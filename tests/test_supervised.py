@@ -4,6 +4,7 @@ import multiprocessing
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -80,6 +81,20 @@ class SupervisedTasks(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "identity"):
             self.host.provision(original)
+
+    def test_provision_rejects_state_roots_that_overlap_the_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            for state_dir, project in (
+                (base / "project" / "host-state", base / "project"),
+                (base / "host-state", base / "host-state" / "project"),
+            ):
+                with self.subTest(state_dir=state_dir, project=project):
+                    project.mkdir(parents=True, exist_ok=True)
+                    host = supervisor.HostSupervisor(state_dir)
+
+                    with self.assertRaisesRegex(ValueError, "outside"):
+                        host.provision(project)
 
     def test_project_scoped_task_operations_reject_a_replacement_directory(self):
         """Skipping registration verification lets a replacement use the prior task state."""
@@ -187,6 +202,51 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(self.host.task("task-1")["status"], "cancelled")
         with self.assertRaisesRegex(ValueError, "Only a paused task can resume"):
             self.host.resume("task-1")
+
+    def test_pause_and_cancel_preempt_a_running_validator_without_releasing_the_final(self):
+        for transition, expected_status in ((self.host.pause, "paused"), (self.host.cancel, "cancelled")):
+            with self.subTest(transition=expected_status):
+                task_id = f"{expected_status}-validator"
+                validator_started = threading.Event()
+                allow_validator_to_finish = threading.Event()
+                transitioned = threading.Event()
+                result = []
+
+                def blocking_validator(_validator):
+                    validator_started.set()
+                    self.assertTrue(allow_validator_to_finish.wait(timeout=5))
+                    return {"exit_status": 0}
+
+                self.host.create_task(task_id, self.project, [{"id": "write-doc", "operation": "write"}],
+                                      validators=[{"id": "check", "command": ["unused"]}])
+                self.host.complete_action(task_id, "write-doc", evidence={"receipt": "host-observed"})
+                with patch.object(self.host, "_validator_receipt", side_effect=blocking_validator):
+                    worker = threading.Thread(target=lambda: result.append(
+                        self.host.gate_final(task_id, "attempt-1", "finished")
+                    ))
+                    worker.start()
+                    self.assertTrue(validator_started.wait(timeout=5))
+
+                    def apply_transition():
+                        transition(task_id)
+                        transitioned.set()
+
+                    transition_worker = threading.Thread(target=apply_transition)
+                    transition_worker.start()
+                    try:
+                        preempted = transitioned.wait(timeout=1)
+                    finally:
+                        allow_validator_to_finish.set()
+                    worker.join(timeout=5)
+                    transition_worker.join(timeout=5)
+
+                self.assertTrue(preempted)
+                self.assertFalse(worker.is_alive())
+                self.assertFalse(transition_worker.is_alive())
+                self.assertEqual(self.host.task(task_id)["status"], expected_status)
+                self.assertEqual(result[0].kind, expected_status)
+                self.assertFalse(result[0].release)
+                self.assertEqual(self.host.visible_messages(task_id), [])
 
     def test_crash_after_dispatch_requires_reconciliation_not_duplicate_dispatch(self):
         self.task(actions=[{"id": "send", "operation": "write", "side_effect": True}])
@@ -301,6 +361,46 @@ class SupervisedTasks(unittest.TestCase):
 
         self.assertEqual(output, [{"kind": "final", "content": "release me", "decision": "complete"}])
 
+    def test_renderer_prefers_completed_final_answer_over_later_commentary(self):
+        self.task()
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        renderer = client.SupervisedRenderer(self.host, "task-1")
+
+        for event in (
+            {"method": "item/completed", "params": {"item": {
+                "id": "answer", "type": "agentMessage", "phase": "final_answer", "text": "final answer"
+            }}},
+            {"method": "item/completed", "params": {"item": {
+                "id": "commentary", "type": "agentMessage", "phase": "commentary", "text": "never release"
+            }}},
+        ):
+            self.assertEqual(renderer.consume(event), [])
+
+        output = renderer.consume({"method": "turn/completed", "params": {"status": "completed"}})
+
+        self.assertEqual(output[0]["content"], "final answer")
+        self.assertNotIn("never release", str(output))
+
+    def test_renderer_uses_phase_unknown_completed_text_but_never_commentary(self):
+        self.task()
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        renderer = client.SupervisedRenderer(self.host, "task-1")
+
+        for event in (
+            {"method": "item/completed", "params": {"item": {
+                "id": "commentary", "type": "agentMessage", "phase": "commentary", "text": "never release"
+            }}},
+            {"method": "item/completed", "params": {"item": {
+                "id": "unknown", "type": "agentMessage", "text": "phase unknown"
+            }}},
+        ):
+            self.assertEqual(renderer.consume(event), [])
+
+        output = renderer.consume({"method": "turn/completed", "params": {"status": "completed"}})
+
+        self.assertEqual(output[0]["content"], "phase unknown")
+        self.assertNotIn("never release", str(output))
+
     def test_renderer_ignores_malformed_agent_message_notifications_without_leaking_text(self):
         self.task()
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
@@ -353,9 +453,17 @@ class SupervisedTasks(unittest.TestCase):
                     "itemId": "partial", "delta": "partial text"
                 }})
 
-                output = renderer.consume({"method": "turn/completed", "params": {"status": status}})
+                output = renderer.consume({"method": "turn/completed", "params": {
+                    "turn": {"status": status, "items": [{
+                        "type": "agentMessage", "text": "complete agent text"
+                    }]},
+                    "error": {"message": "complete agent text"},
+                }})
 
-                self.assertEqual(output[0]["kind"], "progress")
+                self.assertEqual(output, [{"kind": "progress", "event": {
+                    "method": "turn/completed", "params": {"status": status}
+                }}])
+                self.assertNotIn("complete agent text", str(output))
                 self.assertNotIn("final_attempt", [
                     event["type"] for event in self.host.audit(task_id) if event["task_id"] == task_id
                 ])

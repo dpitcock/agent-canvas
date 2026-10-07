@@ -145,6 +145,18 @@ class HostSupervisor:
         project = Path(project).resolve()
         if not project.is_dir():
             raise ValueError("Supervised project must be an existing directory")
+        try:
+            self.root.relative_to(project)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Supervisor state directory must be outside the project workspace")
+        try:
+            project.relative_to(self.root)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Supervisor state directory must be outside the project workspace")
         identity = self._project_identity(project)
         registration = self._registration(project)
         if registration.exists():
@@ -282,17 +294,16 @@ class HostSupervisor:
                 "timeout_s": timeout, "version": validator.get("version", "host-configured")}
 
     def _validate(self, task):
+        receipts = {}
         for validator in task["validators"]:
             validator_id = validator.get("id")
             if not validator_id:
                 raise ValueError("Host validators require an id")
             receipt = self._validator_receipt(validator)
-            task["evidence"]["validators"][validator_id] = receipt
-            self._event(task["task_id"], "validator_received", project=task["project"], validator_id=validator_id, receipt=receipt)
+            receipts[validator_id] = receipt
             if receipt["exit_status"] != 0:
-                self._save_task(task)
-                return False
-        return True
+                return False, receipts
+        return True, receipts
 
     def gate_final(self, task_id, attempt_id, content, *, project=None):
         with self._locked_task(task_id, project=project) as task:
@@ -301,6 +312,8 @@ class HostSupervisor:
                 return Decision(task["status"])
             if task["status"] in {"paused", "cancelled"}:
                 return Decision(task["status"], message="Automatic continuation is disabled until an explicit resume.")
+            if task["status"] == "validating":
+                return Decision("validating", message="Host validation is already in progress.")
             remaining = self._remaining(task)
             if remaining:
                 action_id, action = remaining[0]
@@ -314,13 +327,44 @@ class HostSupervisor:
                 self._save_task(task)
                 self._event(task_id, "blocker_delivered", project=task["project"], blocker_id=blocker.get("id"))
                 return Decision("blocker", release=True, message=message)
-            if not self._validate(task):
-                self._event(task_id, "continuation_queued", project=task["project"], reason="validator_failed")
-                return Decision("continue", message="Host validator failed; repair the reported action.")
-            task["visible_messages"].append(content)
-            task["status"] = "complete"
+            if not task["validators"]:
+                task["visible_messages"].append(content)
+                task["status"] = "complete"
+                self._save_task(task)
+                self._event(task_id, "final_released", project=task["project"], attempt_id=attempt_id)
+                return Decision("complete", release=True, message=content)
+            task["status"] = "validating"
+            task["validation_attempt"] = attempt_id
             self._save_task(task)
-            self._event(task_id, "final_released", project=task["project"], attempt_id=attempt_id)
+            self._event(task_id, "validation_started", project=task["project"], attempt_id=attempt_id)
+
+        try:
+            valid, receipts = self._validate(task)
+        except Exception:
+            with self._locked_task(task_id, project=project) as current:
+                if current["status"] == "validating" and current.get("validation_attempt") == attempt_id:
+                    current["status"] = "active"
+                    current.pop("validation_attempt", None)
+                    self._save_task(current)
+                    self._event(task_id, "validation_aborted", project=current["project"], attempt_id=attempt_id)
+            raise
+
+        with self._locked_task(task_id, project=project) as current:
+            if current["status"] != "validating" or current.get("validation_attempt") != attempt_id:
+                return Decision(current["status"], message="Automatic continuation is disabled until an explicit resume.")
+            current["evidence"]["validators"].update(receipts)
+            for validator_id, receipt in receipts.items():
+                self._event(task_id, "validator_received", project=current["project"], validator_id=validator_id, receipt=receipt)
+            current.pop("validation_attempt", None)
+            if not valid:
+                current["status"] = "active"
+                self._save_task(current)
+                self._event(task_id, "continuation_queued", project=current["project"], reason="validator_failed")
+                return Decision("continue", message="Host validator failed; repair the reported action.")
+            current["visible_messages"].append(content)
+            current["status"] = "complete"
+            self._save_task(current)
+            self._event(task_id, "final_released", project=current["project"], attempt_id=attempt_id)
             return Decision("complete", release=True, message=content)
 
     def visible_messages(self, task_id, *, project=None):

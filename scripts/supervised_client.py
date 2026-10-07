@@ -14,7 +14,7 @@ class SupervisedRenderer:
         self.project = project
         self._message_buffers = {}
         self._completed_message_ids = set()
-        self._final_message = ""
+        self._completed_messages = []
 
     def consume(self, event):
         if not isinstance(event, dict):
@@ -29,8 +29,10 @@ class SupervisedRenderer:
             return [{"kind": "progress", "event": event}]
         if self._turn_did_not_complete(event):
             self._reset_messages()
-            return [{"kind": "progress", "event": event}]
-        decision = self.supervisor.gate_final(self.task_id, str(uuid.uuid4()), self._final_message, project=self.project)
+            return [{"kind": "progress", "event": self._sanitized_turn_completion(event)}]
+        decision = self.supervisor.gate_final(
+            self.task_id, str(uuid.uuid4()), self._select_final_message(), project=self.project
+        )
         self._reset_messages()
         if decision.release:
             return [{"kind": "final", "content": decision.message, "decision": decision.kind}]
@@ -71,14 +73,36 @@ class SupervisedRenderer:
             return True
         self._completed_message_ids.add(item_id)
         buffer = self._message_buffers.pop(item_id, None)
-        if buffer is not None:
-            self._final_message = "".join(buffer)
+        text = item.get("text")
+        if not isinstance(text, str):
+            text = "".join(buffer) if buffer is not None else ""
+        phase = item.get("phase")
+        self._completed_messages.append((phase if isinstance(phase, str) else None, text))
         return True
+
+    def _select_final_message(self):
+        """Prefer an explicit final answer; commentary is never a fallback."""
+        for phase, text in reversed(self._completed_messages):
+            if phase == "final_answer":
+                return text
+        for phase, text in reversed(self._completed_messages):
+            if phase is None:
+                return text
+        return ""
 
     def _reset_messages(self):
         self._message_buffers.clear()
         self._completed_message_ids.clear()
-        self._final_message = ""
+        self._completed_messages.clear()
+
+    @staticmethod
+    def _sanitized_turn_completion(event):
+        """Expose a terminal status without forwarding the agent's failed output."""
+        params = event.get("params")
+        status = params.get("status") if isinstance(params, dict) else None
+        if status is None and isinstance(params, dict) and isinstance(params.get("turn"), dict):
+            status = params["turn"].get("status")
+        return {"method": "turn/completed", "params": {"status": str(status).lower()}}
 
     @staticmethod
     def _turn_did_not_complete(event):

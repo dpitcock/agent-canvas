@@ -191,6 +191,41 @@ class InstallSmoke(unittest.TestCase):
             self.assertTrue(link.is_symlink())
             self.assertIn("PRESERVE skills/addyosmani-agent-skills: not proven to be an unchanged Agent Canvas pack", actions)
 
+    def test_preserve_uninstall_keeps_matching_legacy_baseline_without_created_file_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            target.mkdir()
+            content = (installer.SOURCE / "AGENTS.md").read_text()
+            (target / "AGENTS.md").write_text(content)
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "baselines": {"AGENTS.md": content},
+            }))
+
+            uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertEqual((target / "AGENTS.md").read_text(), content)
+
+    def test_preserve_uninstall_removes_unchanged_pack_with_approved_opencode_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            def local_pack(destination, revision):
+                skill = destination / "skills/example"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("example")
+                (destination / ".opencode").mkdir()
+                (destination / ".opencode/skills").symlink_to("../skills")
+
+            target = base / "project"
+            installer.install(target, skills=True, home=base / "home", downloader=local_pack)
+
+            uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertFalse((target / "skills/addyosmani-agent-skills").exists())
+
     def test_remove_all_ignores_adapter_path_that_escapes_project(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

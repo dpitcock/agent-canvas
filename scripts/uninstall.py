@@ -127,11 +127,19 @@ def adapter_links(state):
 
 
 def pack_fingerprint(pack):
+    if pack.is_symlink():
+        return None
     entries = {}
     for base, dirs, files in os.walk(pack, followlinks=False):
-        if any((Path(base) / name).is_symlink() for name in dirs):
-            return None
-        dirs[:] = sorted(name for name in dirs if name != ".git")
+        for name in dirs + files:
+            path = Path(base) / name
+            if path.is_symlink() and (
+                    path.relative_to(pack).as_posix() != ".opencode/skills"
+                    or os.readlink(path) not in {"../skills", "../skills/"}
+                    or (pack / "skills").is_symlink()
+                    or not (pack / "skills").is_dir()):
+                return None
+        dirs[:] = sorted(name for name in dirs if name != ".git" and not (Path(base) / name).is_symlink())
         for name in sorted(files):
             path = Path(base) / name
             if path.is_symlink() or not path.is_file():
@@ -220,7 +228,7 @@ def uninstall(target, *, mode="preserve", apply=False):
     actions = []
     baselines = state.get("baselines", {}) if state else {}
     provenance = state.get("provenance") if state else None
-    managed_files = set(provenance.get("managed_files", [])) if provenance is not None else None
+    managed_files = set(provenance.get("managed_files", [])) if isinstance(provenance, dict) else set()
 
     for name in MANAGED:
         path = root / name
@@ -235,7 +243,7 @@ def uninstall(target, *, mode="preserve", apply=False):
             continue
         owned_unchanged = (name in baselines and baselines[name] is not None
                            and path.read_text() == baselines[name]
-                           and (managed_files is None or name in managed_files))
+                           and name in managed_files)
         if mode == "remove-all" or owned_unchanged:
             planned_removal(root, path, actions, apply)
         else:
