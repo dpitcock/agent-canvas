@@ -140,6 +140,38 @@ class StagingTests(unittest.TestCase):
 
 
 class RuntimeValidationTests(unittest.TestCase):
+    def test_parent_replacement_after_create_never_starts_the_container(self):
+        """A staging-path swap during Docker create must fail before Docker start."""
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as staging_directory:
+            project = Path(directory) / "project"
+            project.mkdir()
+            (project / "input.txt").write_text("authorized")
+            staging = Path(staging_directory) / "staging"
+            replacement = Path(staging_directory) / "replacement"
+            staging.mkdir(mode=0o700)
+            replacement.mkdir(mode=0o700)
+            request = executor.ExecutionRequest(
+                action_id="swapped", attempt_id="create", project=project,
+                image="example/tool@sha256:" + "a" * 64, command=["tool"], inputs=["input.txt"],
+            )
+
+            def create_then_replace(command, *args, **kwargs):
+                if command[:2] == ["docker", "create"]:
+                    staging.rename(Path(staging_directory) / "old-staging")
+                    replacement.rename(staging)
+                if command[1] == "create":
+                    return mock.Mock(returncode=0)
+                if command[1:3] == ["rm", "-f"]:
+                    return mock.Mock(returncode=0)
+                raise AssertionError(f"unexpected Docker command: {command}")
+
+            with mock.patch.object(executor.ContainerExecutor, "_check_runtime", return_value=("test", "sha256:image")), \
+                    mock.patch.object(executor.subprocess, "run", side_effect=create_then_replace), \
+                    mock.patch.object(executor.subprocess, "Popen") as start:
+                with self.assertRaisesRegex(executor.ConfigurationError, "staging parent changed"):
+                    executor.ContainerExecutor.run(request, executor.ProjectIdentity.capture(project), staging)
+            start.assert_not_called()
+
     def test_pre_cancelled_execution_does_not_create_or_start_a_container(self):
         """Removing the pre-create cancellation check would launch Docker."""
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as staging:

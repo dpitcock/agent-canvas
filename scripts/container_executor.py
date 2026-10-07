@@ -449,6 +449,10 @@ class ContainerExecutor:
                 )
                 if created.returncode:
                     raise ConfigurationError("Docker rejected the required isolation configuration")
+                # Docker create resolves the bind source.  Check again before
+                # start so a parent replacement can never execute a container
+                # mounted from a substitute pathname.
+                snapshot.visible_root()
                 if cancellation is not None and cancellation.is_set():
                     cancelled, status = True, "cancelled"
                 else:
