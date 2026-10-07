@@ -1,6 +1,7 @@
 """Host-supervised task tests; all state lives in temporary host directories."""
 import importlib.util
 import multiprocessing
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -105,6 +106,18 @@ class SupervisedTasks(unittest.TestCase):
 
                     with self.assertRaisesRegex(ValueError, "outside"):
                         host.provision(project)
+
+    def test_rejects_projects_symlink_before_writing_supervised_workspace(self):
+        """A preexisting state/projects link must not redirect durable state into a project."""
+        state_dir = self.base / "linked-host-state"
+        state_dir.mkdir()
+        os.symlink(self.project, state_dir / "projects")
+        host = supervisor.HostSupervisor(state_dir)
+
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            host.create_task("task-1", self.project, [{"id": "write-doc", "operation": "write"}])
+
+        self.assertEqual(list(self.project.iterdir()), [])
 
     def test_project_scoped_task_operations_reject_a_replacement_directory(self):
         """Skipping registration verification lets a replacement use the prior task state."""
@@ -372,6 +385,64 @@ class SupervisedTasks(unittest.TestCase):
         output = renderer.consume({"method": "turn/completed", "params": {"turnId": "turn-1", "status": "completed"}})
         self.assertEqual(output[0]["kind"], "continuation")
         self.assertNotIn("secret final", str(output))
+
+    def test_renderer_suppresses_raw_response_items_before_the_host_gate(self):
+        """Raw response items can carry assistant text and are never display-safe."""
+        self.task()
+        renderer = client.SupervisedRenderer(self.host, "task-1")
+
+        for item in (
+            {"type": "message", "role": "assistant", "content": [{"text": "secret answer"}]},
+            {"type": "agent_message", "content": [{"text": "another secret answer"}]},
+        ):
+            with self.subTest(item_type=item["type"]):
+                output = renderer.consume({"method": "rawResponseItem/completed", "params": {
+                    "threadId": "thread-1", "turnId": "turn-1", "item": item,
+                }})
+                self.assertEqual(output, [])
+                self.assertNotIn("secret", str(output))
+
+        self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit("task-1")])
+
+    def test_renderer_rejects_messages_and_completions_outside_its_thread_and_turn(self):
+        """Sibling events cannot supply text or complete this supervised task."""
+        self.task()
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        unbound_renderer = client.SupervisedRenderer(self.host, "task-1")
+        self.assertEqual(unbound_renderer.consume({"method": "turn/completed", "params": {
+            "threadId": "thread-b", "turn": {"id": "turn-b", "status": "completed"},
+        }}), [])
+        self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit("task-1")])
+        renderer = client.SupervisedRenderer(
+            self.host, "task-1", thread_id="thread-a", turn_id="turn-a"
+        )
+
+        for event in (
+            {"method": "item/agentMessage/delta", "params": {
+                "threadId": "thread-b", "turnId": "turn-a", "itemId": "foreign", "delta": "foreign text",
+            }},
+            {"method": "item/completed", "params": {
+                "threadId": "thread-a", "turnId": "turn-b",
+                "item": {"id": "foreign", "type": "agentMessage", "text": "foreign text"},
+            }},
+            {"method": "turn/completed", "params": {
+                "threadId": "thread-b", "turn": {"id": "turn-b", "status": "completed"},
+            }},
+        ):
+            self.assertEqual(renderer.consume(event), [])
+
+        self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit("task-1")])
+        self.assertEqual(renderer.consume({"method": "item/agentMessage/delta", "params": {
+            "threadId": "thread-a", "turnId": "turn-a", "itemId": "final", "delta": "approved text",
+        }}), [])
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": {
+            "threadId": "thread-a", "turnId": "turn-a",
+            "item": {"id": "final", "type": "agentMessage"},
+        }}), [])
+        output = renderer.consume({"method": "turn/completed", "params": {
+            "threadId": "thread-a", "turn": {"id": "turn-a", "status": "completed"},
+        }})
+        self.assertEqual(output, [{"kind": "final", "content": "approved text", "decision": "complete"}])
 
     def test_renderer_releases_only_the_last_completed_agent_message_item(self):
         self.task()

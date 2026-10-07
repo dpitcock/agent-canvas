@@ -51,6 +51,25 @@ class HostSupervisor:
         except OSError:
             pass
 
+    def _projects_dir(self):
+        """Return the host-owned project state directory without following a link."""
+        self._ensure_root()
+        projects = self.root / "projects"
+        try:
+            projects.lstat()
+        except FileNotFoundError:
+            projects.mkdir(mode=0o700)
+        else:
+            if projects.is_symlink():
+                raise ValueError("Supervisor projects directory must not be a symlink")
+            if not projects.is_dir():
+                raise ValueError("Supervisor projects path must be a directory")
+            try:
+                projects.chmod(0o700)
+            except OSError:
+                pass
+        return projects
+
     def _project_key(self, project):
         return hashlib.sha256(str(Path(project).resolve()).encode()).hexdigest()
 
@@ -67,7 +86,7 @@ class HostSupervisor:
         return {"device": status.st_dev, "inode": status.st_ino}
 
     def _project_dir(self, project):
-        return self.root / "projects" / self._project_key(project)
+        return self._projects_dir() / self._project_key(project)
 
     def _registration(self, project):
         return self._project_dir(project) / "registration.json"
@@ -95,7 +114,8 @@ class HostSupervisor:
             if not path.is_file():
                 raise ValueError(f"Unknown task: {task_id}")
             return path
-        matches = list((self.root / "projects").glob(f"*/tasks/{task_id}.json")) if (self.root / "projects").exists() else []
+        projects = self._projects_dir()
+        matches = list(projects.glob(f"*/tasks/{task_id}.json"))
         if len(matches) != 1:
             raise ValueError(f"Unknown or ambiguous task: {task_id}")
         registration = self._read(matches[0].parents[1] / "registration.json")

@@ -9,10 +9,18 @@ import uuid
 
 
 class SupervisedRenderer:
-    def __init__(self, supervisor, task_id, *, project=None):
+    def __init__(self, supervisor, task_id, *, project=None, thread_id=None, turn_id=None):
         self.supervisor = supervisor
         self.task_id = task_id
         self.project = project
+        if (thread_id is None) != (turn_id is None):
+            raise ValueError("thread_id and turn_id must be bound together")
+        if thread_id is not None and (
+            not self._valid_identifier(thread_id) or not self._valid_identifier(turn_id)
+        ):
+            raise ValueError("thread_id and turn_id must be non-empty strings")
+        self.thread_id = thread_id
+        self.turn_id = turn_id
         self._message_buffers = {}
         self._completed_message_ids = set()
         self._completed_messages = []
@@ -23,6 +31,12 @@ class SupervisedRenderer:
         if not isinstance(event, dict):
             return [{"kind": "progress", "event": event}]
         method = event.get("method")
+        # Raw response items may carry assistant text.  This renderer has no
+        # safe representation for them before the supervisor has gated a turn.
+        if method == "rawResponseItem/completed":
+            return []
+        if self._is_private_event(method) and not self._matches_bound_turn(event):
+            return []
         if method == "item/agentMessage/delta":
             self._buffer_agent_message_delta(event)
             return []
@@ -50,6 +64,29 @@ class SupervisedRenderer:
         if decision.kind == "continue":
             return [{"kind": "continuation", "next_action": decision.next_action, "message": decision.message}]
         return [{"kind": decision.kind, "message": decision.message}]
+
+    @staticmethod
+    def _is_private_event(method):
+        return method == "turn/completed" or method == "item/completed" or (
+            isinstance(method, str) and method.startswith("item/agentMessage/")
+        )
+
+    def _matches_bound_turn(self, event):
+        """Accept private events only from the renderer's configured App Server turn."""
+        params = event.get("params")
+        if not isinstance(params, dict):
+            return self.thread_id is None
+        # Legacy fixtures without App Server routing IDs remain compatible, but
+        # an actual routed notification is unsafe until its destination is bound.
+        if self.thread_id is None:
+            return "threadId" not in params
+        if params.get("threadId") != self.thread_id:
+            return False
+        event_turn_id = params.get("turnId")
+        turn = params.get("turn")
+        nested_turn_id = turn.get("id") if isinstance(turn, dict) else None
+        identifiers = [identifier for identifier in (event_turn_id, nested_turn_id) if identifier is not None]
+        return bool(identifiers) and all(identifier == self.turn_id for identifier in identifiers)
 
     def _buffer_agent_message_delta(self, event):
         """Keep text private until the matching item enters its completed phase."""
@@ -110,6 +147,10 @@ class SupervisedRenderer:
         self._completed_turn_ids.add(turn_id)
 
     @staticmethod
+    def _valid_identifier(identifier):
+        return isinstance(identifier, str) and bool(identifier.strip()) and len(identifier) <= 512
+
+    @staticmethod
     def _turn_completion_id(event):
         """Return one well-formed completion ID, rejecting missing or conflicting fields."""
         params = event.get("params")
@@ -119,10 +160,7 @@ class SupervisedRenderer:
         nested_id = turn.get("id") if isinstance(turn, dict) else None
         direct_id = params.get("turnId")
         identifiers = [identifier for identifier in (nested_id, direct_id) if identifier is not None]
-        if not identifiers or any(
-            not isinstance(identifier, str) or not identifier.strip() or len(identifier) > 512
-            for identifier in identifiers
-        ):
+        if not identifiers or any(not SupervisedRenderer._valid_identifier(identifier) for identifier in identifiers):
             return None
         if any(identifier != identifiers[0] for identifier in identifiers[1:]):
             return None
