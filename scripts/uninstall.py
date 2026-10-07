@@ -245,6 +245,9 @@ def remove_ignore_entries(root, state, actions, apply):
     if path.is_symlink():
         actions.append("PRESERVE .gitignore: it is a symlink")
         return
+    if not path.is_file():
+        actions.append("PRESERVE .gitignore: it is not a regular file")
+        return
     provenance = state.get("provenance")
     if isinstance(provenance, dict):
         entries = set(provenance.get("gitignore_entries", []))
@@ -318,12 +321,12 @@ def uninstall(target, *, mode="preserve", apply=False):
 
     pack = root / "skills/addyosmani-agent-skills"
     pack_referenced_by_modified_adapter = False
-    adapters = adapter_links(state, require_installer_target=mode != "remove-all")
+    adapters = adapter_links(state)
     for relative, expected in adapters.items():
         path = root / relative
         safe_path(root, path)
         exact = path.is_symlink() and os.readlink(path) == expected
-        if mode == "remove-all" or exact:
+        if exact:
             planned_removal(root, path, actions, apply)
         elif path.exists() or path.is_symlink():
             actions.append(f"PRESERVE {relative}: owned link was changed")

@@ -379,6 +379,49 @@ class InstallSmoke(unittest.TestCase):
             self.assertFalse(owned.exists() or owned.is_symlink())
             self.assertEqual(unrelated.read_text(), "do not remove")
 
+    def test_remove_all_preserves_adapter_path_when_state_target_is_not_installer_shaped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            target.mkdir()
+            adapter = target / ".agents/skills/addy-example"
+            adapter.parent.mkdir(parents=True)
+            adapter.symlink_to("../../application-skills/example", target_is_directory=True)
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "baselines": {},
+                "adapters": {"links": {
+                    ".agents/skills/addy-example": "../../application-skills/example",
+                }},
+            }))
+
+            uninstaller.uninstall(target, mode="remove-all", apply=True)
+
+            self.assertTrue(adapter.is_symlink())
+            self.assertEqual(os.readlink(adapter), "../../application-skills/example")
+
+    def test_remove_all_preserves_adapter_directory_despite_installer_shaped_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            target.mkdir()
+            adapter = target / ".agents/skills/addy-example"
+            adapter.mkdir(parents=True)
+            (adapter / "application-file").write_text("preserve")
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "baselines": {},
+                "adapters": {"links": {
+                    ".agents/skills/addy-example": "../../skills/addyosmani-agent-skills/skills/example",
+                }},
+            }))
+
+            uninstaller.uninstall(target, mode="remove-all", apply=True)
+
+            self.assertEqual((adapter / "application-file").read_text(), "preserve")
+
     def test_preserve_uninstall_keeps_adapter_link_with_non_installer_target(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "project"
@@ -509,6 +552,25 @@ class InstallSmoke(unittest.TestCase):
             uninstaller.uninstall(target, mode="preserve", apply=True)
 
             self.assertEqual((target / ".gitignore").read_text(), "important-entry\n")
+
+    def test_preserve_uninstall_keeps_non_regular_gitignore_and_completes_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            target.mkdir()
+            (target / ".gitignore").mkdir()
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "baselines": {},
+                "provenance": {"managed_files": [], "gitignore_entries": ["/.owner-override"]},
+            }))
+
+            _, actions = uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertTrue((target / ".gitignore").is_dir())
+            self.assertFalse(state_path.exists())
+            self.assertIn("PRESERVE .gitignore: it is not a regular file", actions)
 
     def test_preserve_uninstall_keeps_preexisting_matching_files_and_ignore_entries(self):
         with tempfile.TemporaryDirectory() as directory:

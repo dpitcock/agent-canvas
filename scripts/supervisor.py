@@ -277,20 +277,42 @@ class HostSupervisor:
         path = self._event_path(task_id, project)
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
+    @staticmethod
+    def _task_definition(action_map, validators, blockers, permitted_operations):
+        return {
+            "actions": {
+                action_id: {
+                    key: value for key, value in action.items()
+                    if key not in {"status", "attempts", "evidence"}
+                }
+                for action_id, action in action_map.items()
+            },
+            "validators": list(validators),
+            "blockers": list(blockers),
+            "permitted_operations": sorted(set(permitted_operations)),
+        }
+
     def create_task(self, task_id, project, actions, *, validators=(), blockers=(), permitted_operations=("read", "write", "delegate")):
         self._validate_task_id(task_id)
         registration = self.provision(project)
         path = self._state_file(self._tasks_dir(project, create=True) / f"{task_id}.json", description="task state")
+        action_map = {}
+        for action in actions:
+            action = dict(action)
+            action_id = action.pop("id", None)
+            if not action_id or action_id in action_map:
+                raise ValueError("actions require unique ids")
+            action_map[action_id] = {**action, "status": "pending", "attempts": [], "evidence": None}
+        definition = self._task_definition(action_map, validators, blockers, permitted_operations)
         with self._locked_task(task_id, project=project, create=True):
             if path.exists():
-                return self._read(path)
-            action_map = {}
-            for action in actions:
-                action = dict(action)
-                action_id = action.pop("id", None)
-                if not action_id or action_id in action_map:
-                    raise ValueError("actions require unique ids")
-                action_map[action_id] = {**action, "status": "pending", "attempts": [], "evidence": None}
+                task = self._read(path)
+                if definition != self._task_definition(
+                    task["actions"], task["validators"], task["blockers"],
+                    task["authorization"]["permitted_operations"],
+                ):
+                    raise ValueError("task_id already has a different durable definition")
+                return task
             authorization = {"revision": 1, "permitted_operations": sorted(set(permitted_operations)),
                              "prohibited_operations": list(DEFAULT_PROHIBITED)}
             authorization["digest"] = _digest(authorization)

@@ -72,6 +72,32 @@ class SupervisedTasks(unittest.TestCase):
         (self.project / "tasks.md").write_text("write-doc: complete\n")
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "done").kind, "continue")
 
+    def test_task_id_reuse_rejects_a_different_durable_definition(self):
+        actions = [{"id": "write-doc", "operation": "write"}]
+        validators = [{"id": "unit", "command": ["python3", "-m", "unittest"]}]
+        blockers = [{"id": "approval", "required": True}]
+        self.host.create_task(
+            "task-1", self.project, actions, validators=validators, blockers=blockers,
+            permitted_operations=("read", "write"),
+        )
+
+        changed_definitions = (
+            {"actions": [{"id": "delete-doc", "operation": "delete"}]},
+            {"validators": [{"id": "lint", "command": ["python3", "-m", "compileall"]}]},
+            {"blockers": [{"id": "approval", "required": False}]},
+            {"permitted_operations": ("read", "write", "delegate")},
+        )
+        for changed in changed_definitions:
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(ValueError, "definition"):
+                    self.host.create_task(
+                        "task-1", self.project,
+                        changed.get("actions", actions),
+                        validators=changed.get("validators", validators),
+                        blockers=changed.get("blockers", blockers),
+                        permitted_operations=changed.get("permitted_operations", ("read", "write")),
+                    )
+
     def test_rejects_project_nested_state_directory_without_creating_it(self):
         """Creating state before the project-boundary check would leave this directory behind."""
         nested_state = self.project / "host-state"
