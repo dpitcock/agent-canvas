@@ -196,6 +196,23 @@ def adapter_plan(root, environments, state, home=None):
     return operations, actions
 
 
+def add_gitignore_entry(root, ignore, entry):
+    """Append one entry through a descriptor pinned to a regular .gitignore."""
+    safe_destination(root, ignore)
+    try:
+        descriptor = os.open(ignore, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o666)
+    except OSError as error:
+        raise ValueError("Cannot safely update .gitignore: it is not a regular file") from error
+    with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError("Cannot safely update .gitignore: it is not a regular file")
+        old = handle.read()
+        if entry in old.splitlines():
+            return False
+        handle.write(("\n" if old and not old.endswith("\n") else "") + entry + "\n")
+        return True
+
+
 def apply_adapters(operations, provenance=None):
     for operation, link, target in operations:
         if operation == "remove":
@@ -206,11 +223,8 @@ def apply_adapters(operations, provenance=None):
             if link.parent.name == "skills" and link.parent.parent.name == ".cline":
                 root = link.parent.parent.parent
                 ignore = root / ".gitignore"
-                safe_destination(root, ignore)
-                old = ignore.read_text() if ignore.exists() else ""
                 entry = "/.cline/skills/" + link.name
-                if entry not in old.splitlines():
-                    ignore.write_text(old + ("\n" if old and not old.endswith("\n") else "") + entry + "\n")
+                if add_gitignore_entry(root, ignore, entry):
                     if provenance is not None:
                         entries = provenance.setdefault("gitignore_entries", [])
                         if entry not in entries:

@@ -309,7 +309,7 @@ def uninstall(target, *, mode="preserve", apply=False):
     for name in MANAGED:
         path = root / name
         safe_path(root, path)
-        if not path.exists():
+        if not path.exists() and not path.is_symlink():
             continue
         if path.is_symlink():
             if mode == "remove-all":

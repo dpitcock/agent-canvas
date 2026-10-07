@@ -267,6 +267,17 @@ class InstallSmoke(unittest.TestCase):
                     if should_exist:
                         self.assertTrue(managed.is_dir())
 
+    def test_remove_all_unlinks_dangling_managed_file_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            target.mkdir()
+            managed = target / "AGENTS.md"
+            managed.symlink_to("missing-agent-canvas-file")
+
+            uninstaller.uninstall(target, mode="remove-all", apply=True)
+
+            self.assertFalse(managed.exists() or managed.is_symlink())
+
     def test_preserve_uninstall_keeps_pack_referenced_by_unrecorded_adapter_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -586,6 +597,22 @@ class InstallSmoke(unittest.TestCase):
             self.assertTrue((target / ".gitignore").is_dir())
             self.assertFalse(state_path.exists())
             self.assertIn("PRESERVE .gitignore: it is not a regular file", actions)
+
+    def test_apply_adapters_rechecks_gitignore_after_preflight_before_reading(self):
+        """A .gitignore swapped after planning must not be opened as a FIFO/dir."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            link = root / ".cline/skills/example"
+            ignore = root / ".gitignore"
+            link.parent.mkdir(parents=True)
+
+            # Model the gap after a successful preflight and before apply.
+            installer.safe_destination(root, ignore)
+            ignore.mkdir()
+
+            with patch.object(Path, "read_text", side_effect=AssertionError("non-regular .gitignore was read")):
+                with self.assertRaisesRegex(ValueError, "regular file"):
+                    installer.apply_adapters([("add", link, "../../skills/example")])
 
     def test_preserve_uninstall_keeps_non_regular_followup_and_completes_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
