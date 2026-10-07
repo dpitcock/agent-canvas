@@ -22,6 +22,22 @@ executor = load_executor()
 
 
 class StagingTests(unittest.TestCase):
+    def test_rejects_symlinked_staging_parent_before_creating_snapshot(self):
+        """Replacing a staging parent with a link must not redirect the bind mount."""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project, host_owned, redirected = base / "project", base / "host-owned", base / "redirected"
+            project.mkdir()
+            host_owned.mkdir()
+            redirected.mkdir()
+            (project / "input.txt").write_text("input")
+            staging_parent = host_owned / "staging"
+            staging_parent.symlink_to(redirected, target_is_directory=True)
+            with executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project)) as pinned:
+                with self.assertRaisesRegex(executor.ConfigurationError, "staging parent"):
+                    executor.stage_inputs(pinned, ["input.txt"], staging_parent, max_bytes=1024, max_files=1)
+            self.assertEqual(list(redirected.iterdir()), [])
+
     def test_stages_declared_regular_file_from_pinned_root_after_path_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

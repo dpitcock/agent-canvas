@@ -19,7 +19,6 @@ import selectors
 import shutil
 import stat
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
@@ -59,6 +58,44 @@ def _remove_tree(path):
     except OSError:
         return False
     return not Path(path).exists()
+
+
+def _open_staging_parent(path):
+    """Return a descriptor for a private, host-owned staging directory."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        fd = os.open(os.fspath(path), flags)
+    except OSError as error:
+        raise ConfigurationError("staging parent must be a real host-owned directory") from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise ConfigurationError("staging parent must be a private host-owned directory")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _create_stage(parent_fd, parent_path):
+    """Create the snapshot through the retained parent descriptor."""
+    parent_path = Path(parent_path)
+    for _ in range(16):
+        name = f"agent-canvas-input-{uuid.uuid4().hex}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        root = parent_path / name
+        try:
+            created = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            visible = os.lstat(root)
+        except OSError as error:
+            raise ConfigurationError("staging parent changed while creating the snapshot") from error
+        if (created.st_dev, created.st_ino) != (visible.st_dev, visible.st_ino):
+            raise ConfigurationError("staging parent changed while creating the snapshot")
+        return root
+    raise ConfigurationError("could not allocate a unique staging directory")
 
 
 @dataclass(frozen=True)
@@ -148,10 +185,11 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
     paths = tuple(declared)
     if len(paths) > max_files:
         raise InputRejected("declared input count exceeds the staging limit")
-    parent = Path(staging_parent)
-    if not parent.is_dir():
-        raise ConfigurationError("staging parent must exist and be host-owned")
-    root = Path(tempfile.mkdtemp(prefix="agent-canvas-input-", dir=parent))
+    parent_fd = _open_staging_parent(staging_parent)
+    try:
+        root = _create_stage(parent_fd, staging_parent)
+    finally:
+        os.close(parent_fd)
     # The forced non-root container user must traverse the bind mount.  Direct
     # host enumeration stays disabled, while the mount itself is read-only.
     root.chmod(0o711)
