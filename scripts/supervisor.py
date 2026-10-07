@@ -69,9 +69,25 @@ class HostSupervisor:
     def _registration(self, project):
         return self._project_dir(project) / "registration.json"
 
+    def _registered_project(self, project):
+        """Return a registered project only while its original directory still exists."""
+        project = Path(project).resolve()
+        if not project.is_dir():
+            raise ValueError("Supervised project must be an existing directory")
+        registration = self._registration(project)
+        if not registration.is_file():
+            raise ValueError("Supervised project is not registered")
+        current = self._read(registration)
+        if current.get("project") != str(project):
+            raise ValueError("Host registration project mismatch")
+        if current.get("identity") != self._project_identity(project):
+            raise ValueError("Host registration project directory identity mismatch")
+        return project
+
     def _task_path(self, task_id, project=None):
         self._validate_task_id(task_id)
         if project is not None:
+            project = self._registered_project(project)
             path = self._project_dir(project) / "tasks" / f"{task_id}.json"
             if not path.is_file():
                 raise ValueError(f"Unknown task: {task_id}")
@@ -79,11 +95,14 @@ class HostSupervisor:
         matches = list((self.root / "projects").glob(f"*/tasks/{task_id}.json")) if (self.root / "projects").exists() else []
         if len(matches) != 1:
             raise ValueError(f"Unknown or ambiguous task: {task_id}")
+        registration = self._read(matches[0].parents[1] / "registration.json")
+        self._registered_project(registration.get("project"))
         return matches[0]
 
     def _task_lock_path(self, task_id, project=None):
         self._validate_task_id(task_id)
         if project is not None:
+            project = self._registered_project(project)
             return self._project_dir(project) / "tasks" / f"{task_id}.lock"
         return self._task_path(task_id).with_suffix(".lock")
 

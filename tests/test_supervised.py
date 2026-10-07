@@ -81,6 +81,24 @@ class SupervisedTasks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "identity"):
             self.host.provision(original)
 
+    def test_project_scoped_task_operations_reject_a_replacement_directory(self):
+        """Skipping registration verification lets a replacement use the prior task state."""
+        self.task()
+        original = self.project
+        replacement = self.base / "replacement"
+        replacement.mkdir()
+        original.rename(self.base / "original")
+        replacement.rename(original)
+
+        for operation in (
+            lambda: self.host.task("task-1", project=original),
+            lambda: self.host.claim_action("task-1", "write-doc", "attempt-1", project=original),
+            lambda: self.host.gate_final("task-1", "attempt-1", "done", project=original),
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(ValueError, "identity"):
+                    operation()
+
     def test_restart_recovers_rejected_final_and_leased_action(self):
         self.task()
         self.host.gate_final("task-1", "attempt-1", "done")

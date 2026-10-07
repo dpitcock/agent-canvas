@@ -65,6 +65,24 @@ class StagingTests(unittest.TestCase):
             self.assertEqual(len(snapshot.digest), 64)
             self.assertEqual(snapshot.files, ("large.txt",))
 
+    def test_stages_nested_inputs_with_traversable_ancestors_under_restrictive_umask(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as staging:
+            project = Path(directory) / "project"
+            source = project / "nested" / "deeper" / "input.txt"
+            source.parent.mkdir(parents=True)
+            source.write_text("authorized")
+            pinned = executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project))
+            previous_umask = os.umask(0o077)
+            try:
+                snapshot = executor.stage_inputs(
+                    pinned, ["nested/deeper/input.txt"], Path(staging), max_bytes=1024, max_files=1
+                )
+            finally:
+                os.umask(previous_umask)
+            for ancestor in (snapshot.root, snapshot.root / "nested", snapshot.root / "nested" / "deeper"):
+                with self.subTest(ancestor=ancestor):
+                    self.assertTrue(ancestor.stat().st_mode & 0o001)
+
     def test_rejected_stage_reports_cleanup_failure(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as staging:
             project = Path(directory) / "project"

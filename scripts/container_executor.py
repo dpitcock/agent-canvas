@@ -168,7 +168,10 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
                     raise InputRejected("input bytes exceed the staging limit")
                 target = root.joinpath(*parts)
                 target.parent.mkdir(mode=0o711, parents=True, exist_ok=True)
-                target.parent.chmod(0o711)
+                ancestor = root
+                for part in parts[:-1]:
+                    ancestor /= part
+                    ancestor.chmod(0o711)
                 # The path was derived solely from safe components under root.
                 digest = hashlib.sha256()
                 copied_bytes = 0

@@ -170,6 +170,27 @@ class InstallSmoke(unittest.TestCase):
             self.assertFalse((forced / "config/workspace-config.yml").exists())
             self.assertFalse((forced / "INSTALL-FOLLOWUP.md").exists())
 
+    def test_preserve_uninstall_keeps_pack_with_added_directory_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            def local_pack(destination, revision):
+                skill = destination / "skills/example"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("example")
+
+            target = base / "project"
+            installer.install(target, skills=True, home=base / "home", downloader=local_pack)
+            pack = target / "skills/addyosmani-agent-skills"
+            link = pack / "skills/example/added-directory-link"
+            link.symlink_to("..", target_is_directory=True)
+
+            _, actions = uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertTrue(pack.exists())
+            self.assertTrue(link.is_symlink())
+            self.assertIn("PRESERVE skills/addyosmani-agent-skills: not proven to be an unchanged Agent Canvas pack", actions)
+
     def test_remove_all_rejects_adapter_path_that_escapes_project(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

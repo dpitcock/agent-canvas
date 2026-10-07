@@ -82,7 +82,9 @@ def read_state(root):
 def pack_fingerprint(pack):
     entries = {}
     for base, dirs, files in os.walk(pack, followlinks=False):
-        dirs[:] = sorted(name for name in dirs if name != ".git" and not (Path(base) / name).is_symlink())
+        if any((Path(base) / name).is_symlink() for name in dirs):
+            return None
+        dirs[:] = sorted(name for name in dirs if name != ".git")
         for name in sorted(files):
             path = Path(base) / name
             if path.is_symlink() or not path.is_file():
