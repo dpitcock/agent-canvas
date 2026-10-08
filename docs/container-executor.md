@@ -33,7 +33,8 @@ the temporary path—must not read.  It remains a host-owned, read-only containe
 mount; the executor deletes it after execution.
 
 The returned receipt binds the action and attempt identifiers, staged-input
-digest, exact command, pinned image, canonical absolute runtime path, observed runtime version, status,
+digest, exact command, pinned image, canonical absolute runtime path, selected
+local daemon endpoint (`runtime_endpoint`), observed runtime version, status,
 timeout/cancellation state, and bounded output digest.  `receipt.matches()`
 must be checked against the host task's current values before using it.
 
@@ -66,6 +67,29 @@ executable owned by root or the current host account, and not writable by
 group or other users. That one absolute path is used for every lifecycle
 command, including cleanup, and is recorded in `receipt.runtime`. Changing
 `PATH` or an installation alias during a run cannot select another executable.
+
+The daemon endpoint is selected once from `/var/run/docker.sock`, then
+`<OS-account-home>/.docker/run/docker.sock` for Docker Desktop. The account
+home comes from the operating system's account database, never `HOME`.
+The resolved endpoint must be a Unix socket outside the project, owned by
+root or the current account. Socket aliases are resolved before the first
+command; every lifecycle command uses that same explicit `--host` endpoint.
+Remote daemons, Docker contexts, and installations exposing only other socket
+locations are unsupported and fail closed.
+
+Each run also creates an empty private directory under the resolved `/tmp`
+host directory, outside the project, and supplies it as `--config` to every
+Docker command. It is removed on success and failure, including preflight or
+staging failures. `TMPDIR`, `TEMP`, and `TMP` cannot select its parent. Docker
+processes receive only a fixed `PATH`, `LANG`, and `LC_ALL`; inherited Docker
+variables, home settings, proxies, credential helpers, and loader variables
+do not configure them. Normal Docker configuration and registry credentials
+are not loaded, so the exact image must already be available locally.
+
+Socket ownership and path selection establish the supported local install,
+not daemon authentication or attestation. Replacing the selected socket,
+binary, or their ancestors through host-account or administrator control
+remains outside this boundary, as does changing the daemon itself.
 
 Installation directories and their administrators are trusted, including
 admin-writable macOS application directories. This pins an executable path,

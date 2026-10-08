@@ -1,7 +1,10 @@
 """Unit tests for the standalone, host-owned container execution boundary."""
 import importlib.util
+from dataclasses import replace
 import json
 import os
+import socket
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -24,6 +27,46 @@ executor = load_executor()
 
 
 class TrustedRuntimeTests(unittest.TestCase):
+    def test_socket_policy_uses_account_home_and_rejects_untrusted_endpoints(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            account = base / "account"
+            endpoint = account / ".docker/run/docker.sock"
+            endpoint.parent.mkdir(parents=True)
+            daemon = socket.socket(socket.AF_UNIX)
+            self.addCleanup(daemon.close)
+            daemon.bind(str(endpoint))
+            with mock.patch.object(executor.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(account))), \
+                    mock.patch.dict(os.environ, {"HOME": str(project), "DOCKER_HOST": "tcp://poison:123"}):
+                candidates = executor.ContainerExecutor._endpoint_candidates()
+                self.assertEqual(candidates, [Path("/var/run/docker.sock"), endpoint])
+            with mock.patch.object(executor.ContainerExecutor, "_endpoint_candidates", return_value=(endpoint,)):
+                self.assertEqual(executor.ContainerExecutor._select_endpoint(project), "unix://" + str(endpoint))
+                original_stat = Path.stat
+
+                def foreign_owner(path, *args, **kwargs):
+                    info = original_stat(path, *args, **kwargs)
+                    return SimpleNamespace(st_mode=info.st_mode, st_uid=987654) if path == endpoint else info
+
+                with mock.patch.object(Path, "stat", foreign_owner):
+                    with self.assertRaises(executor.ConfigurationError):
+                        executor.ContainerExecutor._select_endpoint(project)
+            in_project = project / "docker.sock"
+            project_daemon = socket.socket(socket.AF_UNIX)
+            self.addCleanup(project_daemon.close)
+            project_daemon.bind(str(in_project))
+            alias = base / "alias"
+            alias.symlink_to(in_project)
+            regular = base / "regular"
+            regular.touch()
+            for candidate in (in_project, alias, regular, base / "missing"):
+                with self.subTest(candidate=candidate), \
+                        mock.patch.object(executor.ContainerExecutor, "_endpoint_candidates", return_value=(candidate,)):
+                    with self.assertRaises(executor.ConfigurationError):
+                        executor.ContainerExecutor._select_endpoint(project)
+
     def test_rejects_project_alias_and_unsafe_installed_files(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory).resolve()
@@ -92,21 +135,31 @@ class TrustedRuntimeTests(unittest.TestCase):
             poison.chmod(0o700)
             runtime = host / "docker"
             runtime.write_text(
-                "#!/bin/sh\n"
-                f"printf '%s %s\\n' \"$0\" \"$1\" >> '{log}'\n"
-                'case "$1" in\n'
-                ' version) printf "27\\n" ;;\n'
-                ' image) printf \'{"Id":"sha256:abc","Config":{}}\' ;;\n'
-                ' start) printf "excess output" ;;\n'
-                ' kill|rm) exit 1 ;;\n'
-                ' container) case "$3" in\n'
-                '   --format) printf "exited\\n" ;;\n'
-                '   *) printf "No such container: %s\\n" "$3" >&2; exit 1 ;;\n'
-                ' esac ;;\nesac\n'
+                f"#!{sys.executable}\n"
+                "import json, os, pathlib, sys\n"
+                f"log = pathlib.Path({str(log)!r})\n"
+                "args = sys.argv[1:]\n"
+                "config = pathlib.Path(args[3]) if args[:1] == ['--host'] else None\n"
+                "with log.open('a') as out: out.write(json.dumps({'args': args, 'env': dict(os.environ), 'config_empty': config is not None and list(config.iterdir()) == [], 'config_mode': config.stat().st_mode & 0o777 if config else None}) + '\\n')\n"
+                "if config: args = args[4:]\n"
+                "verb = args[0]\n"
+                "if verb == 'version': print('27')\n"
+                "if verb == 'image': print('{\"Id\":\"sha256:abc\",\"Config\":{}}')\n"
+                "if verb == 'start': print('excess output')\n"
+                "if verb in ('kill', 'rm'): sys.exit(1)\n"
+                "if verb == 'container':\n"
+                " if args[2] == '--format': print('exited')\n"
+                " else: print('No such container: ' + args[2], file=sys.stderr); sys.exit(1)\n"
             )
             runtime.chmod(0o700)
             alias = host / "docker-alias"
             alias.symlink_to(runtime)
+            daemon = socket.socket(socket.AF_UNIX)
+            self.addCleanup(daemon.close)
+            endpoint = host / "docker.sock"
+            daemon.bind(str(endpoint))
+            endpoint_alias = host / "socket-alias"
+            endpoint_alias.symlink_to(endpoint)
             request = executor.ExecutionRequest(
                 action_id="trusted", attempt_id="one", project=project,
                 image="example/tool@sha256:" + "a" * 64, command=["tool"], inputs=[], max_output_bytes=1,
@@ -119,10 +172,17 @@ class TrustedRuntimeTests(unittest.TestCase):
                 # the executable used for create/start/kill/cleanup.
                 alias.unlink()
                 alias.symlink_to(poison)
+                endpoint_alias.unlink()
+                endpoint_alias.symlink_to(project / "fake.sock")
+                os.environ["DOCKER_HOST"] = "unix://" + str(project / "switched.sock")
                 return original_stage(*args, **kwargs)
 
             with mock.patch.object(executor, "_TRUSTED_DOCKER_PATHS", (str(alias),)), \
-                    mock.patch.dict(os.environ, {"PATH": "."}), \
+                    mock.patch.object(executor.ContainerExecutor, "_endpoint_candidates", return_value=(endpoint_alias,)), \
+                    mock.patch.dict(os.environ, {"PATH": ".", "DOCKER_HOST": "unix://" + str(project / "fake.sock"),
+                                               "DOCKER_CONTEXT": "poison", "DOCKER_CONFIG": str(project),
+                                               "HOME": str(project), "TMPDIR": str(project), "HTTP_PROXY": "poison",
+                                               "LD_PRELOAD": str(project / "poison.so")}), \
                     mock.patch.object(executor, "stage_inputs", side_effect=change_path):
                 previous = Path.cwd()
                 try:
@@ -135,11 +195,25 @@ class TrustedRuntimeTests(unittest.TestCase):
                 finally:
                     os.chdir(previous)
             self.assertFalse(marker.exists())
-            self.assertEqual(log.read_text().splitlines(), [
-                f"{runtime} {verb}" for verb in
-                ("version", "image", "create", "start", "kill", "container", "rm", "container")
-            ])
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertTrue(all(call["args"][:1] == ["--host"] for call in calls), "all lifecycle calls must pin the daemon")
+            self.assertEqual([call["args"][4] for call in calls],
+                             ["version", "image", "create", "start", "kill", "container", "rm", "container"])
+            configs = set()
+            for call in calls:
+                self.assertEqual(call["args"][:3], ["--host", "unix://" + str(endpoint), "--config"])
+                configs.add(call["args"][3])
+                self.assertTrue(call["config_empty"])
+                self.assertEqual(call["config_mode"], 0o700)
+                # macOS may inject this into the Python fixture itself.
+                call["env"].pop("__CF_USER_TEXT_ENCODING", None)
+                self.assertEqual(call["env"], {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})
+            self.assertEqual(len(configs), 1)
+            config = Path(configs.pop())
+            self.assertFalse(config.is_relative_to(project))
+            self.assertFalse(config.exists())
             self.assertEqual(receipt.runtime, str(runtime))
+            self.assertEqual(receipt.runtime_endpoint, "unix://" + str(endpoint))
             self.assertTrue(receipt.output_truncated)
             self.assertTrue(receipt.verify())
 
@@ -331,6 +405,35 @@ class RuntimeValidationTests(unittest.TestCase):
         selected = mock.patch.object(executor.ContainerExecutor, "_select_runtime", return_value="/usr/bin/docker")
         selected.start()
         self.addCleanup(selected.stop)
+        endpoint = mock.patch.object(executor.ContainerExecutor, "_select_endpoint", return_value="unix:///var/run/docker.sock")
+        endpoint.start()
+        self.addCleanup(endpoint.stop)
+        self.runtime = executor._DockerCLI("/usr/bin/docker", "unix:///var/run/docker.sock", "/private/config")
+
+    def test_private_config_removed_after_preflight_and_staging_failure(self):
+        """Early exceptions must not leave Docker configuration behind."""
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            project.mkdir()
+            request = executor.ExecutionRequest(action_id="failed", attempt_id="one", project=project,
+                                                image="example/tool@sha256:" + "a" * 64,
+                                                command=["tool"], inputs=["missing"])
+            for preflight_fails in (True, False):
+                configs = []
+
+                def preflight(_request, runtime):
+                    configs.append(Path(runtime.config))
+                    self.assertTrue(configs[-1].is_dir())
+                    if preflight_fails:
+                        raise executor.ConfigurationError("unavailable")
+                    return "27", "sha256:image"
+
+                with self.subTest(preflight_fails=preflight_fails), \
+                        mock.patch.object(executor.ContainerExecutor, "_check_runtime", side_effect=preflight):
+                    with self.assertRaises((executor.ConfigurationError, executor.InputRejected)):
+                        executor.ContainerExecutor.run(request, executor.ProjectIdentity.capture(project), Path(directory))
+                self.assertEqual(len(configs), 1)
+                self.assertFalse(configs[0].exists())
 
     def test_parent_replacement_after_create_never_starts_the_container(self):
         """A staging-path swap during Docker create must fail before Docker start."""
@@ -348,6 +451,7 @@ class RuntimeValidationTests(unittest.TestCase):
             )
 
             def create_then_replace(command, *args, **kwargs):
+                command = command[:1] + command[5:]
                 if command[:2] == ["/usr/bin/docker", "create"]:
                     staging.rename(Path(staging_directory) / "old-staging")
                     replacement.rename(staging)
@@ -401,6 +505,7 @@ class RuntimeValidationTests(unittest.TestCase):
             cancellation = executor.threading.Event()
 
             def docker_run(argv, **_kwargs):
+                argv = argv[:1] + argv[5:]
                 if argv[1] == "create":
                     cancellation.set()
                     return mock.Mock(returncode=0)
@@ -419,8 +524,8 @@ class RuntimeValidationTests(unittest.TestCase):
             self.assertTrue(receipt.verify())
             self.assertEqual(list(Path(staging).iterdir()), [])
 
-    def test_truncated_output_closes_pipe_before_waiting_for_attached_process(self):
-        """The post-cap drain may not buffer an unbounded final communicate result."""
+    def test_attached_output_is_bounded_and_pipe_closes_after_normal_or_truncated_exit(self):
+        """Normal exit must close the pipe; a post-cap drain must not buffer output."""
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as staging:
             project = Path(directory) / "project"
             project.mkdir()
@@ -433,9 +538,11 @@ class RuntimeValidationTests(unittest.TestCase):
             class Stdout:
                 def __init__(self):
                     self.closed = False
+                    self.data = b"too much output"
 
                 def read1(self, _size):
-                    return b"too much output"
+                    data, self.data = self.data, b""
+                    return data
 
                 def close(self):
                     self.closed = True
@@ -446,7 +553,7 @@ class RuntimeValidationTests(unittest.TestCase):
                     self.returncode = 0
 
                 def poll(self):
-                    return None
+                    return 0
 
                 def communicate(self, **_kwargs):
                     raise AssertionError("communicate would buffer uncapped output")
@@ -464,21 +571,24 @@ class RuntimeValidationTests(unittest.TestCase):
                 def close(self):
                     pass
 
-            process = Process()
-
             def docker_run(argv, **_kwargs):
+                argv = argv[:1] + argv[5:]
                 if argv[1] in {"create", "kill"} or argv[1:3] == ["rm", "-f"]:
                     return mock.Mock(returncode=0)
                 raise AssertionError(f"unexpected Docker command: {argv}")
 
-            with mock.patch.object(executor.ContainerExecutor, "_check_runtime", return_value=("27", "sha256:image")), \
-                 mock.patch.object(executor.subprocess, "run", side_effect=docker_run), \
-                 mock.patch.object(executor.subprocess, "Popen", return_value=process), \
-                 mock.patch.object(executor.selectors, "DefaultSelector", return_value=Selector()):
-                receipt = executor.ContainerExecutor.run(request, executor.ProjectIdentity.capture(project), Path(staging))
-            self.assertTrue(receipt.output_truncated)
-            self.assertEqual(receipt.output, "t")
-            self.assertTrue(process.stdout.closed)
+            for limit in (1, 100):
+                process = Process()
+                with self.subTest(limit=limit), \
+                     mock.patch.object(executor.ContainerExecutor, "_check_runtime", return_value=("27", "sha256:image")), \
+                     mock.patch.object(executor.subprocess, "run", side_effect=docker_run), \
+                     mock.patch.object(executor.subprocess, "Popen", return_value=process), \
+                     mock.patch.object(executor.selectors, "DefaultSelector", return_value=Selector()):
+                    receipt = executor.ContainerExecutor.run(replace(request, max_output_bytes=limit),
+                                                             executor.ProjectIdentity.capture(project), Path(staging))
+                    self.assertEqual(receipt.output_truncated, limit == 1)
+                    self.assertEqual(receipt.output, "t" if limit == 1 else "too much output")
+                    self.assertTrue(process.stdout.closed)
 
     def test_truncated_output_accepts_a_container_that_exited_before_kill(self):
         """Docker's kill race is safe only after inspect confirms the container exited."""
@@ -519,6 +629,7 @@ class RuntimeValidationTests(unittest.TestCase):
                     pass
 
             def docker_run(argv, **_kwargs):
+                argv = argv[:1] + argv[5:]
                 if argv[1] == "create" or argv[1:3] == ["rm", "-f"]:
                     return mock.Mock(returncode=0)
                 if argv[1] == "kill":
@@ -553,10 +664,12 @@ class RuntimeValidationTests(unittest.TestCase):
                         SimpleNamespace(stdout="27\n"),
                         SimpleNamespace(stdout=json.dumps({"Id": image_id, "Config": config})),
                     ]):
-                self.assertEqual(executor.ContainerExecutor._check_runtime(request, "/usr/bin/docker"), ("27", image_id))
+                self.assertEqual(executor.ContainerExecutor._check_runtime(request, self.runtime), ("27", image_id))
 
     def test_runtime_rejects_volumes_and_malformed_metadata_before_create(self):
-        request = executor.ExecutionRequest(action_id="a", attempt_id="one", project=Path("/tmp/project"),
+        project_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(project_dir.cleanup)
+        request = executor.ExecutionRequest(action_id="a", attempt_id="one", project=Path(project_dir.name),
                                             image="example/tool@sha256:" + "a" * 64, command=["true"], inputs=[])
         image_id = "sha256:" + "b" * 64
         metadata = ["not json", "null", "[]", "{}"]
@@ -581,6 +694,7 @@ class RuntimeValidationTests(unittest.TestCase):
         image_id = "sha256:" + "b" * 64
 
         def docker_inspect(argv, **kwargs):
+            argv = argv[:1] + argv[5:]
             if argv[1] == "version":
                 return SimpleNamespace(stdout="27\n")
             if argv[-1] == "{{.Id}}":
@@ -589,14 +703,15 @@ class RuntimeValidationTests(unittest.TestCase):
 
         with mock.patch.object(executor.subprocess, "run", side_effect=docker_inspect):
             with self.assertRaisesRegex(executor.ConfigurationError, "volumes"):
-                executor.ContainerExecutor._check_runtime(request, "/usr/bin/docker")
+                executor.ContainerExecutor._check_runtime(request, self.runtime)
 
     def test_receipt_is_bound_to_attempt_command_image_and_snapshot(self):
         receipt = executor.ExecutionReceipt.build(action_id="action", attempt_id="attempt", input_digest="1" * 64,
                                                   command=("tool", "--check"), image="example/tool@sha256:" + "2" * 64,
-                                                  runtime="docker", runtime_version="27", exit_status=0,
+                                                  runtime="docker", runtime_endpoint="unix:///var/run/docker.sock", runtime_version="27", exit_status=0,
                                                   timed_out=False, cancelled=False, output="ok", output_truncated=False)
         self.assertTrue(receipt.verify())
+        self.assertFalse(replace(receipt, runtime_endpoint="unix:///other.sock").verify())
         self.assertFalse(receipt.matches(action_id="action", attempt_id="other", input_digest="1" * 64,
                                          command=("tool", "--check"), image="example/tool@sha256:" + "2" * 64))
 
@@ -632,33 +747,33 @@ class RuntimeValidationTests(unittest.TestCase):
 
     def test_container_removal_failure_is_reported_without_skipping_stage_cleanup(self):
         with mock.patch.object(executor.subprocess, "run", side_effect=executor.subprocess.TimeoutExpired("docker", 10)):
-            self.assertFalse(executor.ContainerExecutor._remove_container("agent-canvas-test", "/usr/bin/docker"))
+            self.assertFalse(executor.ContainerExecutor._remove_container("agent-canvas-test", self.runtime))
 
     def test_container_cleanup_removes_anonymous_volumes(self):
         """Dropping -v would leave image-declared anonymous volumes behind."""
         removed = mock.Mock(returncode=0)
         with mock.patch.object(executor.subprocess, "run", return_value=removed) as run:
-            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test", "/usr/bin/docker"))
-        self.assertEqual(run.call_args.args[0], ["/usr/bin/docker", "rm", "-f", "-v", "agent-canvas-test"])
+            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test", self.runtime))
+        self.assertEqual(run.call_args.args[0][5:], ["rm", "-f", "-v", "agent-canvas-test"])
 
     def test_container_cleanup_accepts_confirmed_absence_after_create_ambiguity(self):
         failed_remove = mock.Mock(returncode=1)
         absent = mock.Mock(returncode=1, stderr=b"Error: No such container: agent-canvas-test\n")
         with mock.patch.object(executor.subprocess, "run", side_effect=[failed_remove, absent]) as run:
-            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test", "/usr/bin/docker"))
+            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test", self.runtime))
         self.assertEqual(run.call_args_list[1].args[0][-2:], ["inspect", "agent-canvas-test"])
 
     def test_container_cleanup_accepts_inspect_missing_object_diagnostic(self):
         failed_remove = mock.Mock(returncode=1)
         absent = mock.Mock(returncode=1, stderr=b"Error: No such object: agent-canvas-test\n")
         with mock.patch.object(executor.subprocess, "run", side_effect=[failed_remove, absent]):
-            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test", "/usr/bin/docker"))
+            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test", self.runtime))
 
     def test_container_cleanup_rejects_ambiguous_inspect_error(self):
         failed_remove = mock.Mock(returncode=1)
         daemon_error = mock.Mock(returncode=1, stderr=b"Cannot connect to the Docker daemon")
         with mock.patch.object(executor.subprocess, "run", side_effect=[failed_remove, daemon_error]):
-            self.assertFalse(executor.ContainerExecutor._remove_container("agent-canvas-test", "/usr/bin/docker"))
+            self.assertFalse(executor.ContainerExecutor._remove_container("agent-canvas-test", self.runtime))
 
     def test_stage_removal_failure_is_explicit(self):
         with mock.patch.object(executor.shutil, "rmtree", side_effect=OSError("busy")):

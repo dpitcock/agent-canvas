@@ -13,12 +13,14 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import selectors
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -39,6 +41,27 @@ class ConfigurationError(ValueError):
 
 class InputRejected(ValueError):
     """A project-controlled input cannot safely become staged input."""
+
+
+@dataclass(frozen=True)
+class _DockerCLI:
+    runtime: str
+    endpoint: str
+    config: str
+
+    def run(self, args, **kwargs):
+        return subprocess.run(self.command(args), env=self.environment(), **kwargs)
+
+    def popen(self, args, **kwargs):
+        return subprocess.Popen(self.command(args), env=self.environment(), **kwargs)
+
+    def command(self, args):
+        return [self.runtime, "--host", self.endpoint, "--config", self.config, *args]
+
+    @staticmethod
+    def environment():
+        # Do not inherit Docker contexts, proxies, HOME, or loader settings.
+        return {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
 
 
 def _sha256(value):
@@ -419,6 +442,7 @@ class ExecutionReceipt:
     image: str
     runtime: str
     runtime_version: str
+    runtime_endpoint: str
     exit_status: int | str
     timed_out: bool
     cancelled: bool
@@ -447,6 +471,31 @@ class ExecutionReceipt:
 
 class ContainerExecutor:
     """Docker-only executor.  It has no host-process fallback by design."""
+
+    @staticmethod
+    def _endpoint_candidates():
+        candidates = [Path("/var/run/docker.sock")]
+        try:
+            home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        except KeyError:
+            return candidates
+        if home.is_absolute():
+            candidates.append(home / ".docker" / "run" / "docker.sock")
+        return candidates
+
+    @classmethod
+    def _select_endpoint(cls, project):
+        project = Path(project).resolve(strict=True)
+        for candidate in cls._endpoint_candidates():
+            try:
+                endpoint = Path(candidate).resolve(strict=True)
+                info = endpoint.stat()
+            except (OSError, RuntimeError):
+                continue
+            if (not endpoint.is_relative_to(project) and stat.S_ISSOCK(info.st_mode)
+                    and info.st_uid in {0, os.geteuid()}):
+                return "unix://" + str(endpoint)
+        raise ConfigurationError("trusted local Docker socket is unavailable")
 
     @staticmethod
     def _select_runtime(project):
@@ -494,11 +543,11 @@ class ContainerExecutor:
     @classmethod
     def _check_runtime(cls, request, runtime):
         try:
-            version = subprocess.run([runtime, "version", "--format", "{{.Server.Version}}"],
+            version = runtime.run(["version", "--format", "{{.Server.Version}}"],
                                      capture_output=True, text=True, timeout=5, check=True).stdout.strip()
             # Inspect is intentionally before create: Docker create otherwise pulls a
             # missing image, which makes an unapproved image available implicitly.
-            image_metadata = subprocess.run([runtime, "image", "inspect", request.image, "--format", "{{json .}}"],
+            image_metadata = runtime.run(["image", "inspect", request.image, "--format", "{{json .}}"],
                                             capture_output=True, text=True, timeout=5, check=True).stdout.strip()
         except (OSError, subprocess.SubprocessError) as error:
             raise ConfigurationError("Docker daemon or the pinned image is unavailable") from error
@@ -524,13 +573,13 @@ class ContainerExecutor:
     def _remove_container(cls, name, runtime):
         """Best-effort Docker cleanup whose failure remains a failed execution."""
         try:
-            removed = subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=10, check=False)
+            removed = runtime.run(["rm", "-f", "-v", name], capture_output=True, timeout=10, check=False)
         except (OSError, subprocess.SubprocessError):
             return False
         if removed.returncode == 0:
             return True
         try:
-            absent = subprocess.run([runtime, "container", "inspect", name], capture_output=True,
+            absent = runtime.run(["container", "inspect", name], capture_output=True,
                                     timeout=5, check=False)
         except (OSError, subprocess.SubprocessError):
             return False
@@ -546,8 +595,8 @@ class ContainerExecutor:
     def _container_exited(cls, name, runtime):
         """Confirm the container already exited before accepting a failed kill."""
         try:
-            inspected = subprocess.run(
-                [runtime, "container", "inspect", "--format", "{{.State.Status}}", name],
+            inspected = runtime.run(
+                ["container", "inspect", "--format", "{{.State.Status}}", name],
                 capture_output=True, text=True, timeout=5, check=False,
             )
         except (OSError, subprocess.SubprocessError):
@@ -569,6 +618,16 @@ class ContainerExecutor:
         if cancellation is not None and not isinstance(cancellation, threading.Event):
             raise ConfigurationError("cancellation must be a threading.Event")
         runtime = cls._select_runtime(request.project)
+        endpoint = cls._select_endpoint(request.project)
+        # Fixed host temporary parent: tempfile's default trusts TMPDIR/TEMP/TMP.
+        parent = Path("/tmp").resolve(strict=True)
+        if parent.is_relative_to(Path(request.project).resolve(strict=True)):
+            raise ConfigurationError("Docker configuration must be outside the project")
+        with tempfile.TemporaryDirectory(prefix="agent-canvas-docker-", dir=parent) as config:
+            return cls._run(request, identity, staging_parent, _DockerCLI(runtime, endpoint, config), cancellation)
+
+    @classmethod
+    def _run(cls, request, identity, staging_parent, runtime, cancellation):
         version, _image_id = cls._check_runtime(request, runtime)
         with PinnedProject.open(request.project, identity) as pinned:
             snapshot = stage_inputs(pinned, request.inputs, staging_parent, max_bytes=16 * 1024 * 1024, max_files=128)
@@ -583,8 +642,8 @@ class ContainerExecutor:
                 cancelled, status = True, "cancelled"
             else:
                 create_attempted = True
-                created = subprocess.run(
-                    cls.plan(request, snapshot.visible_root(), name, runtime=runtime), capture_output=True, timeout=10, check=False
+                created = runtime.run(
+                    cls.plan(request, snapshot.visible_root(), name, runtime=runtime.runtime)[1:], capture_output=True, timeout=10, check=False
                 )
                 if created.returncode:
                     raise ConfigurationError("Docker rejected the required isolation configuration")
@@ -595,7 +654,7 @@ class ContainerExecutor:
                 if cancellation is not None and cancellation.is_set():
                     cancelled, status = True, "cancelled"
                 else:
-                    process = subprocess.Popen([runtime, "start", "--attach", name], stdout=subprocess.PIPE,
+                    process = runtime.popen(["start", "--attach", name], stdout=subprocess.PIPE,
                                                stderr=subprocess.STDOUT, start_new_session=True)
                     deadline = time.monotonic() + request.timeout_s
                     selector = selectors.DefaultSelector()
@@ -625,7 +684,7 @@ class ContainerExecutor:
                             continue
                     selector.close()
                     if timed_out or cancelled or truncated:
-                        stopped = subprocess.run([runtime, "kill", name], capture_output=True, timeout=10, check=False)
+                        stopped = runtime.run(["kill", name], capture_output=True, timeout=10, check=False)
                         if stopped.returncode and not cls._container_exited(name, runtime):
                             raise ConfigurationError("Docker could not stop the output-limited container")
                         # ``communicate`` would buffer every byte emitted after
@@ -637,6 +696,8 @@ class ContainerExecutor:
                         process.wait(timeout=10)
                     except subprocess.TimeoutExpired as error:
                         raise ConfigurationError("Docker attach did not exit after output handling") from error
+                    if process.stdout is not None:
+                        process.stdout.close()
                     status = process.returncode if not (timed_out or cancelled) else ("timeout" if timed_out else "cancelled")
         finally:
             cleanup_ok = True
@@ -649,7 +710,8 @@ class ContainerExecutor:
             if not cleanup_ok or not stage_removed:
                 raise ConfigurationError("Docker or host staging cleanup could not be confirmed")
         return ExecutionReceipt.build(action_id=request.action_id, attempt_id=request.attempt_id, input_digest=snapshot.digest,
-                                      command=request.command, image=request.image, runtime=runtime,
+                                      command=request.command, image=request.image, runtime=runtime.runtime,
+                                      runtime_endpoint=runtime.endpoint,
                                       runtime_version=version, exit_status=status, timed_out=timed_out,
                                       cancelled=cancelled, output=output.decode("utf-8", "replace"),
                                       output_truncated=truncated)
