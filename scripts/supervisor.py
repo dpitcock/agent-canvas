@@ -273,6 +273,11 @@ class HostSupervisor:
             temp = Path(out.name)
         try:
             os.replace(temp, path)
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         finally:
             temp.unlink(missing_ok=True)
 
@@ -468,6 +473,8 @@ class HostSupervisor:
 
     def reconcile_action(self, task_id, action_id, *, succeeded, receipt, project=None):
         with self._locked_task(task_id, project=project) as task:
+            if task["status"] in {"complete", "blocked", "cancelled"}:
+                raise ValueError("Terminal task actions cannot be reconciled")
             action = task["actions"].get(action_id)
             if not action or action["status"] != "leased":
                 raise ValueError("Only a leased action can be reconciled")
@@ -480,11 +487,23 @@ class HostSupervisor:
             self._save_task(task)
             self._event(task_id, event, project=task["project"], action_id=action_id, receipt=receipt)
 
+    @staticmethod
+    def _completion_replay(task, action, evidence):
+        if action["status"] == "complete":
+            if action["evidence"] == evidence:
+                return True
+            raise ValueError("Completed action evidence cannot be changed")
+        if task["status"] in {"complete", "blocked", "cancelled"}:
+            raise ValueError("Terminal task actions cannot be completed")
+        return False
+
     def complete_action(self, task_id, action_id, *, evidence, project=None):
         with self._locked_task(task_id, project=project) as task:
             action = task["actions"].get(action_id)
             if not action:
                 raise ValueError(f"Unknown action: {action_id}")
+            if self._completion_replay(task, action, evidence):
+                return
             action.update(status="complete", evidence=evidence)
             self._save_task(task)
             self._event(task_id, "action_completed", project=task["project"], action_id=action_id, evidence=evidence)
@@ -494,7 +513,10 @@ class HostSupervisor:
             action = task["actions"].get(action_id)
             if not action or action.get("child_task_id") != child_task_id:
                 raise ValueError("Child result is not bound to this parent action")
-            action.update(status="complete", evidence={"child_task_id": child_task_id, "evidence": evidence})
+            joined = {"child_task_id": child_task_id, "evidence": evidence}
+            if self._completion_replay(task, action, joined):
+                return
+            action.update(status="complete", evidence=joined)
             self._save_task(task)
             self._event(task_id, "action_completed", project=task["project"], action_id=action_id, evidence=action["evidence"])
             self._event(task_id, "child_evidence_joined", project=task["project"], action_id=action_id, child_task_id=child_task_id)
