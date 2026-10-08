@@ -209,9 +209,10 @@ def add_gitignore_entries(root, ignore, entries):
                              | getattr(os, "O_NOFOLLOW", 0), 0o666)
     except OSError as error:
         raise ValueError("Cannot safely update .gitignore: it is not a regular file") from error
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+    current = os.fstat(descriptor)
+    if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
         os.close(descriptor)
-        raise ValueError("Cannot safely update .gitignore: it is not a regular file")
+        raise ValueError("Cannot safely update .gitignore: it must be a regular file with one link")
     with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
         old = handle.read()
         missing = [entry for entry in entries if entry not in old.splitlines()]
@@ -256,6 +257,7 @@ def write_regular_text(root, path, text, *, create=False, identity=None):
         raise ValueError(f"Cannot safely update regular file: {path}") from error
     current = os.fstat(descriptor)
     if (not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
             or (identity is not None and (current.st_dev, current.st_ino) != identity)):
         os.close(descriptor)
         raise ValueError(f"Cannot safely update regular file: {path}")

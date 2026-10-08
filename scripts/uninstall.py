@@ -57,7 +57,7 @@ def regular_text_snapshot(root, path):
     except OSError as error:
         raise ValueError(f"Cannot safely read regular file: {path}") from error
     identity = os.fstat(descriptor)
-    if not stat.S_ISREG(identity.st_mode):
+    if not stat.S_ISREG(identity.st_mode) or identity.st_nlink != 1:
         os.close(descriptor)
         raise ValueError(f"Cannot safely read regular file: {path}")
     with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
@@ -79,6 +79,7 @@ def replace_regular_snapshot(root, path, text, identity):
     with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
         current = os.fstat(handle.fileno())
         if (not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
                 or (current.st_dev, current.st_ino) != identity):
             raise ValueError(f"Cannot safely update regular file: {path}")
         handle.seek(0)
@@ -478,7 +479,10 @@ def uninstall(target, *, mode="preserve", apply=False):
         elif pack_referenced_by_modified_adapter:
             actions.append("PRESERVE skills/addyosmani-agent-skills: preserved adapter link may reference it")
         elif pack_matches:
-            planned_removal(root, pack, actions, apply)
+            # A fingerprint cannot bind a later recursive pathname deletion to
+            # the directory inspected here. Preserve even unchanged packs;
+            # remove-all explicitly authorizes removing the current pathname.
+            actions.append("PRESERVE skills/addyosmani-agent-skills: cleanup requires --mode remove-all")
         else:
             actions.append("PRESERVE skills/addyosmani-agent-skills: not proven to be an unchanged Agent Canvas pack")
 

@@ -601,6 +601,114 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(receipt["exit_status"], 0)
         self.assertEqual(len(receipt["output"].encode()), 8192)
 
+    def test_validator_detached_pipe_has_absolute_drain_deadline(self):
+        child_pid = self.base / "detached-pid"
+        code = (
+            "import os, pathlib, time\n"
+            "if os.fork() == 0:\n"
+            " os.setsid()\n"
+            f" pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
+            " time.sleep(30)\n"
+            "else:\n"
+            " time.sleep(30)\n"
+        )
+        result = []
+        worker = threading.Thread(target=lambda: result.append(self.host._validator_receipt({
+            "command": [sys.executable, "-c", code], "timeout_s": 0.5,
+        })))
+        worker.start()
+        try:
+            worker.join(timeout=4)
+            self.assertFalse(worker.is_alive(), "detached stdout must not prevent timeout")
+            self.assertEqual(result[0]["exit_status"], "timeout")
+        finally:
+            if child_pid.exists():
+                try:
+                    os.kill(int(child_pid.read_text()), 9)
+                except ProcessLookupError:
+                    pass
+            worker.join(timeout=2)
+
+    def test_validator_snapshot_failure_never_launches_original(self):
+        with patch.object(supervisor.os, "fsync", side_effect=OSError("disk full")), \
+                patch.object(supervisor.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(ValueError, "snapshot"):
+                self.host._validator_receipt({"command": [sys.executable, "-c", "pass"]})
+            launch.assert_not_called()
+        self.assertEqual(list((self.host.root / "validator-snapshots").iterdir()), [])
+
+    def test_validator_missing_digest_never_launches(self):
+        for result in ((None, None), (None, "digest")):
+            with self.subTest(result=result), \
+                    patch.object(self.host, "_validator_snapshot", return_value=result), \
+                    patch.object(supervisor.subprocess, "Popen") as launch:
+                with self.assertRaisesRegex(ValueError, "snapshot"):
+                    self.host._validator_receipt({"command": [sys.executable]})
+                launch.assert_not_called()
+
+    def test_validator_snapshot_copy_deadline_cleans_up(self):
+        with patch.object(supervisor.time, "monotonic", side_effect=(0, 6)):
+            with self.assertRaisesRegex(ValueError, "snapshot"):
+                self.host._validator_snapshot(sys.executable)
+        self.assertEqual(list((self.host.root / "validator-snapshots").iterdir()), [])
+
+    def test_validator_snapshot_is_read_only(self):
+        snapshot, digest = self.host._validator_snapshot(sys.executable)
+        try:
+            self.assertEqual(Path(snapshot).stat().st_mode & 0o777, 0o500)
+            self.assertEqual(digest, hashlib.sha256(Path(snapshot).read_bytes()).hexdigest())
+        finally:
+            Path(snapshot).unlink()
+
+    def test_validator_stream_failure_terminates_and_reaps_process(self):
+        processes = []
+        real_launch = supervisor.subprocess.Popen
+
+        def launch(*args, **kwargs):
+            process = real_launch(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with patch.object(supervisor.subprocess, "Popen", side_effect=launch), \
+                patch.object(self.host, "_stream_validator_output", side_effect=OSError("read failed")):
+            with self.assertRaisesRegex(OSError, "read failed"):
+                self.host._validator_receipt({"command": [sys.executable, "-c", "import time; time.sleep(30)"]})
+        self.assertIsNotNone(processes[0].poll())
+        self.assertTrue(processes[0].stdout.closed)
+        self.assertTrue(processes[0].stderr.closed)
+        self.assertEqual(list((self.host.root / "validator-snapshots").iterdir()), [])
+
+    def test_validator_rejects_nonfinite_timeout_before_snapshot(self):
+        with patch.object(self.host, "_validator_snapshot") as snapshot:
+            for timeout in (float("nan"), float("inf"), True):
+                with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                    self.host._validator_receipt({"command": [sys.executable], "timeout_s": timeout})
+            snapshot.assert_not_called()
+
+    def test_validator_continuous_output_cannot_starve_timeout(self):
+        started = time.monotonic()
+        receipt = self.host._validator_receipt({
+            "command": [sys.executable, "-c", "import os\nwhile True: os.write(1, b'x' * 65536)"],
+            "timeout_s": 0.2,
+        })
+        self.assertEqual(receipt["exit_status"], "timeout")
+        self.assertEqual(len(receipt["output"]), 8192)
+        self.assertLess(time.monotonic() - started, 4)
+
+    def test_validator_path_skips_nonexecutable_entry(self):
+        first = self.base / "first"
+        second = self.base / "second"
+        first.mkdir()
+        second.mkdir()
+        (first / "check").write_text("not executable")
+        executable = second / "check"
+        executable.write_text("#!/bin/sh\nprintf checked")
+        executable.chmod(0o700)
+        with patch.dict(os.environ, {"PATH": os.pathsep.join((str(first), str(second)))}):
+            receipt = self.host._validator_receipt({"command": ["check"]})
+        self.assertEqual(receipt["output"], "checked")
+        self.assertEqual(receipt["binary_digest"], hashlib.sha256(executable.read_bytes()).hexdigest())
+
     def test_continuation_cannot_broaden_default_prohibited_operations(self):
         self.task()
         result = self.host.request_operation("task-1", "push")

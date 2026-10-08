@@ -14,6 +14,10 @@ The locally generated Codex App Server protocol schema exposes `turn/start`, `it
 
 The guarantee holds only when users interact through this custom client and the agent lacks filesystem access to its host-state root. File permissions alone do not protect a state directory from another process running as the same operating-system identity. The existing Codex desktop app is outside this interception boundary.
 
+Host validators execute a copied executable from the host-state directory. Copying is limited to 64 MiB and checked against a five-second deadline; a missing executable, failed copy, or missing digest prevents launch. The receipt identifies the copied executable, not its interpreter, imported modules, or other runtime dependencies. Validators must support execution from that location: virtual-environment discovery, paths relative to the executable, and native-library lookup can depend on the original installation path.
+
+Output is drained incrementally with an 8 KiB retained byte prefix. Timeout sends TERM and KILL to the validator process group, then closes output pipes after a final drain deadline and bounds the direct-child wait. Detached descendants may survive independently; this host execution path is not a sandbox. Use the Docker executor's documented local-development boundary when process isolation is required.
+
 Upstream desktop support needs: a host-owned final-message interceptor, durable host task state, callbacks for completion and recovery/compaction, a way to suppress default final rendering, cancellation propagation, and child-turn evidence/join events.
 
 ## Test results

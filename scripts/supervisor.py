@@ -5,6 +5,7 @@ This module deliberately never reads workspace task files as completion evidence
 """
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -469,6 +470,11 @@ class HostSupervisor:
                             **({"dir_fd": project_descriptor}
                                if project_descriptor is not None and not os.path.isabs(candidate) else {}),
                         )
+                        mode = os.fstat(descriptor).st_mode
+                        if not stat.S_ISREG(mode) or not mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+                            os.close(descriptor)
+                            descriptor = None
+                            continue
                         break
                     except OSError:
                         continue
@@ -482,22 +488,25 @@ class HostSupervisor:
             snapshot_descriptor, snapshot_path = tempfile.mkstemp(prefix="validator-", dir=snapshots)
             os.fchmod(snapshot_descriptor, 0o700)
             digest = hashlib.sha256()
+            copy_deadline = time.monotonic() + 5
+            copied = 0
             while chunk := os.read(descriptor, 64 * 1024):
+                copied += len(chunk)
+                if copied > 64 * 1024 * 1024 or time.monotonic() >= copy_deadline:
+                    raise ValueError("Host validator snapshot exceeds the 64 MiB or 5 second copy limit")
                 digest.update(chunk)
                 view = memoryview(chunk)
                 while view:
                     view = view[os.write(snapshot_descriptor, view):]
             os.fsync(snapshot_descriptor)
+            os.fchmod(snapshot_descriptor, 0o500)
             os.close(snapshot_descriptor)
             snapshot_descriptor = None
             return snapshot_path, digest.hexdigest()
-        except OSError:
+        except (OSError, ValueError):
             if snapshot_path is not None:
-                try:
-                    os.unlink(snapshot_path)
-                except OSError:
-                    pass
-            return None, None
+                os.unlink(snapshot_path)
+            raise ValueError("Host validator executable snapshot could not be created")
         finally:
             if descriptor is not None:
                 os.close(descriptor)
@@ -505,11 +514,22 @@ class HostSupervisor:
                 os.close(snapshot_descriptor)
 
     @staticmethod
+    def _signal_validator(process, sig):
+        try:
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            # Some platforms deny access to an empty group after its leader
+            # exits. A surviving leader still needs a direct termination.
+            if process.poll() is None:
+                process.send_signal(sig)
+
+    @staticmethod
     def _stream_validator_output(process, timeout):
         """Drain both pipes without retaining more than the receipt cap in host memory."""
         retained = bytearray()
         timed_out = False
         deadline = time.monotonic() + timeout
+        drain_deadline = deadline + 2
         kill_deadline = None
         with selectors.DefaultSelector() as selector:
             for stream in (process.stdout, process.stderr):
@@ -519,31 +539,30 @@ class HostSupervisor:
                 now = time.monotonic()
                 if not timed_out and now >= deadline:
                     timed_out = True
-                    try:
-                        os.killpg(process.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+                    HostSupervisor._signal_validator(process, signal.SIGTERM)
                     kill_deadline = now + 1
                 elif timed_out and kill_deadline is not None and now >= kill_deadline:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    HostSupervisor._signal_validator(process, signal.SIGKILL)
                     kill_deadline = None
+                if timed_out and now >= drain_deadline:
+                    break
                 wait_for = 0.05 if timed_out else max(0, min(0.05, deadline - now))
                 for key, _ in selector.select(wait_for):
-                    while True:
-                        try:
-                            chunk = os.read(key.fileobj.fileno(), 64 * 1024)
-                        except BlockingIOError:
-                            break
-                        if not chunk:
-                            selector.unregister(key.fileobj)
-                            break
-                        remaining = 8192 - len(retained)
-                        if remaining > 0:
-                            retained.extend(chunk[:remaining])
-        process.wait()
+                    # One bounded read per event ensures noisy writers cannot
+                    # starve timeout checks or the other output stream.
+                    try:
+                        chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    remaining = 8192 - len(retained)
+                    if remaining > 0:
+                        retained.extend(chunk[:remaining])
+        process.stdout.close()
+        process.stderr.close()
+        process.wait(timeout=1)
         return _text_output(bytes(retained)), "timeout" if timed_out else process.returncode
 
     def _validator_receipt(self, validator, *, project=None, project_descriptor=None):
@@ -551,31 +570,37 @@ class HostSupervisor:
         if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
             raise ValueError("Host validator command must be a nonempty argument list")
         timeout = validator.get("timeout_s", 30)
-        if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 300:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0 or timeout > 300:
             raise ValueError("Host validator timeout_s must be between 0 and 300")
         declared_command = command
         snapshot_path, binary_digest = self._validator_snapshot(command[0], project_descriptor=project_descriptor)
-        launch_command = [snapshot_path or command[0], *command[1:]]
+        if snapshot_path is None or binary_digest is None:
+            if snapshot_path is not None:
+                os.unlink(snapshot_path)
+            raise ValueError("Host validator requires an executable snapshot and digest before launch")
+        launch_command = [snapshot_path, *command[1:]]
         run_options = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "cwd": project,
                        "start_new_session": True}
         if project_descriptor is not None:
             # A freshly started interpreter may safely fchdir before it execs the
             # validator.  Avoid preexec_fn: it executes in the forked child of
             # this potentially multithreaded supervisor and can deadlock there.
-            launch_command = [sys.executable, "-c", _VALIDATOR_LAUNCHER, str(project_descriptor), *command]
-            if snapshot_path is not None:
-                launch_command = [sys.executable, "-c", _VALIDATOR_LAUNCHER, str(project_descriptor),
-                                  snapshot_path, *command[1:]]
+            launch_command = [sys.executable, "-c", _VALIDATOR_LAUNCHER, str(project_descriptor),
+                              snapshot_path, *command[1:]]
             run_options.update(cwd=None, pass_fds=(project_descriptor,))
         try:
-            with subprocess.Popen(launch_command, **run_options) as process:
+            process = subprocess.Popen(launch_command, **run_options)
+            try:
                 output, status = self._stream_validator_output(process, timeout)
-        finally:
-            if snapshot_path is not None:
+            finally:
                 try:
-                    os.unlink(snapshot_path)
-                except OSError:
-                    pass
+                    self._signal_validator(process, signal.SIGKILL)
+                finally:
+                    process.stdout.close()
+                    process.stderr.close()
+                    process.wait(timeout=1)
+        finally:
+            os.unlink(snapshot_path)
         return {"command": declared_command, "command_digest": _digest(declared_command), "binary_digest": binary_digest,
                 "exit_status": status, "output": output, "digest": hashlib.sha256(output.encode()).hexdigest(),
                 "timeout_s": timeout, "version": validator.get("version", "host-configured")}

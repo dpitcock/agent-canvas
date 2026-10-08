@@ -21,6 +21,61 @@ nuke_spec.loader.exec_module(agent_nuke)
 
 
 class InstallSmoke(unittest.TestCase):
+    def test_preserve_uninstall_keeps_hardlinked_ignore_and_followup_in_preview_and_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "project"
+            installer.install(root, skills=False, home=base / "home")
+            originals = {}
+            for name in (".gitignore", "INSTALL-FOLLOWUP.md"):
+                originals[name] = (root / name).read_text()
+                os.link(root / name, base / name)
+            for apply in (False, True):
+                _, actions = uninstaller.uninstall(root, apply=apply)
+                for name, original in originals.items():
+                    self.assertEqual((base / name).read_text(), original)
+                    self.assertTrue(any(action.startswith(f"PRESERVE {name}:") for action in actions))
+                    self.assertFalse(any(action.startswith(f"WOULD UPDATE {name}:") for action in actions))
+
+    def test_uninstall_writer_rejects_hardlink_created_after_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "project"
+            root.mkdir()
+            path = root / ".gitignore"
+            path.write_text("original")
+            _, identity = uninstaller.regular_text_snapshot(root, path)
+            os.link(path, base / "external")
+            with self.assertRaisesRegex(ValueError, "Cannot safely update"):
+                uninstaller.replace_regular_snapshot(root, path, "changed", identity)
+            self.assertEqual((base / "external").read_text(), "original")
+
+    def test_preserve_pack_replacement_after_fingerprint_survives_preview_and_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            def local_pack(destination, revision):
+                skill = destination / "skills/example"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("example")
+
+            fingerprint = uninstaller.pack_fingerprint
+            for apply in (False, True):
+                root = base / str(apply)
+                installer.install(root, skills=True, home=base / "home", downloader=local_pack)
+                pack = root / "skills/addyosmani-agent-skills"
+                def replace_after_fingerprint(path):
+                    result = fingerprint(path)
+                    path.rename(root / "original-pack")
+                    path.mkdir()
+                    (path / "application-file").write_text("keep replacement")
+                    return result
+                with patch.object(uninstaller, "pack_fingerprint", replace_after_fingerprint):
+                    _, actions = uninstaller.uninstall(root, apply=apply)
+                self.assertEqual((pack / "application-file").read_text(), "keep replacement")
+                self.assertIn("PRESERVE skills/addyosmani-agent-skills: cleanup requires --mode remove-all", actions)
+                uninstaller.uninstall(root, mode="remove-all", apply=True)
+                self.assertFalse(pack.exists())
+
     def test_new_existing_repeated_and_conflicting_installations(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -160,7 +215,7 @@ class InstallSmoke(unittest.TestCase):
             self.assertEqual((preserved / "AGENTS.md").read_text(), "Project additions\n")
             self.assertEqual((preserved / ".gitignore").read_text(), "app-cache\n")
             self.assertTrue((preserved / ".agent-canvas/state.json").is_file())
-            self.assertFalse((preserved / "skills/addyosmani-agent-skills").exists())
+            self.assertTrue((preserved / "skills/addyosmani-agent-skills").exists())
 
             forced = base / "forced"
             installer.install(forced, skills=False, home=home)
@@ -430,7 +485,7 @@ class InstallSmoke(unittest.TestCase):
             self.assertTrue(pack.exists())
             self.assertTrue(alias.is_symlink())
 
-    def test_preserve_uninstall_removes_unchanged_pack_with_approved_opencode_alias(self):
+    def test_preserve_uninstall_keeps_unchanged_pack_with_approved_opencode_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
 
@@ -446,7 +501,7 @@ class InstallSmoke(unittest.TestCase):
 
             uninstaller.uninstall(target, mode="preserve", apply=True)
 
-            self.assertFalse((target / "skills/addyosmani-agent-skills").exists())
+            self.assertTrue((target / "skills/addyosmani-agent-skills").exists())
 
     def test_remove_all_ignores_adapter_path_that_escapes_project(self):
         with tempfile.TemporaryDirectory() as directory:

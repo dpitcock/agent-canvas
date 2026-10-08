@@ -19,6 +19,40 @@ def snapshot(root):
 
 
 class UpgradeSmoke(unittest.TestCase):
+    def test_existing_file_mutations_reject_hardlinks_to_external_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "project"
+            root.mkdir()
+            external = base / "external"
+            external.write_text("external contents\n")
+            for operation in ("ignore", "replace"):
+                with self.subTest(operation=operation):
+                    path = root / operation
+                    os.link(external, path)
+                    with self.assertRaisesRegex(ValueError, "Cannot safely update"):
+                        if operation == "ignore":
+                            installer.add_gitignore_entries(root, path, ["/new-entry"])
+                        else:
+                            _, identity = installer.regular_text_snapshot(root, path)
+                            installer.write_regular_text(root, path, "replacement", identity=identity)
+                    self.assertEqual(external.read_text(), "external contents\n")
+                    path.unlink()
+
+    def test_writer_rejects_hardlink_created_after_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "project"
+            root.mkdir()
+            path = root / "managed"
+            path.write_text("original")
+            _, identity = installer.regular_text_snapshot(root, path)
+            external = base / "external"
+            os.link(path, external)
+            with self.assertRaisesRegex(ValueError, "Cannot safely update"):
+                installer.write_regular_text(root, path, "changed", identity=identity)
+            self.assertEqual(external.read_text(), "original")
+
     def test_read_state_does_not_follow_a_state_file_replaced_after_validation(self):
         """A replacement symlink cannot change the state read after validation."""
         with tempfile.TemporaryDirectory() as tmp:

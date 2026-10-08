@@ -237,7 +237,7 @@ python3 scripts/uninstall.py /path/to/project
 python3 scripts/uninstall.py /path/to/project --apply
 ```
 
-The default `preserve` mode removes only artifacts that the installation record can prove Agent Canvas created and which remain unchanged. It removes the package's own ignore entries and its marked follow-up section, while retaining project notes and files that may have existed before installation or were edited afterward.
+The default `preserve` mode removes unchanged installer-owned discovery links and removes the package's own ignore entries and marked follow-up section from regular files with only one hard link. It retains managed files, the installation record, and the skill pack, even when unchanged: verification cannot safely bind a later pathname deletion to the verified object. Preview and apply both report these retained paths as `PRESERVE`; use `remove-all` for their cleanup. Project notes and preexisting or modified files remain preserved.
 
 To deliberately remove every known Agent Canvas path, including edits to its managed files, use `remove-all`:
 
