@@ -540,15 +540,54 @@ class SupervisedTasks(unittest.TestCase):
 
     def test_validator_receipt_decodes_byte_output_before_hashing(self):
         """A timed-out byte stream still yields a text receipt and digest."""
+        started = self.base / "validator-started"
         receipt = self.host._validator_receipt({
             "id": "check",
-            "command": [sys.executable, "-c", "import sys, time; sys.stdout.buffer.write(b'validator output'); sys.stdout.flush(); time.sleep(10)"],
-            "timeout_s": 0.1,
+            "command": [sys.executable, "-c", f"import pathlib, sys, time; pathlib.Path({str(started)!r}).write_text('started'); sys.stdout.buffer.write(b'validator output'); sys.stdout.flush(); time.sleep(10)"],
+            "timeout_s": 1,
         })
 
         self.assertEqual(receipt["output"], "validator output")
         self.assertEqual(receipt["digest"], "af0c829e3106013e4ef9555521848126776f8a7054fc42e1b64b94dbc4627de1")
         self.assertEqual(receipt["exit_status"], "timeout")
+        self.assertTrue(started.exists())
+
+    def test_validator_timeout_terminates_descendants_that_hold_the_output_pipe_open(self):
+        """Killing only the parent leaves its child holding stdout open forever."""
+        started = self.base / "validator-started"
+        child_pid = self.base / "validator-child-pid"
+        gate = self.base / "validator-gate"
+        code = (
+            "import os, pathlib, subprocess, sys, time\n"
+            f"gate = pathlib.Path({str(gate)!r})\n"
+            f"pathlib.Path({str(started)!r}).write_text('started')\n"
+            "while not gate.exists(): time.sleep(0.01)\n"
+            "child = subprocess.Popen([sys.executable, '-c', \"import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)\"])\n"
+            f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid))\n"
+            "print('child-started', flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        result = []
+        worker = threading.Thread(target=lambda: result.append(self.host._validator_receipt({
+            "id": "descendant-pipe", "command": [sys.executable, "-c", code], "timeout_s": 1,
+        })))
+        worker.start()
+        try:
+            deadline = time.monotonic() + 2
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(started.exists())
+            gate.touch()
+            worker.join(timeout=4)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result[0]["exit_status"], "timeout")
+        finally:
+            if child_pid.exists():
+                try:
+                    os.kill(int(child_pid.read_text()), 9)
+                except ProcessLookupError:
+                    pass
+            worker.join(timeout=2)
 
     def test_validator_receipt_bounds_retained_output_while_draining_the_process(self):
         """Validator receipts retain at most 8 KiB even when a child writes much more."""

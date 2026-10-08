@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -518,10 +519,17 @@ class HostSupervisor:
                 now = time.monotonic()
                 if not timed_out and now >= deadline:
                     timed_out = True
-                    process.terminate()
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                     kill_deadline = now + 1
-                elif timed_out and process.poll() is None and now >= kill_deadline:
-                    process.kill()
+                elif timed_out and kill_deadline is not None and now >= kill_deadline:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    kill_deadline = None
                 wait_for = 0.05 if timed_out else max(0, min(0.05, deadline - now))
                 for key, _ in selector.select(wait_for):
                     while True:
@@ -548,7 +556,8 @@ class HostSupervisor:
         declared_command = command
         snapshot_path, binary_digest = self._validator_snapshot(command[0], project_descriptor=project_descriptor)
         launch_command = [snapshot_path or command[0], *command[1:]]
-        run_options = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "cwd": project}
+        run_options = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "cwd": project,
+                       "start_new_session": True}
         if project_descriptor is not None:
             # A freshly started interpreter may safely fchdir before it execs the
             # validator.  Avoid preexec_fn: it executes in the forked child of
