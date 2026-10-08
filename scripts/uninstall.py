@@ -87,20 +87,48 @@ def replace_regular_snapshot(root, path, text, identity):
         handle.write(text)
 
 
-def remove_path(path):
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
-    else:
-        path.unlink()
+def remove_path(root, path, *, recursive=True):
+    """Delete relative to no-follow directory descriptors, including cleanup."""
+    relative = path.relative_to(root)
+    if not relative.parts or ".." in relative.parts:
+        raise ValueError(f"Cannot remove the project root or an outside path: {path}")
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("Safe descriptor-relative removal is unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptors = []
+    try:
+        descriptors.append(os.open(root, flags))
+        for name in relative.parts[:-1]:
+            descriptors.append(os.open(name, flags, dir_fd=descriptors[-1]))
+        parent = descriptors[-1]
+        name = relative.name
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if stat.S_ISDIR(current.st_mode) and not recursive:
+            os.rmdir(name, dir_fd=parent)
+        elif stat.S_ISDIR(current.st_mode):
+            if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+                raise ValueError("Safe recursive removal is unavailable")
+            # The safe rmtree implementation pins each descendant and rejects
+            # symlinks substituted between its lstat and directory open.
+            shutil.rmtree(name, dir_fd=parent)
+        else:
+            # unlink never follows the leaf, even if it becomes a symlink.
+            os.unlink(name, dir_fd=parent)
+        remove_empty_parents(relative, descriptors)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
-def remove_empty_parents(root, path):
-    parent = path.parent
-    while parent != root:
-        if parent.is_symlink() or not parent.is_dir() or any(parent.iterdir()):
+def remove_empty_parents(relative, descriptors):
+    """Only prune empty parents through the descriptors used for removal."""
+    for index in range(len(descriptors) - 1, 0, -1):
+        try:
+            # rmdir does not follow a substituted symlink, and atomically
+            # refuses nonempty directories without a preceding listing race.
+            os.rmdir(relative.parts[index - 1], dir_fd=descriptors[index - 1])
+        except OSError:
             return
-        parent.rmdir()
-        parent = parent.parent
 
 
 def read_state(root, *, allow_damaged=False):
@@ -276,8 +304,7 @@ def planned_removal(root, path, actions, apply):
         return
     actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {path.relative_to(root)}")
     if apply:
-        remove_path(path)
-        remove_empty_parents(root, path)
+        remove_path(root, path)
 
 
 def planned_regular_removal(root, path, actions, apply, identity):

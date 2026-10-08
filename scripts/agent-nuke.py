@@ -9,7 +9,6 @@ import re
 _uninstall_spec = importlib.util.spec_from_file_location("agent_canvas_uninstall", Path(__file__).with_name("uninstall.py"))
 _uninstall = importlib.util.module_from_spec(_uninstall_spec)
 _uninstall_spec.loader.exec_module(_uninstall)
-remove_empty_parents = _uninstall.remove_empty_parents
 remove_path = _uninstall.remove_path
 root_path = _uninstall.root_path
 safe_path = _uninstall.safe_path
@@ -41,8 +40,7 @@ def nuke_path(root, path, actions, apply):
     if path.is_symlink() or path.is_file():
         actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {path.relative_to(root)}")
         if apply:
-            remove_path(path)
-            remove_empty_parents(root, path)
+            remove_path(root, path, recursive=False)
         return
     if not path.is_dir():
         actions.append(f"PRESERVE SPECIAL {path.relative_to(root)}")
@@ -52,8 +50,7 @@ def nuke_path(root, path, actions, apply):
     if path.exists() and path.is_dir() and not any(path.iterdir()):
         actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {path.relative_to(root)}/")
         if apply:
-            path.rmdir()
-            remove_empty_parents(root, path)
+            remove_path(root, path, recursive=False)
 
 
 def nuke(target, *, apply=False):

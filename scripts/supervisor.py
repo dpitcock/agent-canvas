@@ -355,10 +355,20 @@ class HostSupervisor:
             "permitted_operations": sorted(set(permitted_operations)),
         }
 
+    @staticmethod
+    def _validate_validator_ids(validators):
+        seen = set()
+        for validator in validators:
+            identifier = validator.get("id") if isinstance(validator, dict) else None
+            if not isinstance(identifier, str) or not identifier.strip() or identifier in seen:
+                raise ValueError("Host validators require unique nonempty string ids")
+            seen.add(identifier)
+
     def create_task(self, task_id, project, actions, *, validators=(), blockers=(), permitted_operations=("read", "write", "delegate")):
         self._validate_task_id(task_id)
         actions = list(actions)
         validators = list(validators)
+        self._validate_validator_ids(validators)
         blockers = list(blockers)
         permitted_operations = tuple(permitted_operations)
         prohibited = sorted(set(permitted_operations).intersection(DEFAULT_PROHIBITED))
@@ -632,12 +642,13 @@ class HostSupervisor:
                 "timeout_s": timeout, "version": validator.get("version", "host-configured")}
 
     def _validate(self, task):
+        # Recheck older saved definitions before running any validator, not
+        # halfway through execution after a receipt has already been replaced.
+        self._validate_validator_ids(task["validators"])
         receipts = {}
         with self._pinned_registered_project(task["project"]) as project_descriptor:
             for validator in task["validators"]:
                 validator_id = validator.get("id")
-                if not validator_id:
-                    raise ValueError("Host validators require an id")
                 receipt = self._validator_receipt(validator, project_descriptor=project_descriptor)
                 receipts[validator_id] = receipt
                 if receipt["exit_status"] != 0:

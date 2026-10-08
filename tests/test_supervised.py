@@ -74,6 +74,42 @@ class SupervisedTasks(unittest.TestCase):
         (self.project / "tasks.md").write_text("write-doc: complete\n")
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "done").kind, "continue")
 
+    def test_validator_ids_are_unique_nonempty_strings_before_task_creation(self):
+        for index, validators in enumerate((
+            [{"id": "same", "command": ["true"]}, {"id": "same", "command": ["true"]}],
+            *[[{"id": value, "command": ["true"]}] for value in (None, "", " ", [], {}, 1)],
+            ["not a validator"],
+        )):
+            with self.subTest(validators=validators):
+                task_id = f"invalid-validators-{index}"
+                with self.assertRaisesRegex(ValueError, "validator"):
+                    self.host.create_task(task_id, self.project, [], validators=validators)
+                self.assertEqual(list((self.base / "host-state").rglob(f"{task_id}.json")), [])
+
+    def test_existing_duplicate_validators_are_rejected_before_any_execution(self):
+        self.host.create_task("task-1", self.project, [], validators=[{"id": "same", "command": ["true"]}])
+        task = self.host.task("task-1")
+        marker = self.project / "must-not-run"
+        task["validators"] = [
+            {"id": "same", "command": [sys.executable, "-c", "from pathlib import Path; Path('must-not-run').touch()"]},
+            {"id": "same", "command": ["true"]},
+        ]
+        self.host._save_task(task)
+        with self.assertRaisesRegex(ValueError, "validator"):
+            self.host.gate_final("task-1", "attempt", "finished")
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.host.visible_messages("task-1"), [])
+        self.assertEqual(self.host.task("task-1")["status"], "active")
+
+    def test_distinct_validators_retain_each_receipt_and_audit_event(self):
+        self.host.create_task("task-1", self.project, [], validators=[
+            {"id": "first", "command": ["true"]}, {"id": "second", "command": ["true"]},
+        ])
+        self.assertTrue(self.host.gate_final("task-1", "attempt", "finished").release)
+        self.assertEqual(set(self.host.task("task-1")["evidence"]["validators"]), {"first", "second"})
+        events = [e for e in self.host.audit("task-1") if e["type"] == "validator_received"]
+        self.assertEqual([e["validator_id"] for e in events], ["first", "second"])
+
     def test_task_id_reuse_rejects_a_different_durable_definition(self):
         actions = [{"id": "write-doc", "operation": "write"}]
         validators = [{"id": "unit", "command": ["python3", "-m", "unittest"]}]

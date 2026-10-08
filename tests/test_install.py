@@ -21,6 +21,131 @@ nuke_spec.loader.exec_module(agent_nuke)
 
 
 class InstallSmoke(unittest.TestCase):
+    def test_remove_all_rejects_ancestor_swapped_before_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            root = base / "project"
+            config = root / "config"
+            config.mkdir(parents=True)
+            target = config / "workspace-config.yml"
+            target.write_text("managed")
+            outside = base / "outside"
+            outside.mkdir()
+            victim = outside / target.name
+            victim.mkdir()
+            (victim / "application.txt").write_text("keep")
+            safe_path = uninstaller.safe_path
+            swapped = False
+
+            def swap_after_check(checked_root, path):
+                nonlocal swapped
+                safe_path(checked_root, path)
+                if path == target and not swapped:
+                    swapped = True
+                    config.rename(root / "held")
+                    config.symlink_to(outside, target_is_directory=True)
+
+            with patch.object(uninstaller, "safe_path", swap_after_check):
+                try:
+                    uninstaller.planned_removal(root, target, [], True)
+                except (OSError, ValueError):
+                    pass
+            self.assertTrue(swapped)
+            self.assertTrue(victim.exists())
+            self.assertEqual((victim / "application.txt").read_text(), "keep")
+
+    def test_remove_all_stays_with_parent_pinned_before_swap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            root = base / "project"
+            config = root / "config"
+            config.mkdir(parents=True)
+            target = config / "workspace-config.yml"
+            target.write_text("managed")
+            outside = base / "outside"
+            outside.mkdir()
+            victim = outside / target.name
+            victim.write_text("keep")
+            held = root / "held"
+            real_open = os.open
+
+            def swap_after_open(path, flags, *args, **kwargs):
+                fd = real_open(path, flags, *args, **kwargs)
+                if path == "config" and flags & os.O_DIRECTORY:
+                    config.rename(held)
+                    config.symlink_to(outside, target_is_directory=True)
+                return fd
+
+            with patch.object(os, "open", swap_after_open):
+                uninstaller.planned_removal(root, target, [], True)
+            self.assertEqual(victim.read_text(), "keep")
+            self.assertTrue(config.is_symlink())
+            self.assertFalse((held / target.name).exists())
+
+    def test_remove_all_fails_closed_without_safe_recursive_removal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            pack = root / "skills/addyosmani-agent-skills"
+            pack.mkdir(parents=True)
+            keep = pack / "SKILL.md"
+            keep.write_text("keep")
+            with patch.object(uninstaller.shutil.rmtree, "avoids_symlink_attacks", False):
+                try:
+                    uninstaller.planned_removal(root, pack, [], True)
+                except (OSError, ValueError):
+                    pass
+            self.assertTrue(keep.exists())
+
+    def test_remove_all_leaf_swapped_to_symlink_never_follows_target(self):
+        for directory in (False, True):
+            with self.subTest(directory=directory), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve()
+                root = base / "project"
+                root.mkdir()
+                target = root / "AGENTS.md"
+                if directory:
+                    target.mkdir()
+                else:
+                    target.write_text("managed")
+                outside = base / "outside"
+                outside.mkdir()
+                victim = outside / "application.txt"
+                victim.write_text("keep")
+                real_stat = os.stat
+                swapped = False
+
+                def swap_after_stat(path, *args, **kwargs):
+                    nonlocal swapped
+                    result = real_stat(path, *args, **kwargs)
+                    if path == target.name and kwargs.get("dir_fd") is not None and not swapped:
+                        swapped = True
+                        target.rename(root / "held")
+                        target.symlink_to(outside, target_is_directory=True)
+                    return result
+
+                with patch.object(os, "stat", swap_after_stat):
+                    try:
+                        uninstaller.planned_removal(root, target, [], True)
+                    except (OSError, ValueError):
+                        pass
+                self.assertTrue(swapped)
+                self.assertEqual(victim.read_text(), "keep")
+
+    def test_remove_all_prunes_empty_parents_and_keeps_unrelated_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            config = root / "config"
+            config.mkdir()
+            (config / "workspace-config.yml").write_text("managed")
+            (config / "application.yml").write_text("keep")
+            pack = root / "skills/addyosmani-agent-skills/skills/example"
+            pack.mkdir(parents=True)
+            (pack / "SKILL.md").write_text("managed")
+            uninstaller.uninstall(root, mode="remove-all", apply=True)
+            self.assertEqual((config / "application.yml").read_text(), "keep")
+            self.assertFalse((config / "workspace-config.yml").exists())
+            self.assertFalse((root / "skills").exists())
+
     def test_preserve_adapter_replacement_directory_survives(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve() / "project"
