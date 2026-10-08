@@ -4,6 +4,10 @@
 running a declared validator in Docker Desktop.  It is intentionally not wired
 to the supervisor; PR #7 can consume a verified receipt later.
 
+The supported target for this proof of concept is a personal local Mac running
+Docker Desktop. Linux Desktop compatibility is outside this project's current
+scope; the fixed-path fallbacks below do not promise support for every platform.
+
 ## Contract
 
 The host supplies an `ExecutionRequest`, a recorded `ProjectIdentity`, and a

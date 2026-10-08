@@ -380,8 +380,8 @@ class HostSupervisor:
         for action in actions:
             action = dict(action)
             action_id = action.pop("id", None)
-            if not action_id or action_id in action_map:
-                raise ValueError("actions require unique ids")
+            if not isinstance(action_id, str) or not action_id.strip() or action_id in action_map:
+                raise ValueError("actions require unique nonempty string ids")
             operation = action.get("operation")
             if operation not in permitted_operations or operation in DEFAULT_PROHIBITED:
                 raise ValueError("action operation is not permitted by task authorization")

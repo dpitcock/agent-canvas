@@ -12,6 +12,10 @@ The POC uses atomic replacement for task state and fsynced append-only progress 
 
 ## Boundary and limitations
 
+Each renderer retains at most 1 MiB of UTF-8 message text across pending and completed items, 4,096 nonempty delta chunks, and 1,024 distinct item IDs plus 1,024 completed turn IDs over its lifetime. IDs are limited to 512 characters; phases are normalized to fixed values. Completed item text replaces its delta buffer and counts against the same text budget. Empty deltas consume no retained metadata. Turn completion clears message text but preserves bounded replay history. Exceeding a retention limit (or receiving text that cannot encode as UTF-8) clears retained state and permanently returns `renderer_limit_exceeded`; later events cannot release text or reach the host gate. Start a new renderer for a new independently bound turn instead of evicting replay history.
+
+These limits bound renderer-retained state, not the size of an event already allocated by the caller. A live transport must separately limit incoming event size before parsing.
+
 The locally generated Codex App Server protocol schema exposes `turn/start`, `item/agentMessage/delta`, and `turn/completed`, supporting this renderer design. This POC exercises the renderer with an event fixture; it does not launch a real App Server turn or modify the desktop app.
 
 The guarantee holds only when users interact through this custom client and the agent lacks filesystem access to its host-state root. File permissions alone do not protect a state directory from another process running as the same operating-system identity. The existing Codex desktop app is outside this interception boundary.

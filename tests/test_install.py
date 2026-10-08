@@ -21,6 +21,33 @@ nuke_spec.loader.exec_module(agent_nuke)
 
 
 class InstallSmoke(unittest.TestCase):
+    def test_reset_shared_file_replaced_by_directory_never_recurses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            target = root / "agents/review-coordinator.md"
+            target.parent.mkdir()
+            target.write_text("installed artifact")
+            original_check = agent_nuke.safe_path
+            swapped = False
+
+            def replace_after_check(project, path):
+                nonlocal swapped
+                original_check(project, path)
+                if path == target and not swapped:
+                    swapped = True
+                    target.rename(root / "old-artifact")
+                    target.mkdir()
+                    (target / "application.py").write_text("keep")
+
+            with patch.object(agent_nuke, "safe_path", side_effect=replace_after_check):
+                try:
+                    agent_nuke.nuke(root, apply=True)
+                except (OSError, ValueError):
+                    pass
+            self.assertTrue(swapped)
+            self.assertTrue((target / "application.py").exists())
+            self.assertEqual((target / "application.py").read_text(), "keep")
+
     def test_remove_all_rejects_ancestor_swapped_before_open(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp).resolve()
@@ -1136,7 +1163,7 @@ class InstallSmoke(unittest.TestCase):
             (root / ".agents/skills/example").mkdir(parents=True)
             (root / ".agents/skills/example/SKILL.md").write_text("remove")
             (root / "agents").mkdir()
-            (root / "agents/review.md").write_text("remove")
+            (root / "agents/review-coordinator.md").write_text("remove")
             (root / ".github/workflows").mkdir(parents=True)
             (root / ".github/workflows/ci.yml").write_text("remove")
             (root / "AGENTS.md").write_text("remove")
@@ -1165,6 +1192,74 @@ class InstallSmoke(unittest.TestCase):
             self.assertEqual((root / "config.toml").read_text(), '[application]\nport = 8080\n')
             self.assertEqual((root / "hooks.json").read_text(), '{"hooks": ["pre-commit"]}')
             self.assertFalse((root / "AGENTS.md").exists())
+
+    def test_agent_nuke_preserves_unknown_files_in_shared_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preserved = (
+                "agents/worker.py", "skills/catalog.json", "rules/pricing.py",
+                "commands/import.py", "agents/review.md",
+                "skills/addyosmani-agent-skills/user-note.md",
+            )
+            removed = ("agents/review-coordinator.md", "skills/addyosmani-agent-skills.ref")
+            for relative in (*preserved, *removed):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(relative)
+
+            _, preview = agent_nuke.nuke(root)
+            for relative in preserved:
+                self.assertNotIn(f"WOULD REMOVE {relative}", preview)
+            for relative in removed:
+                self.assertTrue((root / relative).exists())
+                self.assertIn(f"WOULD REMOVE {relative}", preview)
+
+            agent_nuke.nuke(root, apply=True)
+            for relative in preserved:
+                self.assertEqual((root / relative).read_text(), relative)
+            for relative in removed:
+                self.assertFalse((root / relative).exists())
+
+    def test_agent_nuke_removes_plan_named_framework_skills(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for owner in (".agents", ".cline", ".codex", ".claude", ".cursor"):
+                skill = root / owner / "skills/writing-plans/SKILL.md"
+                skill.parent.mkdir(parents=True)
+                skill.write_text("framework implementation")
+            for relative in ("plans/current.md", "epics/current.md", "tasks/current.md",
+                             "specs/current.md", "docs/superpowers/specs/design.md",
+                             "docs/superpowers/implementation-plan.md"):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("project work")
+
+            agent_nuke.nuke(root, apply=True)
+
+            for owner in (".agents", ".cline", ".codex", ".claude", ".cursor"):
+                self.assertFalse((root / owner).exists())
+            for relative in ("plans/current.md", "epics/current.md", "tasks/current.md",
+                             "specs/current.md", "docs/superpowers/specs/design.md",
+                             "docs/superpowers/implementation-plan.md"):
+                self.assertEqual((root / relative).read_text(), "project work")
+
+    def test_agent_nuke_preserves_shared_symlinks_and_directory_replacements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            outside = Path(directory) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (outside / "review-coordinator.md").write_text("outside")
+            (root / "agents").symlink_to(outside, target_is_directory=True)
+            replacement = root / "skills/addyosmani-agent-skills.ref/user-data.txt"
+            replacement.parent.mkdir(parents=True)
+            replacement.write_text("keep")
+
+            agent_nuke.nuke(root, apply=True)
+
+            self.assertTrue((root / "agents").is_symlink())
+            self.assertEqual((outside / "review-coordinator.md").read_text(), "outside")
+            self.assertEqual(replacement.read_text(), "keep")
 
     def test_agent_nuke_preserves_special_file_replacements(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -260,7 +260,9 @@ python3 scripts/agent-nuke.py /path/to/project
 python3 scripts/agent-nuke.py /path/to/project --apply
 ```
 
-`agent-nuke` clears common repository-level agent, skill, governance, and workflow locations—including agent instruction files, agent/configuration directories, workflow metadata, and Agent Canvas artifacts. It preserves normal application files and paths identified as plans, epics, tasks, or specs, including `plans/`, `epics/`, `tasks/`, and `docs/superpowers/specs/`. Review the preview carefully: this is intentionally broader than the official uninstaller and is meant to reset process setup between experiments.
+`agent-nuke` clears common repository-level agent, governance, and workflow locations—including agent instruction files, dot-agent configuration directories, and workflow metadata. It preserves project plans, epics, tasks, and specs, including `plans/`, `epics/`, `tasks/`, and `docs/superpowers/specs/`. Plan-like names inside agent-owned directories such as `.agents/skills/writing-plans/` are removed with that setup.
+
+Shared application directories (`agents/`, `skills/`, `rules/`, and `commands/`) are preserved except for the exact Agent Canvas files `agents/review-coordinator.md` and `skills/addyosmani-agent-skills.ref`. The shared `skills/addyosmani-agent-skills/` payload is preserved; reset detaches its dot-agent setup. Use the official uninstaller's `--mode remove-all` for complete Agent Canvas package removal. Review the preview carefully: reset is intentionally broader than the official uninstaller in the agent and workflow locations it clears.
 
 To include Osmani on a machine/project without an existing installation:
 

@@ -18,15 +18,19 @@ TARGETS = (
     "AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules", ".mcp.json",
     "INSTALL-FOLLOWUP.md", ".owner-override",
     ".owner-override.example", ".agent-canvas", ".agents", ".cline", ".clinerules",
-    ".claude", ".codex", ".cursor", ".github", "agents", "skills", "rules", "commands",
+    ".claude", ".codex", ".cursor", ".github",
     "config/workspace-config.yml", "CODEOWNERS", ".github/CODEOWNERS", "docs/superpowers",
 )
+SHARED_FILES = ("agents/review-coordinator.md", "skills/addyosmani-agent-skills.ref")
+AGENT_TREES = {".agent-canvas", ".agents", ".cline", ".clinerules", ".claude", ".codex", ".cursor"}
 PLAN_PARTS = {"plan", "plans", "epic", "epics", "task", "tasks", "spec", "specs"}
 PLAN_NAME = re.compile(r"(?:^|[-_.])(plan|plans|epic|epics|task|tasks|spec|specs)(?:[-_.]|$)", re.I)
 
 
 def is_plan(path, root):
     relative = path.relative_to(root)
+    if relative.parts[0] in AGENT_TREES:
+        return False
     return any(part.lower() in PLAN_PARTS for part in relative.parts) or bool(PLAN_NAME.search(path.name))
 
 
@@ -60,6 +64,18 @@ def nuke(target, *, apply=False):
         path = root / relative
         if path.exists() or path.is_symlink():
             nuke_path(root, path, actions, apply)
+    # Shared application directories are not agent-owned trees. Only the exact
+    # installed filenames are reset; never recurse into a replacement directory
+    # or follow a shared root symlink to find one of these names.
+    for relative in SHARED_FILES:
+        path = root / relative
+        if path.parent.is_symlink():
+            actions.append(f"PRESERVE SHARED {path.parent.relative_to(root)}")
+        elif path.is_symlink() or path.is_file():
+            safe_path(root, path)
+            actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {relative}")
+            if apply:
+                remove_path(root, path, recursive=False)
     if not actions:
         actions.append("NO AGENT, GOVERNANCE, OR WORKFLOW ARTIFACTS FOUND")
     return apply, actions

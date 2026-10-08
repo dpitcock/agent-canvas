@@ -9,6 +9,11 @@ import uuid
 
 
 class SupervisedRenderer:
+    MAX_TEXT_BYTES = 1024 * 1024
+    MAX_ITEM_IDS = 1024
+    MAX_TURN_IDS = 1024
+    MAX_CHUNKS = 4096
+
     def __init__(
         self, supervisor, task_id, *, project=None, thread_id=None, turn_id=None,
         legacy_test_mode=False,
@@ -27,12 +32,19 @@ class SupervisedRenderer:
         self.thread_id = thread_id
         self.turn_id = turn_id
         self._message_buffers = {}
+        self._buffer_bytes = {}
+        self._retained_bytes = 0
+        self._retained_chunks = 0
+        self._seen_item_ids = set()
+        self._limit_exceeded = False
         self._completed_message_ids = set()
         self._completed_messages = []
         self._completed_turn_ids = set()
         self._completed_turn_lock = threading.Lock()
 
     def consume(self, event):
+        if self._limit_exceeded:
+            return self._limit_error()
         if not isinstance(event, dict):
             return [{"kind": "progress", "event": event}]
         method = event.get("method")
@@ -44,9 +56,9 @@ class SupervisedRenderer:
             return []
         if method == "item/agentMessage/delta":
             self._buffer_agent_message_delta(event)
-            return []
+            return self._limit_error() if self._limit_exceeded else []
         if self._complete_agent_message(event):
-            return []
+            return self._limit_error() if self._limit_exceeded else []
         if isinstance(method, str) and method.startswith("item/"):
             # Other response-item types may also carry assistant content, but
             # only completed agent messages have a safe gated representation.
@@ -60,7 +72,8 @@ class SupervisedRenderer:
         with self._completed_turn_lock:
             if turn_id in self._completed_turn_ids:
                 return []
-            self._remember_completed_turn(turn_id)
+            if not self._remember_completed_turn(turn_id):
+                return self._limit_error()
         if self._turn_status(event) != "completed":
             self._reset_messages()
             return [{"kind": "progress", "event": self._sanitized_turn_completion(event)}]
@@ -115,9 +128,22 @@ class SupervisedRenderer:
         delta = params.get("delta")
         if not isinstance(item_id, str) or not item_id or not isinstance(delta, str):
             return
+        if not delta:
+            return
         if item_id in self._completed_message_ids:
             return
+        if not self._remember_item(item_id):
+            return
+        size = self._text_size(delta)
+        if size is None:
+            return
+        if self._retained_bytes + size > self.MAX_TEXT_BYTES or self._retained_chunks >= self.MAX_CHUNKS:
+            self._fail_limit()
+            return
         self._message_buffers.setdefault(item_id, []).append(delta)
+        self._buffer_bytes[item_id] = self._buffer_bytes.get(item_id, 0) + size
+        self._retained_bytes += size
+        self._retained_chunks += 1
 
     def _complete_agent_message(self, event):
         """Promote only a delta buffer whose ID matches a completed agent message."""
@@ -137,13 +163,27 @@ class SupervisedRenderer:
             return True
         if item_id in self._completed_message_ids:
             return True
+        if not self._remember_item(item_id):
+            return True
         self._completed_message_ids.add(item_id)
         buffer = self._message_buffers.pop(item_id, None)
+        self._retained_bytes -= self._buffer_bytes.pop(item_id, 0)
+        self._retained_chunks -= len(buffer) if buffer is not None else 0
         text = item.get("text")
         if not isinstance(text, str):
             text = "".join(buffer) if buffer is not None else ""
+        size = self._text_size(text)
+        if size is None:
+            return True
+        if self._retained_bytes + size > self.MAX_TEXT_BYTES:
+            self._fail_limit()
+            return True
+        self._retained_bytes += size
         phase = item.get("phase")
-        self._completed_messages.append((phase if isinstance(phase, str) else None, text))
+        phase = phase if phase in ("final_answer", "commentary") else (
+            "unknown" if isinstance(phase, str) else None
+        )
+        self._completed_messages.append((phase, text))
         return True
 
     def _select_final_message(self):
@@ -158,11 +198,55 @@ class SupervisedRenderer:
 
     def _reset_messages(self):
         self._message_buffers.clear()
+        self._buffer_bytes.clear()
         self._completed_messages.clear()
+        self._retained_bytes = 0
+        self._retained_chunks = 0
+
+    @staticmethod
+    def _limit_error():
+        return [{"kind": "error", "message": "renderer_limit_exceeded"}]
+
+    def _fail_limit(self):
+        # A permanent latch permits clearing history without enabling replay.
+        self._limit_exceeded = True
+        self._reset_messages()
+        self._seen_item_ids.clear()
+        self._completed_message_ids.clear()
+        self._completed_turn_ids.clear()
+
+    def _text_size(self, text):
+        # Check characters before encoding so an oversized event cannot force a
+        # second equally large allocation just to determine its UTF-8 size.
+        if len(text) > self.MAX_TEXT_BYTES:
+            self._fail_limit()
+            return None
+        try:
+            size = len(text.encode("utf-8"))
+        except UnicodeEncodeError:
+            self._fail_limit()
+            return None
+        if size > self.MAX_TEXT_BYTES:
+            self._fail_limit()
+            return None
+        return size
+
+    def _remember_item(self, item_id):
+        if len(item_id) > 512 or (
+            item_id not in self._seen_item_ids and len(self._seen_item_ids) >= self.MAX_ITEM_IDS
+        ):
+            self._fail_limit()
+            return False
+        self._seen_item_ids.add(item_id)
+        return True
 
     def _remember_completed_turn(self, turn_id):
         """Remember every completed turn for this renderer/task lifetime."""
+        if len(self._completed_turn_ids) >= self.MAX_TURN_IDS:
+            self._fail_limit()
+            return False
         self._completed_turn_ids.add(turn_id)
+        return True
 
     @staticmethod
     def _valid_identifier(identifier):

@@ -74,6 +74,21 @@ class SupervisedTasks(unittest.TestCase):
         (self.project / "tasks.md").write_text("write-doc: complete\n")
         self.assertEqual(self.host.gate_final("task-1", "attempt-1", "done").kind, "continue")
 
+    def test_action_ids_must_be_nonempty_strings_before_persistence(self):
+        for index, identifier in enumerate((1, True, [], [1], {}, {"id": "x"}, None, "", "  ")):
+            with self.subTest(identifier=identifier):
+                task_id = f"invalid-action-{index}"
+                with self.assertRaisesRegex(ValueError, "actions require"):
+                    self.host.create_task(task_id, self.project, [{"id": identifier, "operation": "write"}])
+                self.assertEqual(list((self.base / "host-state").rglob(f"{task_id}.json")), [])
+
+    def test_action_string_id_survives_reload_and_completion(self):
+        self.host.create_task("task-1", self.project, [{"id": "1", "operation": "write"}])
+        reopened = supervisor.HostSupervisor(self.base / "host-state")
+        self.assertEqual(reopened.gate_final("task-1", "first", "done").next_action["id"], "1")
+        reopened.complete_action("task-1", "1", evidence={"receipt": "checked"})
+        self.assertTrue(reopened.gate_final("task-1", "second", "done").release)
+
     def test_validator_ids_are_unique_nonempty_strings_before_task_creation(self):
         for index, validators in enumerate((
             [{"id": "same", "command": ["true"]}, {"id": "same", "command": ["true"]}],
