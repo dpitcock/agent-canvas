@@ -23,6 +23,144 @@ def load_executor():
 executor = load_executor()
 
 
+class TrustedRuntimeTests(unittest.TestCase):
+    def test_rejects_project_alias_and_unsafe_installed_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project, host = base / "project", base / "host"
+            project.mkdir()
+            host.mkdir()
+            shim = project / "docker"
+            marker = project / "executed"
+            shim.write_text(f"#!/bin/sh\nprintf poison > '{marker}'\n")
+            shim.chmod(0o700)
+            alias = host / "project-alias"
+            alias.symlink_to(shim)
+            writable, nonexecutable = host / "writable", host / "nonexecutable"
+            for path, mode in ((writable, 0o777), (nonexecutable, 0o600)):
+                path.write_text("#!/bin/sh\nexit 0\n")
+                path.chmod(mode)
+            hardlink = host / "hardlink"
+            hardlink_source = host / "hardlink-source"
+            hardlink_source.write_text("#!/bin/sh\nexit 0\n")
+            hardlink_source.chmod(0o700)
+            hardlink.hardlink_to(hardlink_source)
+            request = executor.ExecutionRequest(
+                action_id="unsafe", attempt_id="one", project=project,
+                image="example/tool@sha256:" + "a" * 64, command=["tool"], inputs=[],
+            )
+            for candidate in (alias, writable, nonexecutable, hardlink, host, Path("docker")):
+                with self.subTest(candidate=candidate), \
+                        mock.patch.object(executor, "_TRUSTED_DOCKER_PATHS", (str(candidate),)):
+                    with self.assertRaises(executor.ConfigurationError):
+                        executor.ContainerExecutor.run(request, executor.ProjectIdentity.capture(project), host)
+            self.assertFalse(marker.exists())
+
+    def test_rejects_runtime_owned_by_another_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            runtime = base / "docker"
+            runtime.write_text("#!/bin/sh\nexit 0\n")
+            runtime.chmod(0o700)
+            original_stat = Path.stat
+
+            def foreign_owner(path, *args, **kwargs):
+                info = original_stat(path, *args, **kwargs)
+                if path == runtime:
+                    return SimpleNamespace(st_mode=info.st_mode, st_uid=987654, st_nlink=1)
+                return info
+
+            # Changing ownership requires privilege; keep all other filesystem
+            # behavior real while supplying the foreign-owner stat result.
+            with mock.patch.object(executor, "_TRUSTED_DOCKER_PATHS", (str(runtime),)), \
+                    mock.patch.object(Path, "stat", foreign_owner):
+                with self.assertRaises(executor.ConfigurationError):
+                    executor.ContainerExecutor._select_runtime(project)
+
+    def test_path_shim_never_runs_and_one_canonical_runtime_serves_lifecycle(self):
+        """Bare docker in any lifecycle step would execute the poison shim."""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project, staging, host = base / "project", base / "staging", base / "host"
+            for path in (project, staging, host):
+                path.mkdir(mode=0o700)
+            marker, log = base / "poison-executed", base / "calls"
+            poison = project / "docker"
+            poison.write_text(f"#!/bin/sh\nprintf poison > '{marker}'\nexit 1\n")
+            poison.chmod(0o700)
+            runtime = host / "docker"
+            runtime.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s %s\\n' \"$0\" \"$1\" >> '{log}'\n"
+                'case "$1" in\n'
+                ' version) printf "27\\n" ;;\n'
+                ' image) printf \'{"Id":"sha256:abc","Config":{}}\' ;;\n'
+                ' start) printf "excess output" ;;\n'
+                ' kill|rm) exit 1 ;;\n'
+                ' container) case "$3" in\n'
+                '   --format) printf "exited\\n" ;;\n'
+                '   *) printf "No such container: %s\\n" "$3" >&2; exit 1 ;;\n'
+                ' esac ;;\nesac\n'
+            )
+            runtime.chmod(0o700)
+            alias = host / "docker-alias"
+            alias.symlink_to(runtime)
+            request = executor.ExecutionRequest(
+                action_id="trusted", attempt_id="one", project=project,
+                image="example/tool@sha256:" + "a" * 64, command=["tool"], inputs=[], max_output_bytes=1,
+            )
+            original_stage = executor.stage_inputs
+
+            def change_path(*args, **kwargs):
+                os.environ["PATH"] = str(project)
+                # Changing an installation alias after selection must not change
+                # the executable used for create/start/kill/cleanup.
+                alias.unlink()
+                alias.symlink_to(poison)
+                return original_stage(*args, **kwargs)
+
+            with mock.patch.object(executor, "_TRUSTED_DOCKER_PATHS", (str(alias),)), \
+                    mock.patch.dict(os.environ, {"PATH": "."}), \
+                    mock.patch.object(executor, "stage_inputs", side_effect=change_path):
+                previous = Path.cwd()
+                try:
+                    os.chdir(project)
+                    try:
+                        receipt = executor.ContainerExecutor.run(request, executor.ProjectIdentity.capture(project), staging)
+                    except executor.ConfigurationError:
+                        self.assertFalse(marker.exists(), "project docker shim executed on host")
+                        raise
+                finally:
+                    os.chdir(previous)
+            self.assertFalse(marker.exists())
+            self.assertEqual(log.read_text().splitlines(), [
+                f"{runtime} {verb}" for verb in
+                ("version", "image", "create", "start", "kill", "container", "rm", "container")
+            ])
+            self.assertEqual(receipt.runtime, str(runtime))
+            self.assertTrue(receipt.output_truncated)
+            self.assertTrue(receipt.verify())
+
+    def test_missing_trusted_installation_never_falls_back_to_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory).resolve()
+            marker = project / "executed"
+            shim = project / "docker"
+            shim.write_text(f"#!/bin/sh\nprintf poison > '{marker}'\nexit 1\n")
+            shim.chmod(0o700)
+            request = executor.ExecutionRequest(
+                action_id="missing", attempt_id="one", project=project,
+                image="example/tool@sha256:" + "a" * 64, command=["tool"], inputs=[],
+            )
+            with mock.patch.object(executor, "_TRUSTED_DOCKER_PATHS", (str(project / "missing"),)), \
+                    mock.patch.dict(os.environ, {"PATH": str(project)}):
+                with self.assertRaises(executor.ConfigurationError):
+                    executor.ContainerExecutor.run(request, executor.ProjectIdentity.capture(project), project)
+            self.assertFalse(marker.exists(), "PATH fallback executed a project shim")
+
+
 class StagingTests(unittest.TestCase):
     def test_parent_replacement_after_snapshot_creation_does_not_redirect_stage_io(self):
         """The descriptor-owned stage remains isolated even if its visible path moves."""
@@ -187,6 +325,13 @@ class StagingTests(unittest.TestCase):
 
 
 class RuntimeValidationTests(unittest.TestCase):
+    def setUp(self):
+        # These tests isolate lifecycle/metadata behavior; real executable
+        # selection and subprocess launches are covered by TrustedRuntimeTests.
+        selected = mock.patch.object(executor.ContainerExecutor, "_select_runtime", return_value="/usr/bin/docker")
+        selected.start()
+        self.addCleanup(selected.stop)
+
     def test_parent_replacement_after_create_never_starts_the_container(self):
         """A staging-path swap during Docker create must fail before Docker start."""
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as staging_directory:
@@ -203,7 +348,7 @@ class RuntimeValidationTests(unittest.TestCase):
             )
 
             def create_then_replace(command, *args, **kwargs):
-                if command[:2] == ["docker", "create"]:
+                if command[:2] == ["/usr/bin/docker", "create"]:
                     staging.rename(Path(staging_directory) / "old-staging")
                     replacement.rename(staging)
                 if command[1] == "create":
@@ -404,12 +549,11 @@ class RuntimeValidationTests(unittest.TestCase):
         image_id = "sha256:" + "b" * 64
         for config in ({}, {"Volumes": None}, {"Volumes": {}}):
             with self.subTest(config=config), \
-                    mock.patch.object(executor.shutil, "which", return_value="/usr/bin/docker"), \
                     mock.patch.object(executor.subprocess, "run", side_effect=[
                         SimpleNamespace(stdout="27\n"),
                         SimpleNamespace(stdout=json.dumps({"Id": image_id, "Config": config})),
                     ]):
-                self.assertEqual(executor.ContainerExecutor._check_runtime(request), ("27", image_id))
+                self.assertEqual(executor.ContainerExecutor._check_runtime(request, "/usr/bin/docker"), ("27", image_id))
 
     def test_runtime_rejects_volumes_and_malformed_metadata_before_create(self):
         request = executor.ExecutionRequest(action_id="a", attempt_id="one", project=Path("/tmp/project"),
@@ -422,7 +566,6 @@ class RuntimeValidationTests(unittest.TestCase):
         metadata += [json.dumps({"Id": invalid, "Config": {}}) for invalid in (None, "", "not-an-image")]
         for inspected in metadata:
             with self.subTest(inspected=inspected), \
-                    mock.patch.object(executor.shutil, "which", return_value="/usr/bin/docker"), \
                     mock.patch.object(executor.subprocess, "run", side_effect=[
                         SimpleNamespace(stdout="27\n"), SimpleNamespace(stdout=inspected),
                     ]) as run, \
@@ -444,10 +587,9 @@ class RuntimeValidationTests(unittest.TestCase):
                 return SimpleNamespace(stdout=image_id)
             return SimpleNamespace(stdout=json.dumps({"Id": image_id, "Config": {"Volumes": {"/data": {}}}}))
 
-        with mock.patch.object(executor.shutil, "which", return_value="/usr/bin/docker"), \
-                mock.patch.object(executor.subprocess, "run", side_effect=docker_inspect):
+        with mock.patch.object(executor.subprocess, "run", side_effect=docker_inspect):
             with self.assertRaisesRegex(executor.ConfigurationError, "volumes"):
-                executor.ContainerExecutor._check_runtime(request)
+                executor.ContainerExecutor._check_runtime(request, "/usr/bin/docker")
 
     def test_receipt_is_bound_to_attempt_command_image_and_snapshot(self):
         receipt = executor.ExecutionReceipt.build(action_id="action", attempt_id="attempt", input_digest="1" * 64,
@@ -465,7 +607,7 @@ class RuntimeValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             staged = Path(directory) / "inputs"
             staged.mkdir()
-            plan = executor.ContainerExecutor.plan(request, staged, "agent-canvas-test")
+            plan = executor.ContainerExecutor.plan(request, staged, "agent-canvas-test", runtime="/usr/bin/docker")
         self.assertIn("--network", plan)
         self.assertIn("none", plan)
         self.assertIn("--read-only", plan)
@@ -490,33 +632,33 @@ class RuntimeValidationTests(unittest.TestCase):
 
     def test_container_removal_failure_is_reported_without_skipping_stage_cleanup(self):
         with mock.patch.object(executor.subprocess, "run", side_effect=executor.subprocess.TimeoutExpired("docker", 10)):
-            self.assertFalse(executor.ContainerExecutor._remove_container("agent-canvas-test"))
+            self.assertFalse(executor.ContainerExecutor._remove_container("agent-canvas-test", "/usr/bin/docker"))
 
     def test_container_cleanup_removes_anonymous_volumes(self):
         """Dropping -v would leave image-declared anonymous volumes behind."""
         removed = mock.Mock(returncode=0)
         with mock.patch.object(executor.subprocess, "run", return_value=removed) as run:
-            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test"))
-        self.assertEqual(run.call_args.args[0], ["docker", "rm", "-f", "-v", "agent-canvas-test"])
+            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test", "/usr/bin/docker"))
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/docker", "rm", "-f", "-v", "agent-canvas-test"])
 
     def test_container_cleanup_accepts_confirmed_absence_after_create_ambiguity(self):
         failed_remove = mock.Mock(returncode=1)
         absent = mock.Mock(returncode=1, stderr=b"Error: No such container: agent-canvas-test\n")
         with mock.patch.object(executor.subprocess, "run", side_effect=[failed_remove, absent]) as run:
-            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test"))
+            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test", "/usr/bin/docker"))
         self.assertEqual(run.call_args_list[1].args[0][-2:], ["inspect", "agent-canvas-test"])
 
     def test_container_cleanup_accepts_inspect_missing_object_diagnostic(self):
         failed_remove = mock.Mock(returncode=1)
         absent = mock.Mock(returncode=1, stderr=b"Error: No such object: agent-canvas-test\n")
         with mock.patch.object(executor.subprocess, "run", side_effect=[failed_remove, absent]):
-            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test"))
+            self.assertTrue(executor.ContainerExecutor._remove_container("agent-canvas-test", "/usr/bin/docker"))
 
     def test_container_cleanup_rejects_ambiguous_inspect_error(self):
         failed_remove = mock.Mock(returncode=1)
         daemon_error = mock.Mock(returncode=1, stderr=b"Cannot connect to the Docker daemon")
         with mock.patch.object(executor.subprocess, "run", side_effect=[failed_remove, daemon_error]):
-            self.assertFalse(executor.ContainerExecutor._remove_container("agent-canvas-test"))
+            self.assertFalse(executor.ContainerExecutor._remove_container("agent-canvas-test", "/usr/bin/docker"))
 
     def test_stage_removal_failure_is_explicit(self):
         with mock.patch.object(executor.shutil, "rmtree", side_effect=OSError("busy")):

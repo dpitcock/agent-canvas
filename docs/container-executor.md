@@ -33,7 +33,7 @@ the temporary path—must not read.  It remains a host-owned, read-only containe
 mount; the executor deletes it after execution.
 
 The returned receipt binds the action and attempt identifiers, staged-input
-digest, exact command, pinned image, observed runtime version, status,
+digest, exact command, pinned image, canonical absolute runtime path, observed runtime version, status,
 timeout/cancellation state, and bounded output digest.  `receipt.matches()`
 must be checked against the host task's current values before using it.
 
@@ -54,6 +54,23 @@ host account is outside this boundary.
 Docker must be installed, its daemon running, and the exact pinned image must
 already be present; otherwise the executor fails closed and never invokes a
 host validator command.  It uses no image pull fallback.
+
+The host-owned executor selects Docker only from these fixed installation
+paths, in order: `/Applications/Docker.app/Contents/Resources/bin/docker`
+(Docker Desktop on macOS), `/usr/bin/docker`, and `/usr/local/bin/docker`.
+There is no request, project configuration, environment-variable, or `PATH`
+override. Installations elsewhere are unsupported and fail closed when none
+of these paths is usable. Symlink aliases are resolved before execution; the
+canonical target must be outside the project, a singly linked regular
+executable owned by root or the current host account, and not writable by
+group or other users. That one absolute path is used for every lifecycle
+command, including cleanup, and is recorded in `receipt.runtime`. Changing
+`PATH` or an installation alias during a run cannot select another executable.
+
+Installation directories and their administrators are trusted, including
+admin-writable macOS application directories. This pins an executable path,
+not its inode: replacing the binary or its ancestors through host-account or
+administrator control remains outside the local-development boundary above.
 
 ## Verification
 
