@@ -2,6 +2,7 @@
 """Install Agent Canvas additively; leave semantic conflicts for the project owner."""
 
 import argparse
+from contextlib import contextmanager
 import difflib
 import hashlib
 import importlib.util
@@ -12,6 +13,7 @@ import re
 import subprocess
 import tempfile
 import stat
+import uuid
 
 SOURCE = Path(__file__).resolve().parents[1]
 IGNORE = ("/.owner-override", "/.agents/skills/addy-*/", "/skills/addyosmani-agent-skills/")
@@ -243,16 +245,40 @@ def read_regular_text(root, path, *, missing=None):
     return regular_text_snapshot(root, path, missing=missing)[0]
 
 
+@contextmanager
+def pinned_parent(root, path, *, create=False):
+    """Traverse project directories without following replacement symlinks."""
+    safe_destination(root, path)
+    relative = path.relative_to(root)
+    if not relative.parts or ".." in relative.parts:
+        raise ValueError(f"Destination is outside project: {path}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(root, flags)
+    try:
+        for name in relative.parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(name, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            child = os.open(name, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor, relative.name
+    finally:
+        os.close(descriptor)
+
+
 def write_regular_text(root, path, text, *, create=False, identity=None):
     """Replace a descriptor-pinned regular project file without following links."""
-    safe_destination(root, path)
-    if create:
-        path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     if create:
         flags |= os.O_CREAT | (os.O_EXCL if identity is None else 0)
     try:
-        descriptor = os.open(path, flags, 0o666)
+        with pinned_parent(root, path, create=create) as (parent, name):
+            descriptor = os.open(name, flags, 0o666, dir_fd=parent)
     except OSError as error:
         raise ValueError(f"Cannot safely update regular file: {path}") from error
     current = os.fstat(descriptor)
@@ -360,14 +386,19 @@ def save_state(root, state):
     text = json.dumps(state, indent=2, sort_keys=True) + "\n"
     if path.exists() and path.read_text() == text:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
-        out.write(text)
-        temporary = Path(out.name)
-    try:
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with pinned_parent(root, path, create=True) as (parent, name):
+        temporary = ".state-" + uuid.uuid4().hex
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as out:
+                out.write(text)
+            os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=parent)
+            except FileNotFoundError:
+                pass
 
 
 def merge_text(base, local, incoming):
@@ -650,9 +681,7 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
         else:
             actions.append(f"{'ADD' if active else 'WOULD ADD'} {name}")
             if active:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("x") as out:
-                    out.write(content)
+                write_regular_text(root, path, content, create=True)
                 provenance["managed_files"].append(name)
     ignore_path = root / ".gitignore"
     ignore = read_regular_text(root, ignore_path, missing="")
@@ -732,8 +761,7 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
     if followup.exists():
         actions.append("KEEP INSTALL-FOLLOWUP.md unchanged; rescan live files when running its prompt")
     else:
-        with followup.open("x") as out:
-            out.write(prompt)
+        write_regular_text(root, followup, prompt, create=True)
         actions.append("ADD INSTALL-FOLLOWUP.md (ready-to-run conflict-resolution prompt)")
     if active and prior_state is None:
         state = dict(schema_version=1, package_version=digest(files), options=options,

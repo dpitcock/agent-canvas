@@ -237,7 +237,7 @@ python3 scripts/uninstall.py /path/to/project
 python3 scripts/uninstall.py /path/to/project --apply
 ```
 
-The default `preserve` mode removes unchanged installer-owned discovery links and removes the package's own ignore entries and marked follow-up section from regular files with only one hard link. It retains managed files, the installation record, and the skill pack, even when unchanged: verification cannot safely bind a later pathname deletion to the verified object. Preview and apply both report these retained paths as `PRESERVE`; use `remove-all` for their cleanup. Project notes and preexisting or modified files remain preserved.
+The default `preserve` mode removes the package's own ignore entries and marked follow-up section from regular files with only one hard link. It retains discovery links, managed files, the installation record, and the skill pack, even when unchanged: verification cannot safely bind a later pathname deletion to the verified object. Preview and apply both report these retained paths as `PRESERVE`; use `remove-all` for their cleanup. Project notes and preexisting or modified files remain preserved.
 
 To deliberately remove every known Agent Canvas path, including edits to its managed files, use `remove-all`:
 
@@ -246,6 +246,8 @@ python3 scripts/uninstall.py /path/to/project --mode remove-all --apply
 ```
 
 `remove-all` deletes the complete Agent Canvas follow-up file as well as managed settings, installed skill links/packs, and the installation record. It still does not touch application code, Git history, or unrelated project files.
+
+Even without readable installation history, `remove-all` removes the three exact fixed ignore entries (`/.owner-override`, `/.agents/skills/addy-*/`, and `/skills/addyosmani-agent-skills/`). It preserves unrelated ignore text and dynamic Cline entries without recorded ownership.
 
 ### Clear agent and governance setup: `agent-nuke`
 

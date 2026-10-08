@@ -309,7 +309,7 @@ def planned_regular_removal(root, path, actions, apply, identity):
     return True
 
 
-def remove_ignore_entries(root, state, actions, apply):
+def remove_ignore_entries(root, state, actions, apply, *, remove_all=False):
     path = root / ".gitignore"
     safe_path(root, path)
     if not path.exists():
@@ -331,6 +331,10 @@ def remove_ignore_entries(root, state, actions, apply):
                    for relative in adapter_links(state)
                    if relative.startswith(".cline/skills/"))
     entries &= allowed
+    if remove_all:
+        # Explicit removal authorizes these exact fixed package entries even
+        # when damaged/missing history cannot establish their provenance.
+        entries.update(IGNORE)
     try:
         old, identity = regular_text_snapshot(root, path)
     except ValueError:
@@ -427,7 +431,12 @@ def uninstall(target, *, mode="preserve", apply=False):
         safe_path(root, path)
         exact = path.is_symlink() and os.readlink(path) == expected
         if exact:
-            planned_removal(root, path, actions, apply)
+            if mode == "remove-all":
+                planned_removal(root, path, actions, apply)
+            else:
+                # As with regular files, there is no portable unlink of the
+                # verified object. Never recursively remove a replacement.
+                actions.append(f"PRESERVE {relative}: cleanup requires --mode remove-all")
         elif path.exists() or path.is_symlink():
             actions.append(f"PRESERVE {relative}: owned link was changed")
             try:
@@ -486,8 +495,8 @@ def uninstall(target, *, mode="preserve", apply=False):
         else:
             actions.append("PRESERVE skills/addyosmani-agent-skills: not proven to be an unchanged Agent Canvas pack")
 
-    if state:
-        remove_ignore_entries(root, state, actions, apply)
+    if state or mode == "remove-all":
+        remove_ignore_entries(root, state or {}, actions, apply, remove_all=mode == "remove-all")
     if mode == "remove-all":
         planned_removal(root, root / FOLLOWUP, actions, apply)
     elif state:

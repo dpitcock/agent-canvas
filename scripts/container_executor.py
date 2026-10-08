@@ -467,12 +467,26 @@ class ContainerExecutor:
                                      capture_output=True, text=True, timeout=5, check=True).stdout.strip()
             # Inspect is intentionally before create: Docker create otherwise pulls a
             # missing image, which makes an unapproved image available implicitly.
-            image_id = subprocess.run([cls.RUNTIME, "image", "inspect", request.image, "--format", "{{.Id}}"],
-                                      capture_output=True, text=True, timeout=5, check=True).stdout.strip()
+            image_metadata = subprocess.run([cls.RUNTIME, "image", "inspect", request.image, "--format", "{{json .}}"],
+                                            capture_output=True, text=True, timeout=5, check=True).stdout.strip()
         except (OSError, subprocess.SubprocessError) as error:
             raise ConfigurationError("Docker daemon or the pinned image is unavailable") from error
-        if not version or not image_id.startswith("sha256:"):
+        try:
+            image = json.loads(image_metadata)
+        except (ValueError, TypeError) as error:
+            raise ConfigurationError("Docker returned invalid image metadata") from error
+        if not isinstance(image, dict) or not isinstance(image.get("Config"), dict):
+            raise ConfigurationError("Docker returned invalid image metadata")
+        image_id = image.get("Id")
+        if not version or not isinstance(image_id, str) or not image_id.startswith("sha256:"):
             raise ConfigurationError("Docker did not report an immutable server and image identity")
+        volumes = image["Config"].get("Volumes")
+        if volumes is not None and not isinstance(volumes, dict):
+            raise ConfigurationError("Docker returned invalid image volumes metadata")
+        # Image-declared anonymous volumes remain writable with --read-only
+        # and are not constrained by the explicit tmpfs size limits.
+        if volumes:
+            raise ConfigurationError("image-declared volumes are not permitted")
         return version, image_id
 
     @classmethod
@@ -542,9 +556,9 @@ class ContainerExecutor:
                 )
                 if created.returncode:
                     raise ConfigurationError("Docker rejected the required isolation configuration")
-                # Docker create resolves the bind source.  Check again before
-                # start so a parent replacement can never execute a container
-                # mounted from a substitute pathname.
+                # Recheck the staging pathname before start.  Docker resolves
+                # the bind mount during start, so this is not atomic binding;
+                # host-account staging mutation is outside this boundary.
                 snapshot.visible_root()
                 if cancellation is not None and cancellation.is_set():
                     cancelled, status = True, "cancelled"

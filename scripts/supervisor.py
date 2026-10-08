@@ -330,8 +330,15 @@ class HostSupervisor:
         return event
 
     def audit(self, task_id, *, project=None):
-        path = self._event_path(task_id, project)
-        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        # The terminal decision and its audit event share one atomic task write.
+        # Progress events remain in JSONL; it is not the complete delivery ledger.
+        with self._locked_task(task_id, project=project) as task:
+            path = self._event_path(task_id, project)
+            events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+            events = [event for event in events if event["task_id"] == task_id]
+            if task.get("release_event"):
+                events.append(task["release_event"])
+            return sorted(events, key=lambda event: event["at"])
 
     @staticmethod
     def _task_definition(action_map, validators, blockers, permitted_operations):
@@ -394,6 +401,25 @@ class HostSupervisor:
 
     def _save_task(self, task):
         self._write(self._task_path(task["task_id"], task["project"]), task)
+
+    def _commit_release(self, task, attempt_id, message, *, blocker=False):
+        """Commit release authorization, message and audit evidence together.
+
+        This records a host decision, not an acknowledgement that a UI rendered
+        it. A client crash after this commit can recover the visible message.
+        """
+        task["release_event"] = {
+            "at": _now(), "task_id": task["task_id"],
+            "type": "blocker_release_committed" if blocker else "final_release_committed",
+            "attempt_id": attempt_id,
+            "content_digest": hashlib.sha256(message.encode()).hexdigest(),
+        }
+        if blocker:
+            task["release_event"]["blocker_id"] = task["blockers"][0].get("id")
+        task["visible_messages"].append(message)
+        task["status"] = "blocked" if blocker else "complete"
+        self._save_task(task)
+        return Decision("blocker" if blocker else "complete", release=True, message=message)
 
     def _remaining(self, task):
         return [(action_id, action) for action_id, action in task["actions"].items() if action["status"] != "complete"]
@@ -635,19 +661,9 @@ class HostSupervisor:
             if task["blockers"]:
                 blocker = task["blockers"][0]
                 message = blocker.get("owner_action", "Owner authorization is required.")
-                self._event(task_id, "blocker_delivered", project=task["project"], blocker_id=blocker.get("id"))
-                task["visible_messages"].append(message)
-                task["status"] = "blocked"
-                self._save_task(task)
-                return Decision("blocker", release=True, message=message)
+                return self._commit_release(task, attempt_id, message, blocker=True)
             if not task["validators"]:
-                # Audit failure must leave delivery retryable.  Commit terminal
-                # state only after all fallible audit writes, under this lock.
-                self._event(task_id, "final_released", project=task["project"], attempt_id=attempt_id)
-                task["visible_messages"].append(content)
-                task["status"] = "complete"
-                self._save_task(task)
-                return Decision("complete", release=True, message=content)
+                return self._commit_release(task, attempt_id, content)
             self._event(task_id, "validation_started", project=task["project"], attempt_id=attempt_id)
             task["status"] = "validating"
             task["validation_attempt"] = attempt_id
@@ -667,11 +683,7 @@ class HostSupervisor:
                     current["status"] = "active"
                     self._save_task(current)
                     return Decision("continue", message="Host validator failed; repair the reported action.")
-                self._event(task_id, "final_released", project=current["project"], attempt_id=attempt_id)
-                current["visible_messages"].append(content)
-                current["status"] = "complete"
-                self._save_task(current)
-                return Decision("complete", release=True, message=content)
+                return self._commit_release(current, attempt_id, content)
         except Exception:
             # Validation and delivery-audit failures both release this attempt's
             # claim, so the renderer can retry without explicit recovery.

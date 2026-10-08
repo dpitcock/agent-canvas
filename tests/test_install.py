@@ -21,6 +21,106 @@ nuke_spec.loader.exec_module(agent_nuke)
 
 
 class InstallSmoke(unittest.TestCase):
+    def test_preserve_adapter_replacement_directory_survives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve() / "project"
+            link = root / ".agents/skills/addy-example"
+            link.parent.mkdir(parents=True)
+            expected = "../../skills/addyosmani-agent-skills/skills/example"
+            link.symlink_to(expected)
+            state = root / ".agent-canvas/state.json"
+            state.parent.mkdir()
+            state.write_text(json.dumps({"schema_version": 1, "baselines": {},
+                                         "adapters": {"links": {".agents/skills/addy-example": expected}}}))
+            readlink = os.readlink
+
+            def replace_after_read(path, *args, **kwargs):
+                value = readlink(path, *args, **kwargs)
+                if path == link:
+                    link.unlink()
+                    link.mkdir()
+                    (link / "application.txt").write_text("keep")
+                return value
+
+            with patch.object(os, "readlink", replace_after_read):
+                uninstaller.uninstall(root, apply=True)
+            self.assertTrue((link / "application.txt").exists())
+
+    def test_remove_all_cleans_fixed_ignore_entries_without_valid_state(self):
+        for damaged in (False, True):
+            with self.subTest(damaged=damaged), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                ignore = root / ".gitignore"
+                original = "app-cache\n/.owner-override\n/.agents/skills/addy-*/\n/skills/addyosmani-agent-skills/\n/.cline/skills/custom\n"
+                ignore.write_text(original)
+                if damaged:
+                    state = root / ".agent-canvas/state.json"
+                    state.parent.mkdir()
+                    state.write_text("broken json")
+                _, preview = uninstaller.uninstall(root, mode="remove-all")
+                self.assertEqual(ignore.read_text(), original)
+                self.assertTrue(any(action.startswith("WOULD UPDATE .gitignore") for action in preview))
+                uninstaller.uninstall(root, mode="remove-all", apply=True)
+                self.assertEqual(ignore.read_text(), "app-cache\n/.cline/skills/custom\n")
+
+    def test_missing_managed_file_creation_rejects_swapped_parent(self):
+        for fresh in (False, True):
+            with self.subTest(fresh=fresh), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve()
+                root = base / "project"
+                root.mkdir()
+                config = root / "config"
+                config.mkdir()
+                outside = base / "outside"
+                outside.mkdir()
+                destination = config / "workspace-config.yml"
+                safe_destination = installer.safe_destination
+                swapped = False
+                checks = 0
+
+                def swap_after_check(checked_root, path):
+                    nonlocal swapped, checks
+                    safe_destination(checked_root, path)
+                    if path == destination:
+                        checks += 1
+                    if path == destination and checks == (2 if fresh else 1) and not swapped:
+                        swapped = True
+                        config.rmdir()
+                        config.symlink_to(outside, target_is_directory=True)
+
+                with patch.object(installer, "safe_destination", swap_after_check):
+                    try:
+                        if fresh:
+                            installer.install(root, skills=False, apply=True, home=base / "home")
+                        else:
+                            installer.write_regular_text(root, destination, "managed", create=True)
+                    except (ValueError, OSError):
+                        pass
+                self.assertTrue(swapped)
+                self.assertFalse((outside / "workspace-config.yml").exists())
+
+    def test_managed_write_stays_with_pinned_parent_after_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            config = root / "config"
+            config.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            held = root / "original-config"
+            open_descriptor = os.open
+
+            def replace_opened_parent(path, flags, *args, **kwargs):
+                descriptor = open_descriptor(path, flags, *args, **kwargs)
+                if path == "config" and flags & os.O_DIRECTORY:
+                    config.rename(held)
+                    config.symlink_to(outside, target_is_directory=True)
+                return descriptor
+
+            with patch.object(os, "open", replace_opened_parent):
+                installer.write_regular_text(root, config / "workspace-config.yml", "managed", create=True)
+            self.assertFalse((outside / "workspace-config.yml").exists())
+            self.assertEqual((held / "workspace-config.yml").read_text(), "managed")
+
     def test_preserve_uninstall_keeps_hardlinked_ignore_and_followup_in_preview_and_apply(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -210,7 +310,7 @@ class InstallSmoke(unittest.TestCase):
             (preserved / ".gitignore").write_text("app-cache\n" + (preserved / ".gitignore").read_text())
             active, actions = uninstaller.uninstall(preserved, mode="preserve")
             self.assertFalse(active)
-            self.assertTrue(any(action.startswith("WOULD REMOVE") for action in actions))
+            self.assertTrue(any(action.startswith("PRESERVE .agents/skills/") for action in actions))
             uninstaller.uninstall(preserved, mode="preserve", apply=True)
             self.assertEqual((preserved / "AGENTS.md").read_text(), "Project additions\n")
             self.assertEqual((preserved / ".gitignore").read_text(), "app-cache\n")

@@ -195,9 +195,13 @@ class SupervisedRenderer:
         params = event.get("params")
         if not isinstance(params, dict):
             return "unknown"
-        status = params.get("status")
-        if status is None and isinstance(params.get("turn"), dict):
-            status = params["turn"].get("status")
-        if isinstance(status, str) and status in {"completed", "failed", "interrupted", "cancelled"}:
-            return status
-        return "unknown"
+        sources = [params]
+        if isinstance(params.get("turn"), dict):
+            sources.append(params["turn"])
+        statuses = [source["status"] for source in sources if "status" in source]
+        if not statuses or any(
+            not isinstance(status, str) or status not in {"completed", "failed", "interrupted", "cancelled"}
+            for status in statuses
+        ):
+            return "unknown"
+        return statuses[0] if all(status == statuses[0] for status in statuses) else "unknown"

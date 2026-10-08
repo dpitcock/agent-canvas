@@ -21,6 +21,10 @@ snapshot is the sole bind mount and is read-only.  The container has no Docker
 socket, no host state, no host home, no inherited environment, no project
 mount, no network, no Linux capabilities, a non-root user, a read-only root,
 bounded tmpfs, memory, CPUs, pids, files, runtime, and captured output.
+Images declaring volumes are rejected before container creation: their
+anonymous writable volumes would bypass the explicit tmpfs size limits even
+with a read-only root filesystem. Unreadable or malformed image metadata is
+also rejected.
 
 The stage permits traversal and read access through declared paths while it
 exists so the fixed container UID can consume it.  Declared input must not
@@ -42,6 +46,10 @@ account can bypass container restrictions.  Do not store credentials or
 supervisor state in a location accessible to that actor, and do not use this
 executor as proof of safe execution of hostile code.  A separately operated
 Linux VM or remote sandbox remains necessary for that stronger claim.
+The executor rechecks the staging pathname before starting the container, but
+Docker resolves the bind mount during start; the check does not atomically pin
+that mount. Concurrent host-side staging mutation by an actor controlling the
+host account is outside this boundary.
 
 Docker must be installed, its daemon running, and the exact pinned image must
 already be present; otherwise the executor fails closed and never invokes a

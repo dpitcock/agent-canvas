@@ -1,5 +1,6 @@
 """Unit tests for the standalone, host-owned container execution boundary."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -396,6 +397,57 @@ class RuntimeValidationTests(unittest.TestCase):
                                             image="example.invalid/tool@sha256:" + "a" * 64,
                                             command=["true"], inputs=[])
         self.assertEqual(request.command, ("true",))
+
+    def test_runtime_accepts_volume_free_image_metadata(self):
+        request = executor.ExecutionRequest(action_id="a", attempt_id="one", project=Path("/tmp/project"),
+                                            image="example/tool@sha256:" + "a" * 64, command=["true"], inputs=[])
+        image_id = "sha256:" + "b" * 64
+        for config in ({}, {"Volumes": None}, {"Volumes": {}}):
+            with self.subTest(config=config), \
+                    mock.patch.object(executor.shutil, "which", return_value="/usr/bin/docker"), \
+                    mock.patch.object(executor.subprocess, "run", side_effect=[
+                        SimpleNamespace(stdout="27\n"),
+                        SimpleNamespace(stdout=json.dumps({"Id": image_id, "Config": config})),
+                    ]):
+                self.assertEqual(executor.ContainerExecutor._check_runtime(request), ("27", image_id))
+
+    def test_runtime_rejects_volumes_and_malformed_metadata_before_create(self):
+        request = executor.ExecutionRequest(action_id="a", attempt_id="one", project=Path("/tmp/project"),
+                                            image="example/tool@sha256:" + "a" * 64, command=["true"], inputs=[])
+        image_id = "sha256:" + "b" * 64
+        metadata = ["not json", "null", "[]", "{}"]
+        metadata += [json.dumps({"Id": image_id, "Config": config}) for config in (
+            None, [], {"Volumes": {"/data": {}}}, {"Volumes": []}, {"Volumes": ""}, {"Volumes": False},
+        )]
+        metadata += [json.dumps({"Id": invalid, "Config": {}}) for invalid in (None, "", "not-an-image")]
+        for inspected in metadata:
+            with self.subTest(inspected=inspected), \
+                    mock.patch.object(executor.shutil, "which", return_value="/usr/bin/docker"), \
+                    mock.patch.object(executor.subprocess, "run", side_effect=[
+                        SimpleNamespace(stdout="27\n"), SimpleNamespace(stdout=inspected),
+                    ]) as run, \
+                    mock.patch.object(executor.PinnedProject, "open") as open_project:
+                with self.assertRaises(executor.ConfigurationError):
+                    executor.ContainerExecutor.run(request, executor.ProjectIdentity(1, 2), Path("/tmp/stage"))
+                open_project.assert_not_called()
+                self.assertEqual(run.call_count, 2)
+
+    def test_image_declared_volume_is_rejected_even_with_valid_image_id(self):
+        request = executor.ExecutionRequest(action_id="a", attempt_id="one", project=Path("/tmp/project"),
+                                            image="example/tool@sha256:" + "a" * 64, command=["true"], inputs=[])
+        image_id = "sha256:" + "b" * 64
+
+        def docker_inspect(argv, **kwargs):
+            if argv[1] == "version":
+                return SimpleNamespace(stdout="27\n")
+            if argv[-1] == "{{.Id}}":
+                return SimpleNamespace(stdout=image_id)
+            return SimpleNamespace(stdout=json.dumps({"Id": image_id, "Config": {"Volumes": {"/data": {}}}}))
+
+        with mock.patch.object(executor.shutil, "which", return_value="/usr/bin/docker"), \
+                mock.patch.object(executor.subprocess, "run", side_effect=docker_inspect):
+            with self.assertRaisesRegex(executor.ConfigurationError, "volumes"):
+                executor.ContainerExecutor._check_runtime(request)
 
     def test_receipt_is_bound_to_attempt_command_image_and_snapshot(self):
         receipt = executor.ExecutionReceipt.build(action_id="action", attempt_id="attempt", input_digest="1" * 64,

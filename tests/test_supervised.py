@@ -383,9 +383,9 @@ class SupervisedTasks(unittest.TestCase):
 
     def test_delivery_audit_failure_can_retry_without_losing_or_duplicating_output(self):
         cases = (
-            ("plain", [], [], "final_released", "complete", "finished"),
-            ("validated", [{"id": "check", "command": ["true"]}], [], "final_released", "complete", "finished"),
-            ("blocker", [], [{"id": "choice", "owner_action": "Choose a region."}], "blocker_delivered", "blocker", "Choose a region."),
+            ("plain", [], [], "final_attempt", "complete", "finished"),
+            ("validated", [{"id": "check", "command": ["true"]}], [], "validator_received", "complete", "finished"),
+            ("blocker", [], [{"id": "choice", "owner_action": "Choose a region."}], "final_attempt", "blocker", "Choose a region."),
             ("validation-start", [{"id": "check", "command": ["true"]}], [], "validation_started", "complete", "finished"),
             ("validation-receipt", [{"id": "check", "command": ["true"]}], [], "validator_received", "complete", "finished"),
         )
@@ -417,6 +417,59 @@ class SupervisedTasks(unittest.TestCase):
                 self.assertEqual(renderer.consume(completion), [])
                 self.assertFalse(self.host.gate_final(task_id, "replay", "finished").release)
                 self.assertEqual(self.host.visible_messages(task_id), [message])
+
+    def test_failed_terminal_state_write_does_not_audit_a_successful_release(self):
+        for task_id, validators, blockers, message in (
+            ("plain", [], [], "finished"),
+            ("validated", [{"id": "check", "command": ["true"]}], [], "finished"),
+            ("blocker", [], [{"id": "choice", "owner_action": "Choose."}], "Choose."),
+        ):
+            with self.subTest(task_id=task_id):
+                self.host.create_task(task_id, self.project, [], validators=validators, blockers=blockers)
+                renderer = self.renderer(task_id)
+                renderer.consume({"method": "item/completed", "params": {"item": {
+                    "type": "agentMessage", "id": "final", "phase": "final_answer", "text": "finished",
+                }}})
+                completion = {"method": "turn/completed", "params": {"turnId": "turn-1", "status": "completed"}}
+                original_replace = supervisor.os.replace
+
+                def fail_terminal_replace(source, destination):
+                    candidate = supervisor.json.loads(Path(source).read_text())
+                    if candidate["status"] in {"complete", "blocked"}:
+                        raise OSError("state unavailable")
+                    return original_replace(source, destination)
+
+                release_types = {"final_released", "blocker_delivered", "final_release_committed", "blocker_release_committed"}
+                with patch.object(supervisor.os, "replace", side_effect=fail_terminal_replace):
+                    with self.assertRaisesRegex(OSError, "state unavailable"):
+                        renderer.consume(completion)
+                self.assertEqual(self.host.task(task_id)["status"], "active")
+                self.assertEqual(self.host.visible_messages(task_id), [])
+                self.assertFalse(any(e["type"] in release_types for e in self.host.audit(task_id)))
+                self.assertEqual(renderer.consume(completion)[0]["content"], message)
+                self.assertEqual(renderer.consume(completion), [])
+                reopened = supervisor.HostSupervisor(self.base / "host-state")
+                releases = [e for e in reopened.audit(task_id) if e["task_id"] == task_id and e["type"] in release_types]
+                self.assertEqual(len(releases), 1)
+                self.assertEqual(reopened.visible_messages(task_id), [message])
+
+    def test_release_commit_survives_client_failure_without_claiming_display(self):
+        self.host.create_task("task-1", self.project, [])
+        original_save = self.host._save_task
+
+        def fail_after_commit(task):
+            original_save(task)
+            raise OSError("client lost response")
+
+        with patch.object(self.host, "_save_task", side_effect=fail_after_commit):
+            with self.assertRaisesRegex(OSError, "client lost response"):
+                self.host.gate_final("task-1", "first", "finished")
+        reopened = supervisor.HostSupervisor(self.base / "host-state")
+        self.assertEqual(reopened.visible_messages("task-1"), ["finished"])
+        self.assertFalse(reopened.gate_final("task-1", "retry", "finished").release)
+        events = reopened.audit("task-1")
+        self.assertEqual([e["type"] for e in events].count("final_release_committed"), 1)
+        self.assertNotIn("final_released", [e["type"] for e in events])
 
     def test_completed_final_is_not_released_twice_when_a_turn_is_replayed(self):
         self.task()
@@ -1147,6 +1200,37 @@ class SupervisedTasks(unittest.TestCase):
                 }})
                 output = renderer.consume({"method": "turn/completed", "params": {"turnId": "turn-1", "status": "completed"}})
                 self.assertEqual(output[0]["content"], "complete text")
+
+    def test_conflicting_statuses_never_release_bound_turn_but_consistent_forms_do(self):
+        cases = [
+            ({"status": "completed", "turn": {"status": other}}, False)
+            for other in ("failed", "interrupted", "cancelled", "unknown", None, [], {})
+        ] + [
+            ({"status": other, "turn": {"status": "completed"}}, False)
+            for other in ("failed", "interrupted", "cancelled", "unknown", None, [], {})
+        ] + [
+            ({"status": "completed"}, True),
+            ({"turn": {"status": "completed"}}, True),
+            ({"status": "completed", "turn": {"status": "completed"}}, True),
+        ]
+        for index, (params, release) in enumerate(cases):
+            with self.subTest(params=params):
+                task_id = f"status-{index}"
+                self.host.create_task(task_id, self.project, [])
+                renderer = client.SupervisedRenderer(self.host, task_id, thread_id="thread-1", turn_id="turn-1")
+                renderer.consume({"method": "item/completed", "params": {
+                    "threadId": "thread-1", "turnId": "turn-1", "item": {
+                        "id": "final", "type": "agentMessage", "phase": "final_answer", "text": "private candidate",
+                    },
+                }})
+                output = renderer.consume({"method": "turn/completed", "params": {
+                    **params, "threadId": "thread-1", "turnId": "turn-1",
+                }})
+                self.assertEqual(any(item["kind"] == "final" for item in output), release)
+                self.assertEqual(self.host.visible_messages(task_id), ["private candidate"] if release else [])
+                if not release:
+                    self.assertNotIn("private candidate", str(output))
+                    self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit(task_id)])
 
     def test_non_successful_turn_statuses_discard_candidate_text_without_gating(self):
         """Treat missing, cancelled, and unknown statuses as non-successful turns."""

@@ -6,7 +6,9 @@ One host state directory can serve multiple projects. Every task operation accep
 
 The custom renderer consumes Codex App Server item events. It forwards progress but buffers `item/agentMessage/delta` content. Only after `turn/completed` does it ask the host supervisor to release content. Remaining host actions queue a continuation instead; a blocker is delivered only after no independently authorized action remains.
 
-The POC uses atomic replacement for task state and fsynced append-only audit events. It recovers a leased side-effect action as `reconcile`, never a second dispatch. Pause and cancellation are persisted and disable automatic continuation.
+The POC uses atomic replacement for task state and fsynced append-only progress audit events. Terminal release authorization, its message, and its audit event are committed together in the task file; a failed state write cannot leave a successful release event behind. `HostSupervisor.audit(task_id)` combines that task's progress log with its committed release event. Reading `audit.jsonl` alone is not a complete audit. Existing historical JSONL events remain readable.
+
+`final_release_committed` and `blocker_release_committed` mean the host authorized release, not that a UI acknowledged rendering. A client crash after commitment does not cause an automatic second release; clients can recover the saved message using `visible_messages`. Exactly-once display across client crashes is not guaranteed by this POC. It recovers a leased side-effect action as `reconcile`, never a second dispatch. Pause and cancellation are persisted and disable automatic continuation.
 
 ## Boundary and limitations
 
