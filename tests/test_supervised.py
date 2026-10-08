@@ -40,6 +40,25 @@ def complete_from_another_process(state_dir, project, start, action_id):
 
 
 class SupervisedTasks(unittest.TestCase):
+    def test_malformed_blockers_rejected_before_task_persistence(self):
+        for i, blocker in enumerate(("bad", None, [], {"owner_action": 42},
+                                     {"owner_action": None}, {"owner_action": " "},
+                                     {"owner_action": "\ud800"})):
+            with self.subTest(blocker=repr(blocker)):
+                task_id = f"invalid-blocker-{i}"
+                with self.assertRaises(ValueError):
+                    self.host.create_task(task_id, self.project, [], blockers=[blocker])
+                self.host.create_task(task_id, self.project, [], blockers=[{"owner_action": "Choose a region."}])
+                decision = self.host.gate_final(task_id, "attempt", "done", project=self.project)
+                self.assertTrue(decision.release)
+                self.assertEqual(decision.message, "Choose a region.")
+
+    def test_blocker_without_message_uses_default(self):
+        self.host.create_task("default-blocker", self.project, [], blockers=[{}])
+        decision = self.host.gate_final("default-blocker", "attempt", "done", project=self.project)
+        self.assertTrue(decision.release)
+        self.assertEqual(decision.message, "Owner authorization is required.")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)

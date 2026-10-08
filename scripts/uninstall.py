@@ -256,10 +256,8 @@ def unrecorded_adapter_references_pack(root, state, pack):
 
 def installer_adapter_links(root, pack):
     """Return discoverable standard adapter links that point at ``pack``."""
-    try:
-        pack_root = pack.resolve(strict=True)
-    except OSError:
-        return []
+    # Exact installer-shaped link text is sufficient for explicit remove-all,
+    # even when its target pack no longer exists. Never follow the target.
     found = []
     for directory in ADAPTER_DIRS:
         adapter_dir = root / directory
@@ -275,11 +273,7 @@ def installer_adapter_links(root, pack):
                     or (directory == ".agents/skills" and not name.startswith("addy-"))
                     or os.readlink(path) != str(expected)):
                 continue
-            try:
-                path.resolve(strict=False).relative_to(pack_root)
-                found.append(path)
-            except (OSError, ValueError):
-                pass
+            found.append(path)
     return found
 
 

@@ -370,6 +370,17 @@ class HostSupervisor:
         validators = list(validators)
         self._validate_validator_ids(validators)
         blockers = list(blockers)
+        for blocker in blockers:
+            if not isinstance(blocker, dict):
+                raise ValueError("blockers must be records")
+            if "owner_action" in blocker:
+                message = blocker["owner_action"]
+                if not isinstance(message, str) or not message.strip():
+                    raise ValueError("blocker owner_action must be a nonempty string")
+                try:
+                    message.encode("utf-8")
+                except UnicodeEncodeError as exc:
+                    raise ValueError("blocker owner_action must be valid UTF-8") from exc
         permitted_operations = tuple(permitted_operations)
         prohibited = sorted(set(permitted_operations).intersection(DEFAULT_PROHIBITED))
         if prohibited:

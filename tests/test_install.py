@@ -21,6 +21,31 @@ nuke_spec.loader.exec_module(agent_nuke)
 
 
 class InstallSmoke(unittest.TestCase):
+    def test_remove_all_cleans_dangling_standard_links_without_pack_or_state(self):
+        for damaged in (False, True):
+            with self.subTest(damaged=damaged), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                links = []
+                for directory, name in ((".agents/skills", "addy-writing-plans"), (".cline/skills", "writing-plans")):
+                    link = root / directory / name
+                    link.parent.mkdir(parents=True)
+                    link.symlink_to("../../skills/addyosmani-agent-skills/skills/writing-plans")
+                    links.append(link)
+                custom = root / ".agents/skills/addy-custom"
+                custom.symlink_to("../../application/skills/custom")
+                if damaged:
+                    state = root / ".agent-canvas/state.json"
+                    state.parent.mkdir()
+                    state.write_text("broken json")
+                _, preview = uninstaller.uninstall(root, mode="remove-all")
+                for link in links:
+                    self.assertTrue(link.is_symlink())
+                    self.assertTrue(any(str(link.relative_to(root)) in action for action in preview))
+                uninstaller.uninstall(root, mode="remove-all", apply=True)
+                for link in links:
+                    self.assertFalse(link.is_symlink())
+                self.assertTrue(custom.is_symlink())
+
     def test_reset_shared_file_replaced_by_directory_never_recurses(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
