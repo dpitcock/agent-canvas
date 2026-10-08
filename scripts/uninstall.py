@@ -280,7 +280,7 @@ def planned_removal(root, path, actions, apply):
 
 
 def planned_regular_removal(root, path, actions, apply, identity):
-    """Plan regular-file removal without unlinking a pathname after validation."""
+    """Preserve a verified regular file when portable identity-safe unlink is unavailable."""
     safe_path(root, path)
     if not path.exists() and not path.is_symlink():
         return False
@@ -299,9 +299,12 @@ def planned_regular_removal(root, path, actions, apply, identity):
         # POSIX exposes no portable unlink-by-descriptor operation. Once this
         # descriptor is closed, unlinking ``path`` could delete an attacker
         # replacement, even if it is another regular file. Preserve it rather
-        # than claiming a pathname-based delete is identity-safe.
-        return False
-    actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {path.relative_to(root)}")
+        # than claiming a pathname-based delete is identity-safe. The preview
+        # reports the same outcome, so it never promises a removal apply cannot
+        # safely perform.
+        actions.append(f"PRESERVE {path.relative_to(root)}: cleanup requires --mode remove-all")
+        return True
+    actions.append(f"PRESERVE {path.relative_to(root)}: cleanup requires --mode remove-all")
     return True
 
 

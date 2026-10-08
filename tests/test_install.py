@@ -333,8 +333,24 @@ class InstallSmoke(unittest.TestCase):
             with patch.object(os, "close", swap_after_close):
                 removed = uninstaller.planned_regular_removal(root, managed, actions, True, identity)
 
-            self.assertFalse(removed)
+            self.assertTrue(removed)
             self.assertEqual(managed.read_text(), "replacement")
+            self.assertEqual(actions, ["PRESERVE AGENTS.md: cleanup requires --mode remove-all"])
+
+    def test_preserve_preview_does_not_promise_a_racy_regular_file_removal(self):
+        """Preserve previews must describe the same fail-closed outcome as apply."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            managed = root / "AGENTS.md"
+            managed.write_text("owned")
+            identity = (managed.stat().st_dev, managed.stat().st_ino)
+
+            actions = []
+            handled = uninstaller.planned_regular_removal(root, managed, actions, False, identity)
+
+            self.assertTrue(handled)
+            self.assertEqual(actions, ["PRESERVE AGENTS.md: cleanup requires --mode remove-all"])
 
     def test_preserve_uninstall_does_not_remove_state_replaced_after_read(self):
         """Preserve mode must not delete a state path after it has been read."""
