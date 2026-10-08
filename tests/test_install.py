@@ -288,6 +288,54 @@ class InstallSmoke(unittest.TestCase):
             self.assertTrue(managed.is_dir())
             self.assertEqual((managed / "application-file").read_text(), "preserve")
 
+    def test_read_state_rejects_a_state_file_swapped_to_a_symlink_after_lstat(self):
+        """State must be parsed from a no-follow descriptor, not a reopened path."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            state_path = root / ".agent-canvas/state.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(json.dumps({"schema_version": 1, "baselines": {}}))
+            outside = Path(directory) / "outside.json"
+            outside.write_text(json.dumps({"schema_version": 1, "baselines": {"outside": "state"}}))
+            original_lstat = Path.lstat
+
+            def swap_after_lstat(path, *args, **kwargs):
+                result = original_lstat(path, *args, **kwargs)
+                if path == state_path and not state_path.is_symlink():
+                    state_path.unlink()
+                    state_path.symlink_to(outside)
+                return result
+
+            with patch.object(Path, "lstat", swap_after_lstat):
+                with self.assertRaisesRegex(ValueError, "Cannot safely read"):
+                    uninstaller.read_state(root)
+
+    def test_planned_regular_removal_preserves_a_regular_replacement_after_validation(self):
+        """The pathname must not be unlinked after its verified fd is released."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            managed = root / "AGENTS.md"
+            managed.write_text("owned")
+            identity = (managed.stat().st_dev, managed.stat().st_ino)
+            original_close = os.close
+            swapped = False
+
+            def swap_after_close(descriptor):
+                nonlocal swapped
+                original_close(descriptor)
+                if not swapped:
+                    swapped = True
+                    managed.unlink()
+                    managed.write_text("replacement")
+
+            actions = []
+            with patch.object(os, "close", swap_after_close):
+                removed = uninstaller.planned_regular_removal(root, managed, actions, True, identity)
+
+            self.assertFalse(removed)
+            self.assertEqual(managed.read_text(), "replacement")
+
     def test_remove_all_unlinks_dangling_managed_file_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "project"

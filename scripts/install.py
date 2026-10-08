@@ -285,15 +285,14 @@ def apply_adapters(operations, provenance=None):
 
 def read_state(root):
     path = root / STATE
-    safe_destination(root, path)
     try:
-        mode = path.lstat().st_mode
-    except FileNotFoundError:
+        text = read_regular_text(root, path, missing=None)
+    except ValueError as error:
+        raise ValueError("Cannot safely read a non-regular .agent-canvas/state.json") from error
+    if text is None:
         return None
-    if not stat.S_ISREG(mode):
-        raise ValueError("Cannot safely read a non-regular .agent-canvas/state.json")
     try:
-        state = json.loads(path.read_text())
+        state = json.loads(text)
         if not isinstance(state, dict) or state.get("schema_version") != 1:
             raise ValueError
         options = state.get("options")

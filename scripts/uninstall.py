@@ -112,7 +112,9 @@ def read_state(root, *, allow_damaged=False):
             return None
         if not stat.S_ISREG(state_mode):
             raise ValueError("Cannot safely read a non-regular .agent-canvas/state.json")
-        state = json.loads(state_path.read_text())
+        # The lstat above is only a fast rejection. Read through a pinned,
+        # no-follow descriptor so a replacement cannot redirect parsing.
+        state = json.loads(read_regular_text(root, state_path))
         if not valid_state(state):
             raise ValueError
         return state
@@ -278,7 +280,7 @@ def planned_removal(root, path, actions, apply):
 
 
 def planned_regular_removal(root, path, actions, apply, identity):
-    """Remove only the regular file whose pinned identity was verified."""
+    """Plan regular-file removal without unlinking a pathname after validation."""
     safe_path(root, path)
     if not path.exists() and not path.is_symlink():
         return False
@@ -294,12 +296,11 @@ def planned_regular_removal(root, path, actions, apply, identity):
                 return False
         finally:
             os.close(descriptor)
-        try:
-            # unlink() rejects a replacement directory, unlike remove_path().
-            os.unlink(path)
-        except OSError:
-            return False
-        remove_empty_parents(root, path)
+        # POSIX exposes no portable unlink-by-descriptor operation. Once this
+        # descriptor is closed, unlinking ``path`` could delete an attacker
+        # replacement, even if it is another regular file. Preserve it rather
+        # than claiming a pathname-based delete is identity-safe.
+        return False
     actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {path.relative_to(root)}")
     return True
 

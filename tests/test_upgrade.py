@@ -19,6 +19,36 @@ def snapshot(root):
 
 
 class UpgradeSmoke(unittest.TestCase):
+    def test_read_state_does_not_follow_a_state_file_replaced_after_validation(self):
+        """A replacement symlink cannot change the state read after validation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            state_path = root / installer.STATE
+            state_path.parent.mkdir(parents=True)
+            original = {
+                "schema_version": 1,
+                "options": {"workspace": "original", "environment": "local", "role": "application", "slack": ""},
+                "baselines": {}, "pending": {}, "resolutions": [],
+            }
+            replacement = {**original, "options": {**original["options"], "workspace": "replacement"}}
+            state_path.write_text(json.dumps(original))
+            external = root / "replacement.json"
+            external.write_text(json.dumps(replacement))
+
+            original_lstat = Path.lstat
+
+            def replace_after_validation(path, *args, **kwargs):
+                result = original_lstat(path, *args, **kwargs)
+                if path == state_path:
+                    state_path.unlink()
+                    state_path.symlink_to(external)
+                return result
+
+            with patch.object(Path, "lstat", replace_after_validation):
+                state = installer.read_state(root)
+
+            self.assertEqual(state["options"]["workspace"], "original")
+
     def test_install_rejects_fifo_state_without_reading_it(self):
         """A FIFO state file must not block an install before it is rejected."""
         with tempfile.TemporaryDirectory() as tmp:
