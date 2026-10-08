@@ -29,7 +29,7 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def provision_supervised(root, state_dir):
+def provision_supervised(root, state_dir, *, root_identity=None):
     """Register a project in host state; never treat project files as authority."""
     root = Path(root).resolve()
     state_dir = (Path.home() / ".agent-canvas-supervisor") if state_dir is None else Path(state_dir).expanduser()
@@ -49,7 +49,8 @@ def provision_supervised(root, state_dir):
     spec = importlib.util.spec_from_file_location("agent_canvas_supervisor", SOURCE / "scripts/supervisor.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    registration = module.HostSupervisor(state_dir).provision(root)
+    with pinned_parent(root, root / ".registration", root_identity=root_identity):
+        registration = module.HostSupervisor(state_dir).provision(root, expected_identity=root_identity)
     return {"enabled": True, "state_dir": str(state_dir), "registration_digest": digest(registration)}
 
 
@@ -198,17 +199,18 @@ def adapter_plan(root, environments, state, home=None):
     return operations, actions
 
 
-def add_gitignore_entry(root, ignore, entry):
+def add_gitignore_entry(root, ignore, entry, *, root_identity=None):
     """Append one entry through a descriptor pinned to a regular .gitignore."""
-    return add_gitignore_entries(root, ignore, [entry])
+    return add_gitignore_entries(root, ignore, [entry], root_identity=root_identity)
 
 
-def add_gitignore_entries(root, ignore, entries):
+def add_gitignore_entries(root, ignore, entries, *, root_identity=None):
     """Append missing entries through one pinned regular-file descriptor."""
     safe_destination(root, ignore)
     try:
-        descriptor = os.open(ignore, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK
-                             | getattr(os, "O_NOFOLLOW", 0), 0o666)
+        with pinned_parent(root, ignore, root_identity=root_identity) as (parent, name):
+            descriptor = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o666, dir_fd=parent)
     except OSError as error:
         raise ValueError("Cannot safely update .gitignore: it is not a regular file") from error
     current = os.fstat(descriptor)
@@ -245,18 +247,44 @@ def read_regular_text(root, path, *, missing=None):
     return regular_text_snapshot(root, path, missing=missing)[0]
 
 
+def select_project(target, *, allow_missing=False):
+    """Capture the selected project once, before planning or writing its files."""
+    root = Path(target).expanduser().resolve()
+    try:
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError as error:
+        if allow_missing:
+            return root, None
+        raise ValueError("Target must be an existing project directory") from error
+    except OSError as error:
+        raise ValueError("Target must be an existing project directory") from error
+    try:
+        current = os.fstat(descriptor)
+        return root, (current.st_dev, current.st_ino)
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
-def pinned_parent(root, path, *, create=False):
+def pinned_parent(root, path, *, create=False, root_identity=None):
     """Traverse project directories without following replacement symlinks."""
     safe_destination(root, path)
     relative = path.relative_to(root)
     if not relative.parts or ".." in relative.parts:
         raise ValueError(f"Destination is outside project: {path}")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    if create:
+    if create and root_identity is None:
         root.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(root, flags)
     try:
+        descriptor = os.open(root, flags)
+    except OSError as error:
+        if root_identity is not None:
+            raise ValueError("Project directory changed during installation") from error
+        raise
+    try:
+        current = os.fstat(descriptor)
+        if root_identity is not None and (current.st_dev, current.st_ino) != root_identity:
+            raise ValueError("Project directory changed during installation")
         for name in relative.parts[:-1]:
             if create:
                 try:
@@ -271,13 +299,13 @@ def pinned_parent(root, path, *, create=False):
         os.close(descriptor)
 
 
-def write_regular_text(root, path, text, *, create=False, identity=None):
+def write_regular_text(root, path, text, *, create=False, identity=None, root_identity=None):
     """Replace a descriptor-pinned regular project file without following links."""
     flags = os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     if create:
         flags |= os.O_CREAT | (os.O_EXCL if identity is None else 0)
     try:
-        with pinned_parent(root, path, create=create) as (parent, name):
+        with pinned_parent(root, path, create=create, root_identity=root_identity) as (parent, name):
             descriptor = os.open(name, flags, 0o666, dir_fd=parent)
     except OSError as error:
         raise ValueError(f"Cannot safely update regular file: {path}") from error
@@ -293,18 +321,21 @@ def write_regular_text(root, path, text, *, create=False, identity=None):
         handle.write(text)
 
 
-def apply_adapters(operations, provenance=None):
+def apply_adapters(operations, provenance=None, *, root=None, root_identity=None):
     for operation, link, target in operations:
-        if operation == "remove":
-            link.unlink()
-        else:
-            link.parent.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(target, target_is_directory=True)
+        project = root if root is not None else link.parent.parent.parent
+        # Discovery links themselves are symlinks; validate and pin their parent.
+        with pinned_parent(project, link.parent / ".adapter", create=True,
+                           root_identity=root_identity) as (parent, _):
+            if operation == "remove":
+                os.unlink(link.name, dir_fd=parent)
+            else:
+                os.symlink(target, link.name, dir_fd=parent, target_is_directory=True)
+        if operation != "remove":
             if link.parent.name == "skills" and link.parent.parent.name == ".cline":
-                root = link.parent.parent.parent
-                ignore = root / ".gitignore"
+                ignore = project / ".gitignore"
                 entry = "/.cline/skills/" + link.name
-                if add_gitignore_entry(root, ignore, entry):
+                if add_gitignore_entry(project, ignore, entry, root_identity=root_identity):
                     if provenance is not None:
                         entries = provenance.setdefault("gitignore_entries", [])
                         if entry not in entries:
@@ -380,13 +411,13 @@ def read_state(root):
         raise ValueError(f"Cannot read upgrade history in {path}; preserve it and repair or restore it") from error
 
 
-def save_state(root, state):
+def save_state(root, state, *, root_identity=None):
     path = root / STATE
     safe_destination(root, path)
     text = json.dumps(state, indent=2, sort_keys=True) + "\n"
     if path.exists() and path.read_text() == text:
         return
-    with pinned_parent(root, path, create=True) as (parent, name):
+    with pinned_parent(root, path, create=True, root_identity=root_identity) as (parent, name):
         temporary = ".state-" + uuid.uuid4().hex
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                              0o600, dir_fd=parent)
@@ -431,7 +462,8 @@ def merge_text(base, local, incoming):
     return "".join(lines), False
 
 
-def upgrade_followup(root, actions, pending, source=SOURCE, *, state=None, preserve_current=False):
+def upgrade_followup(root, actions, pending, source=SOURCE, *, state=None, preserve_current=False,
+                     root_identity=None):
     path = root / "INSTALL-FOLLOWUP.md"
     old, identity = regular_text_snapshot(root, path, missing="# Agent Canvas installation follow-up\n")
     marker = f"<!-- agent-canvas:proposal:{digest([str(source), state])} -->"
@@ -464,14 +496,12 @@ Pending files: {', '.join('`' + name + '`' for name in sorted(pending)) or 'none
     else:
         updated = old.rstrip() + "\n\n" + block + "\n"
     if updated != old:
-        write_regular_text(root, path, updated, create=True, identity=identity)
+        write_regular_text(root, path, updated, create=True, identity=identity, root_identity=root_identity)
 
 
 def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=None,
             supervised=False, supervisor_state_dir=None):
-    root = Path(target).expanduser().resolve()
-    if not root.is_dir():
-        raise ValueError("Install the project first; upgrade target must exist")
+    root, root_identity = select_project(target)
     for name in (*MANAGED, STATE, ".gitignore", "INSTALL-FOLLOWUP.md"):
         path = root / name
         safe_destination(root, path)
@@ -492,7 +522,7 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
     supervised_record = None
     if supervised:
         if apply:
-            supervised_record = provision_supervised(root, supervisor_state_dir)
+            supervised_record = provision_supervised(root, supervisor_state_dir, root_identity=root_identity)
             state["supervised"] = supervised_record
             actions = ["REGISTER supervised project in host-owned state"]
         else:
@@ -551,24 +581,24 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
     state["package_version"] = version
     if not writes and not operations and json.dumps(state, sort_keys=True) == original_state:
         actions = actions or ["NO CHANGES: prior decisions and local customizations preserved"]
-        upgrade_followup(root, actions, state["pending"], source=source, state=state, preserve_current=True)
+        upgrade_followup(root, actions, state["pending"], source=source, state=state, preserve_current=True, root_identity=root_identity)
         return apply, actions
     if not actions:
         actions.append("RECONCILED: current files preserved; baseline or pending records updated")
     # Prepare the handoff before changing tracked files; malformed markers cannot partially apply an upgrade.
-    upgrade_followup(root, actions, state["pending"], source=source, state=state)
+    upgrade_followup(root, actions, state["pending"], source=source, state=state, root_identity=root_identity)
     if apply:
         for name, text in writes.items():
             path = root / name
-            write_regular_text(root, path, text, create=True, identity=managed_identities[name])
+            write_regular_text(root, path, text, create=True, identity=managed_identities[name], root_identity=root_identity)
         provenance = state.setdefault("provenance", {})
         managed_files = provenance.setdefault("managed_files", [])
         for name in sorted(created_managed):
             if name not in managed_files:
                 managed_files.append(name)
-        apply_adapters(operations, provenance)
-        save_state(root, state)
-        upgrade_followup(root, actions, state["pending"], source=source, state=state)
+        apply_adapters(operations, provenance, root=root, root_identity=root_identity)
+        save_state(root, state, root_identity=root_identity)
+        upgrade_followup(root, actions, state["pending"], source=source, state=state, root_identity=root_identity)
     return apply, actions
 
 
@@ -645,9 +675,7 @@ def render_files(source, *, workspace, environment, role, slack):
 def install(target, *, apply=False, skills=False, workspace=None, environment="local",
             role="application", slack="", source=SOURCE, home=None, downloader=download_skills,
             supervised=False, supervisor_state_dir=None):
-    root = Path(target).expanduser().resolve()
-    if root.exists() and not root.is_dir():
-        raise ValueError("Target must be a directory")
+    root, root_identity = select_project(target, allow_missing=True)
     existing = root.exists() and any(p.name != ".git" for p in root.iterdir())
     active = apply or not existing
     discovered = inventory(root) if root.exists() else []
@@ -668,6 +696,14 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
             raise ValueError(f"Expected file; preserving existing path: {path}")
     config_path = root / "config/workspace-config.yml"
     environments = agentic_envs(read_regular_text(root, config_path, missing=files["config/workspace-config.yml"]))
+    if root_identity is None:
+        # Validate the proposal before creating a new project. Never adopt a
+        # directory that appeared since selection, or recreate an existing one.
+        try:
+            root.mkdir(parents=True)
+        except FileExistsError as error:
+            raise ValueError("Project directory changed during installation") from error
+        root, root_identity = select_project(root)
     adapter_state = json.loads(json.dumps(prior_state)) if prior_state else {"adapters": {"links": {}, "pending": []}}
     provenance = adapter_state.setdefault("provenance", {})
     provenance.setdefault("managed_files", [])
@@ -681,7 +717,7 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
         else:
             actions.append(f"{'ADD' if active else 'WOULD ADD'} {name}")
             if active:
-                write_regular_text(root, path, content, create=True)
+                write_regular_text(root, path, content, create=True, root_identity=root_identity)
                 provenance["managed_files"].append(name)
     ignore_path = root / ".gitignore"
     ignore = read_regular_text(root, ignore_path, missing="")
@@ -689,7 +725,7 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
     if missing:
         actions.append(f"{'ADD' if active else 'WOULD ADD'} missing .gitignore entries")
         if active:
-            if add_gitignore_entries(root, ignore_path, missing):
+            if add_gitignore_entries(root, ignore_path, missing, root_identity=root_identity):
                 provenance["gitignore_entries"].extend(missing)
     pack = root / "skills/addyosmani-agent-skills"
     if skills and not any(environments.get(env) for env in ADAPTERS):
@@ -704,7 +740,13 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
                 ref = (root / "skills/addyosmani-agent-skills.ref").read_text().strip()
                 if not re.fullmatch(r"[0-9a-fA-F]{40}", ref):
                     raise ValueError("Existing skill reference is not a full commit SHA; preserved for manual resolution")
-                downloader(pack, ref)
+                # Download outside the project, then place the pack through its
+                # verified parent descriptor. A renamed project cannot redirect it.
+                with tempfile.TemporaryDirectory(prefix=".agent-canvas-download-", dir=root.parent) as tmp:
+                    checkout = Path(tmp) / "pack"
+                    downloader(checkout, ref)
+                    with pinned_parent(root, pack, create=True, root_identity=root_identity) as (parent, name):
+                        os.rename(checkout, name, dst_dir_fd=parent)
                 discovered_skills = sorted((pack / "skills").glob("*/SKILL.md"))
                 if not discovered_skills:
                     raise ValueError("Skill pack is empty")
@@ -718,7 +760,7 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
     operations, adapter_actions = adapter_plan(root, environments, adapter_state, home=home)
     actions.extend(adapter_actions if active else ["WOULD " + a if a.startswith(("ADD ", "REMOVE ")) else a for a in adapter_actions])
     if active:
-        apply_adapters(operations, provenance)
+        apply_adapters(operations, provenance, root=root, root_identity=root_identity)
     actions.append("REUSE Superpowers if enabled; otherwise verify a supported installation for each active environment; never assume plugin portability")
     followup = root / "INSTALL-FOLLOWUP.md"
     prompt = f"""# Agent Canvas installation follow-up
@@ -751,17 +793,16 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
 >
 > Preview remaining changes, apply agreed safe additions and merges, and verify the touched files and links. Do not run legacy governance scripts or create new approval machinery. Report what is resolved and what still needs my input. Update this follow-up file with the outcome so another session does not repeat finished work. Missing integrations must be reported honestly; continue independent work.
 """
-    root.mkdir(parents=True, exist_ok=True)
     if supervised:
         if active:
-            adapter_state["supervised"] = provision_supervised(root, supervisor_state_dir)
+            adapter_state["supervised"] = provision_supervised(root, supervisor_state_dir, root_identity=root_identity)
             actions.append("REGISTER supervised project in host-owned state")
         else:
             actions.append("WOULD REGISTER supervised project in host-owned state")
     if followup.exists():
         actions.append("KEEP INSTALL-FOLLOWUP.md unchanged; rescan live files when running its prompt")
     else:
-        write_regular_text(root, followup, prompt, create=True)
+        write_regular_text(root, followup, prompt, create=True, root_identity=root_identity)
         actions.append("ADD INSTALL-FOLLOWUP.md (ready-to-run conflict-resolution prompt)")
     if active and prior_state is None:
         state = dict(schema_version=1, package_version=digest(files), options=options,
@@ -776,11 +817,11 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
             else:
                 state["baselines"][name] = None
                 state["pending"][name] = dict(incoming=incoming)
-        save_state(root, state)
-        upgrade_followup(root, ["TRACKING: package baseline saved; reconcile any pending files"], state["pending"], source=source, state=state)
+        save_state(root, state, root_identity=root_identity)
+        upgrade_followup(root, ["TRACKING: package baseline saved; reconcile any pending files"], state["pending"], source=source, state=state, root_identity=root_identity)
     elif active and prior_state != adapter_state:
-        save_state(root, adapter_state)
-        upgrade_followup(root, adapter_actions, adapter_state["pending"], source=source, state=adapter_state)
+        save_state(root, adapter_state, root_identity=root_identity)
+        upgrade_followup(root, adapter_actions, adapter_state["pending"], source=source, state=adapter_state, root_identity=root_identity)
     return active, actions
 
 

@@ -284,7 +284,7 @@ class HostSupervisor:
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"Host state is unreadable: {path}") from error
 
-    def provision(self, project):
+    def provision(self, project, *, expected_identity=None):
         project = Path(project).resolve()
         if not project.is_dir():
             raise ValueError("Supervised project must be an existing directory")
@@ -300,8 +300,10 @@ class HostSupervisor:
             pass
         else:
             raise ValueError("Supervisor state directory must be outside the project workspace")
-        self._ensure_root()
         identity = self._project_identity(project)
+        if expected_identity is not None and (identity["device"], identity["inode"]) != expected_identity:
+            raise ValueError("Project directory changed during installation")
+        self._ensure_root()
         registration = self._registration(project, create=True)
         if registration.exists():
             current = self._read(registration)

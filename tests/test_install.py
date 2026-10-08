@@ -21,6 +21,147 @@ nuke_spec.loader.exec_module(agent_nuke)
 
 
 class InstallSmoke(unittest.TestCase):
+    def test_provision_rejects_project_replaced_inside_registration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "project"
+            root.mkdir()
+            selected = root.stat()
+            spec = importlib.util.spec_from_file_location("identity_test_supervisor", installer.SOURCE / "scripts/supervisor.py")
+            supervisor = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(supervisor)
+            project_identity = supervisor.HostSupervisor._project_identity
+
+            def replace_then_identify(project):
+                root.rename(base / "original")
+                root.mkdir()
+                return project_identity(project)
+
+            with patch.object(supervisor.HostSupervisor, "_project_identity", side_effect=replace_then_identify):
+                with self.assertRaisesRegex(ValueError, "Project directory changed"):
+                    supervisor.HostSupervisor(base / "host-state").provision(
+                        root, expected_identity=(selected.st_dev, selected.st_ino))
+            self.assertFalse((base / "host-state").exists())
+
+    def test_adapter_mutations_preserve_replacement_project(self):
+        for operation in ("add", "remove"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "project"
+                root.mkdir()
+                root, identity = installer.select_project(root)
+                root.rename(root.with_name("original"))
+                link = root / ".agents/skills/addy-example"
+                link.parent.mkdir(parents=True)
+                if operation == "remove":
+                    link.symlink_to("keep-target")
+                with self.assertRaisesRegex(ValueError, "Project directory changed"):
+                    installer.apply_adapters([(operation, link, "new-target")], root=root, root_identity=identity)
+                if operation == "remove":
+                    self.assertEqual(os.readlink(link), "keep-target")
+                else:
+                    self.assertFalse(link.is_symlink())
+
+    def test_install_preserves_replacement_at_late_mutation_boundaries(self):
+        for hook in ("add_gitignore_entries", "apply_adapters", "save_state", "provision_supervised"):
+            with self.subTest(hook=hook), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                root = base / "project"
+                original_call = getattr(installer, hook)
+                replaced = False
+
+                def swap_then_call(*args, **kwargs):
+                    nonlocal replaced
+                    if not replaced:
+                        replaced = True
+                        root.rename(base / "original")
+                        root.mkdir()
+                        (root / "application.txt").write_text("keep")
+                    return original_call(*args, **kwargs)
+
+                with patch.object(installer, hook, side_effect=swap_then_call):
+                    with self.assertRaisesRegex(ValueError, "Project directory changed"):
+                        installer.install(root, home=base / "home", supervised=hook == "provision_supervised",
+                                          supervisor_state_dir=base / "host-state")
+                self.assertEqual(sorted(p.name for p in root.iterdir()), ["application.txt"])
+                self.assertFalse((base / "host-state").exists())
+
+    def test_download_does_not_place_pack_in_replacement_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "project"
+
+            def download(destination, revision):
+                destination.mkdir(parents=True)
+                (destination / "pack.txt").write_text("downloaded")
+                root.rename(base / "original")
+                root.mkdir()
+                (root / "application.txt").write_text("keep")
+
+            with self.assertRaisesRegex(ValueError, "Project directory changed"):
+                installer.install(root, skills=True, home=base / "home", downloader=download)
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["application.txt"])
+
+    def test_new_project_can_be_installed_with_supervision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "new" / "project"
+            active, _ = installer.install(root, home=base / "home", supervised=True,
+                                          supervisor_state_dir=base / "host-state")
+            self.assertTrue(active)
+            self.assertTrue(installer.read_state(root)["supervised"]["enabled"])
+
+    def test_install_and_upgrade_preserve_replacement_project(self):
+        for operation in (installer.install, installer.upgrade):
+            for after_first in (False, True):
+                with self.subTest(operation=operation.__name__, after_first=after_first), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "project"
+                    root.mkdir()
+                    original = root.with_name("original")
+                    swapped = False
+                    render = installer.render_files
+                    write = installer.write_regular_text
+
+                    def swap():
+                        nonlocal swapped
+                        if not swapped:
+                            swapped = True
+                            root.rename(original)
+                            root.mkdir()
+                            (root / "application.txt").write_text("unrelated project")
+
+                    def render_then_swap(*args, **kwargs):
+                        result = render(*args, **kwargs)
+                        swap()
+                        return result
+
+                    def write_then_swap(*args, **kwargs):
+                        result = write(*args, **kwargs)
+                        swap()
+                        return result
+
+                    hook = "write_regular_text" if after_first else "render_files"
+                    with patch.object(installer, hook, side_effect=write_then_swap if after_first else render_then_swap):
+                        with self.assertRaisesRegex(ValueError, "Project directory changed"):
+                            operation(root, apply=True, home=Path(tmp) / "home")
+                    self.assertEqual(sorted(p.name for p in root.iterdir()), ["application.txt"])
+                    self.assertEqual((root / "application.txt").read_text(), "unrelated project")
+
+    def test_install_does_not_recreate_disappeared_selected_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            render = installer.render_files
+
+            def disappear(*args, **kwargs):
+                result = render(*args, **kwargs)
+                root.rename(root.with_name("original"))
+                return result
+
+            with patch.object(installer, "render_files", side_effect=disappear):
+                with self.assertRaisesRegex(ValueError, "Project directory changed"):
+                    installer.install(root, home=Path(tmp) / "home")
+            self.assertFalse(root.exists())
+
     def test_cleanup_rejects_project_replacement_after_selection_and_between_deletions(self):
         for module in (uninstaller, agent_nuke):
             for after_first in (False, True):
