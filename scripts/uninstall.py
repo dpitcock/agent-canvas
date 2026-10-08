@@ -142,7 +142,7 @@ def valid_state(state):
         return False
     adapters = state.get("adapters")
     if adapters is not None:
-        if not isinstance(adapters, dict) or not isinstance(adapters.get("links", {}), dict):
+        if not isinstance(adapters, dict) or not isinstance(adapters.get("links"), dict):
             return False
         if any(not isinstance(relative, str) or not isinstance(expected, str)
                for relative, expected in adapters["links"].items()):

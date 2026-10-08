@@ -653,6 +653,28 @@ class InstallSmoke(unittest.TestCase):
             self.assertFalse(cline_link.exists() or cline_link.is_symlink())
             self.assertTrue(unrelated.is_symlink())
 
+    def test_remove_all_recovers_state_without_adapter_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            state_path = target / ".agent-canvas/state.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(json.dumps({
+                "schema_version": 1, "baselines": {}, "adapters": {},
+            }))
+            managed = target / "AGENTS.md"
+            managed.write_text("managed")
+            unrelated = target / "application.txt"
+            unrelated.write_text("keep")
+
+            _, preview = uninstaller.uninstall(target, mode="remove-all", apply=False)
+            self.assertIn("WOULD REMOVE AGENTS.md", preview)
+            self.assertTrue(managed.exists())
+            self.assertTrue(state_path.exists())
+            uninstaller.uninstall(target, mode="remove-all", apply=True)
+            self.assertFalse(managed.exists())
+            self.assertFalse(state_path.exists())
+            self.assertEqual(unrelated.read_text(), "keep")
+
     def test_remove_all_recovers_when_state_has_wrong_field_types(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "project"
