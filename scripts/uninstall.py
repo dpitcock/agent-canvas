@@ -485,7 +485,9 @@ def uninstall(target, *, mode="preserve", apply=False):
         planned_removal(root, root / FOLLOWUP, actions, apply)
     elif state:
         remove_followup_block(root, actions, apply)
-    if state or mode == "remove-all":
+    if mode == "preserve" and state:
+        actions.append("PRESERVE .agent-canvas/state.json: state cleanup requires --mode remove-all")
+    elif state or mode == "remove-all":
         state_root = state_path.parent
         planned_removal(root, state_root if not state_root.is_dir() or state_root.is_symlink() else state_path,
                         actions, apply)

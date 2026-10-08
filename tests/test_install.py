@@ -159,7 +159,7 @@ class InstallSmoke(unittest.TestCase):
             uninstaller.uninstall(preserved, mode="preserve", apply=True)
             self.assertEqual((preserved / "AGENTS.md").read_text(), "Project additions\n")
             self.assertEqual((preserved / ".gitignore").read_text(), "app-cache\n")
-            self.assertFalse((preserved / ".agent-canvas").exists())
+            self.assertTrue((preserved / ".agent-canvas/state.json").is_file())
             self.assertFalse((preserved / "skills/addyosmani-agent-skills").exists())
 
             forced = base / "forced"
@@ -335,6 +335,26 @@ class InstallSmoke(unittest.TestCase):
 
             self.assertFalse(removed)
             self.assertEqual(managed.read_text(), "replacement")
+
+    def test_preserve_uninstall_does_not_remove_state_replaced_after_read(self):
+        """Preserve mode must not delete a state path after it has been read."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            state_path = root / ".agent-canvas/state.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(json.dumps({"schema_version": 1, "baselines": {}}))
+
+            def replace_state(*_args, **_kwargs):
+                state_path.unlink()
+                state_path.mkdir()
+                (state_path / "user-file").write_text("preserve")
+                return False
+
+            with patch.object(uninstaller, "remove_followup_block", replace_state):
+                uninstaller.uninstall(root, mode="preserve", apply=True)
+
+            self.assertTrue(state_path.is_dir())
+            self.assertEqual((state_path / "user-file").read_text(), "preserve")
 
     def test_remove_all_unlinks_dangling_managed_file_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -664,8 +684,9 @@ class InstallSmoke(unittest.TestCase):
             _, actions = uninstaller.uninstall(target, mode="preserve", apply=True)
 
             self.assertTrue((target / ".gitignore").is_dir())
-            self.assertFalse(state_path.exists())
+            self.assertTrue(state_path.is_file())
             self.assertIn("PRESERVE .gitignore: it is not a regular file", actions)
+            self.assertIn("PRESERVE .agent-canvas/state.json: state cleanup requires --mode remove-all", actions)
 
     def test_apply_adapters_rechecks_gitignore_after_preflight_before_reading(self):
         """A .gitignore swapped after planning must not be opened as a FIFO/dir."""
@@ -699,8 +720,9 @@ class InstallSmoke(unittest.TestCase):
             _, actions = uninstaller.uninstall(target, mode="preserve", apply=True)
 
             self.assertTrue((target / "INSTALL-FOLLOWUP.md").is_dir())
-            self.assertFalse(state_path.exists())
+            self.assertTrue(state_path.is_file())
             self.assertIn("PRESERVE INSTALL-FOLLOWUP.md: it is not a regular file", actions)
+            self.assertIn("PRESERVE .agent-canvas/state.json: state cleanup requires --mode remove-all", actions)
 
     def test_preserve_uninstall_keeps_preexisting_matching_files_and_ignore_entries(self):
         with tempfile.TemporaryDirectory() as directory:
