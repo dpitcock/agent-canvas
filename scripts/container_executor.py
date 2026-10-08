@@ -129,8 +129,16 @@ def _create_stage(parent_fd, parent_path):
             created = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             visible = os.lstat(root)
         except OSError as error:
+            try:
+                os.rmdir(name, dir_fd=parent_fd)
+            except OSError:
+                pass
             raise ConfigurationError("staging parent changed while creating the snapshot") from error
         if (created.st_dev, created.st_ino) != (visible.st_dev, visible.st_ino):
+            try:
+                os.rmdir(name, dir_fd=parent_fd)
+            except OSError:
+                pass
             raise ConfigurationError("staging parent changed while creating the snapshot")
         return root
     raise ConfigurationError("could not allocate a unique staging directory")
@@ -266,6 +274,7 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
     parent_fd = _open_staging_parent(staging_parent)
     stage_fd = None
     root = None
+    snapshot = None
     try:
         root = _create_stage(parent_fd, staging_parent)
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -320,13 +329,18 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
         return snapshot
     except Exception as error:
         cleanup_ok = root is None
-        if root is not None and stage_fd is not None:
-            cleanup_ok = snapshot.remove()
+        try:
+            if snapshot is not None:
+                cleanup_ok = snapshot.remove()
+        finally:
+            if snapshot is not None:
+                snapshot.close()
+            else:
+                if stage_fd is not None:
+                    os.close(stage_fd)
+                os.close(parent_fd)
         if not cleanup_ok:
             raise ConfigurationError("rejected input stage cleanup could not be confirmed") from error
-        if stage_fd is not None:
-            os.close(stage_fd)
-        os.close(parent_fd)
         raise
 
 
@@ -511,7 +525,7 @@ class ContainerExecutor:
                     deadline = time.monotonic() + request.timeout_s
                     selector = selectors.DefaultSelector()
                     selector.register(process.stdout, selectors.EVENT_READ)
-                    while process.poll() is None:
+                    while True:
                         if cancellation is not None and cancellation.is_set():
                             cancelled = True
                             break
@@ -526,16 +540,28 @@ class ContainerExecutor:
                             truncated |= len(chunk) > available
                             if truncated:
                                 break
-                        else:
+                            continue
+                        if process.poll() is not None:
+                            # A terminated writer cannot add new bytes.  An
+                            # empty read is EOF, so all bounded output has
+                            # already been captured.
+                            break
+                        if not events:
                             continue
                     selector.close()
                     if timed_out or cancelled or truncated:
-                        subprocess.run([cls.RUNTIME, "kill", name], capture_output=True, timeout=10, check=False)
-                    rest, _ = process.communicate(timeout=10)
-                    if rest:
-                        available = request.max_output_bytes - len(output)
-                        output += rest[:max(0, available)]
-                        truncated |= len(rest) > available
+                        stopped = subprocess.run([cls.RUNTIME, "kill", name], capture_output=True, timeout=10, check=False)
+                        if stopped.returncode:
+                            raise ConfigurationError("Docker could not stop the output-limited container")
+                        # ``communicate`` would buffer every byte emitted after
+                        # the cap.  Closing the pipe first bounds host memory;
+                        # Docker kill has already stopped the producer.
+                        if process.stdout is not None:
+                            process.stdout.close()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired as error:
+                        raise ConfigurationError("Docker attach did not exit after output handling") from error
                     status = process.returncode if not (timed_out or cancelled) else ("timeout" if timed_out else "cancelled")
         finally:
             cleanup_ok = True

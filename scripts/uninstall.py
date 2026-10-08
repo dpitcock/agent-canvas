@@ -49,6 +49,42 @@ def safe_path(root, path):
     raise ValueError(f"Path is outside the project: {path}")
 
 
+def regular_text_snapshot(root, path):
+    """Return text and inode identity from a no-follow regular-file descriptor."""
+    safe_path(root, path)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise ValueError(f"Cannot safely read regular file: {path}") from error
+    with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+        identity = os.fstat(handle.fileno())
+        if not stat.S_ISREG(identity.st_mode):
+            raise ValueError(f"Cannot safely read regular file: {path}")
+        return handle.read(), (identity.st_dev, identity.st_ino)
+
+
+def read_regular_text(root, path):
+    """Read a descriptor-pinned regular file without following a replacement link."""
+    return regular_text_snapshot(root, path)[0]
+
+
+def replace_regular_snapshot(root, path, text, identity):
+    """Rewrite only the exact regular file that was read for this operation."""
+    safe_path(root, path)
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise ValueError(f"Cannot safely update regular file: {path}") from error
+    with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
+        current = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino) != identity):
+            raise ValueError(f"Cannot safely update regular file: {path}")
+        handle.seek(0)
+        handle.truncate()
+        handle.write(text)
+
+
 def remove_path(path):
     if path.is_dir() and not path.is_symlink():
         shutil.rmtree(path)
@@ -262,13 +298,21 @@ def remove_ignore_entries(root, state, actions, apply):
                    for relative in adapter_links(state)
                    if relative.startswith(".cline/skills/"))
     entries &= allowed
-    old = path.read_text()
+    try:
+        old, identity = regular_text_snapshot(root, path)
+    except ValueError:
+        actions.append("PRESERVE .gitignore: it changed during cleanup")
+        return
     kept = [line for line in old.splitlines(keepends=True) if line.rstrip("\r\n") not in entries]
     new = "".join(kept)
     if old != new:
-        actions.append(f"{'UPDATE' if apply else 'WOULD UPDATE'} .gitignore: remove Agent Canvas ignore entries")
         if apply:
-            path.write_text(new)
+            try:
+                replace_regular_snapshot(root, path, new, identity)
+            except ValueError:
+                actions.append("PRESERVE .gitignore: it changed during cleanup")
+                return
+        actions.append(f"{'UPDATE' if apply else 'WOULD UPDATE'} .gitignore: remove Agent Canvas ignore entries")
 
 
 def remove_followup_block(root, actions, apply):
@@ -282,16 +326,24 @@ def remove_followup_block(root, actions, apply):
     if not path.is_file():
         actions.append("PRESERVE INSTALL-FOLLOWUP.md: it is not a regular file")
         return
-    updated, found = followup_without_agent_canvas_block(path.read_text())
+    try:
+        old, identity = regular_text_snapshot(root, path)
+    except ValueError:
+        actions.append("PRESERVE INSTALL-FOLLOWUP.md: it changed during cleanup")
+        return
+    updated, found = followup_without_agent_canvas_block(old)
     if found is None:
         actions.append("PRESERVE INSTALL-FOLLOWUP.md: Agent Canvas markers are malformed")
     elif found:
-        actions.append(f"{'UPDATE' if apply else 'WOULD UPDATE'} INSTALL-FOLLOWUP.md: remove Agent Canvas section")
         if apply:
-            if updated:
-                path.write_text(updated)
-            else:
-                path.unlink()
+            try:
+                # Keep an empty regular file rather than unlinking a pathname
+                # that could have been replaced after its pinned read.
+                replace_regular_snapshot(root, path, updated, identity)
+            except ValueError:
+                actions.append("PRESERVE INSTALL-FOLLOWUP.md: it changed during cleanup")
+                return
+        actions.append(f"{'UPDATE' if apply else 'WOULD UPDATE'} INSTALL-FOLLOWUP.md: remove Agent Canvas section")
 
 
 def uninstall(target, *, mode="preserve", apply=False):

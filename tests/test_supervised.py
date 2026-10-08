@@ -1,4 +1,5 @@
 """Host-supervised task tests; all state lives in temporary host directories."""
+import hashlib
 import importlib.util
 import multiprocessing
 import os
@@ -266,6 +267,24 @@ class SupervisedTasks(unittest.TestCase):
         receipt = self.host.task("task-1")["evidence"]["validators"]["check-project-cwd"]
         self.assertEqual(receipt["exit_status"], 0)
         self.assertEqual(receipt["output"], "project-owned input\n")
+
+    def test_validator_receipt_hashes_a_project_relative_executable(self):
+        """The receipt must identify the binary executed after changing to the project."""
+        check = self.project / "check"
+        check.write_text("#!/bin/sh\nexit 0\n")
+        check.chmod(0o700)
+        self.task(validators=[{
+            "id": "project-check",
+            "command": ["./check"],
+            "timeout_s": 2,
+        }])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+
+        decision = self.host.gate_final("task-1", "attempt-1", "finished")
+
+        self.assertTrue(decision.release)
+        receipt = self.host.task("task-1")["evidence"]["validators"]["project-check"]
+        self.assertEqual(receipt["binary_digest"], hashlib.sha256(check.read_bytes()).hexdigest())
 
     def test_host_validator_remains_in_registered_directory_if_project_path_is_replaced(self):
         """A path replacement just before spawn must not validate the substitute project."""

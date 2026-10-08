@@ -198,19 +198,71 @@ def adapter_plan(root, environments, state, home=None):
 
 def add_gitignore_entry(root, ignore, entry):
     """Append one entry through a descriptor pinned to a regular .gitignore."""
+    return add_gitignore_entries(root, ignore, [entry])
+
+
+def add_gitignore_entries(root, ignore, entries):
+    """Append missing entries through one pinned regular-file descriptor."""
     safe_destination(root, ignore)
     try:
-        descriptor = os.open(ignore, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o666)
+        descriptor = os.open(ignore, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK
+                             | getattr(os, "O_NOFOLLOW", 0), 0o666)
     except OSError as error:
         raise ValueError("Cannot safely update .gitignore: it is not a regular file") from error
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise ValueError("Cannot safely update .gitignore: it is not a regular file")
     with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            raise ValueError("Cannot safely update .gitignore: it is not a regular file")
         old = handle.read()
-        if entry in old.splitlines():
+        missing = [entry for entry in entries if entry not in old.splitlines()]
+        if not missing:
             return False
-        handle.write(("\n" if old and not old.endswith("\n") else "") + entry + "\n")
+        handle.write(("\n" if old and not old.endswith("\n") else "") + "\n".join(missing) + "\n")
         return True
+
+
+def regular_text_snapshot(root, path, *, missing=None):
+    """Read a regular project file and retain its device/inode identity."""
+    safe_destination(root, path)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return missing, None
+    except OSError as error:
+        raise ValueError(f"Cannot safely read regular file: {path}") from error
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise ValueError(f"Cannot safely read regular file: {path}")
+    with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+        return handle.read(), (os.fstat(handle.fileno()).st_dev, os.fstat(handle.fileno()).st_ino)
+
+
+def read_regular_text(root, path, *, missing=None):
+    """Read only a descriptor-pinned regular project file."""
+    return regular_text_snapshot(root, path, missing=missing)[0]
+
+
+def write_regular_text(root, path, text, *, create=False, identity=None):
+    """Replace a descriptor-pinned regular project file without following links."""
+    safe_destination(root, path)
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    if create:
+        flags |= os.O_CREAT | (os.O_EXCL if identity is None else 0)
+    try:
+        descriptor = os.open(path, flags, 0o666)
+    except OSError as error:
+        raise ValueError(f"Cannot safely update regular file: {path}") from error
+    current = os.fstat(descriptor)
+    if (not stat.S_ISREG(current.st_mode)
+            or (identity is not None and (current.st_dev, current.st_ino) != identity)):
+        os.close(descriptor)
+        raise ValueError(f"Cannot safely update regular file: {path}")
+    with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(text)
 
 
 def apply_adapters(operations, provenance=None):
@@ -284,8 +336,12 @@ def read_state(root):
                 if not (isinstance(name, str) and isinstance(target, str) and name == str(Path(name))
                         and str(Path(name).parent) in ADAPTERS.values() and Path(name).name not in {".", ".."}):
                     raise ValueError
-                expected = Path("../../skills/addyosmani-agent-skills/skills") / Path(target).name
-                if target != str(expected) or Path(target).name in {".", ".."}:
+                directory = str(Path(name).parent)
+                link_name = Path(name).name
+                skill_name = link_name.removeprefix("addy-") if directory == ".agents/skills" else link_name
+                expected = Path("../../skills/addyosmani-agent-skills/skills") / skill_name
+                if (not skill_name or (directory == ".agents/skills" and not link_name.startswith("addy-"))
+                        or target != str(expected)):
                     raise ValueError
             if "pack" in adapter:
                 pack = adapter["pack"]
@@ -345,8 +401,7 @@ def merge_text(base, local, incoming):
 
 def upgrade_followup(root, actions, pending, source=SOURCE, *, state=None, preserve_current=False):
     path = root / "INSTALL-FOLLOWUP.md"
-    safe_destination(root, path)
-    old = path.read_text() if path.exists() else "# Agent Canvas installation follow-up\n"
+    old, identity = regular_text_snapshot(root, path, missing="# Agent Canvas installation follow-up\n")
     marker = f"<!-- agent-canvas:proposal:{digest([str(source), state])} -->"
     if BEGIN in old or END in old:
         if old.count(BEGIN) != 1 or old.count(END) != 1 or old.index(BEGIN) >= old.index(END):
@@ -377,8 +432,7 @@ Pending files: {', '.join('`' + name + '`' for name in sorted(pending)) or 'none
     else:
         updated = old.rstrip() + "\n\n" + block + "\n"
     if updated != old:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(updated)
+        write_regular_text(root, path, updated, create=True, identity=identity)
 
 
 def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=None,
@@ -398,7 +452,8 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
     options = state["options"] if state else dict(workspace=root.name, environment="local", role="application", slack="")
     files = render_files(source, **options)
     config_path = root / "config/workspace-config.yml"
-    environments = agentic_envs(config_path.read_text() if config_path.exists() else files["config/workspace-config.yml"])
+    config_text, _ = regular_text_snapshot(root, config_path, missing=files["config/workspace-config.yml"])
+    environments = agentic_envs(config_text)
     version = digest(files)
     if state is None:
         state = dict(schema_version=1, options=options, baselines={}, pending={}, resolutions=[])
@@ -418,10 +473,11 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
         if state["pending"][name]["incoming"] != files[name]:
             raise ValueError(f"Package changed since this conflict was recorded: {name}; preview/apply the new proposal first")
     writes = {}
+    managed_identities = {}
     created_managed = set()
     for name, incoming in files.items():
         path = root / name
-        local = path.read_text() if path.exists() else None
+        local, managed_identities[name] = regular_text_snapshot(root, path, missing=None)
         known = name in state["baselines"] and state["baselines"][name] is not None
         base = state["baselines"].get(name)
         if name in resolve:
@@ -457,7 +513,7 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
                 diff = "".join(difflib.unified_diff((local or "").splitlines(True), (result or "").splitlines(True),
                                                      fromfile=name, tofile=name + " (proposed)"))
                 actions.append(f"{'UPDATE' if apply else 'WOULD UPDATE'} {name}\n{diff}")
-    config_text = writes.get("config/workspace-config.yml", config_path.read_text() if config_path.exists() else files["config/workspace-config.yml"])
+    config_text = writes.get("config/workspace-config.yml", config_text)
     operations, adapter_actions = adapter_plan(root, agentic_envs(config_text), state, home=home)
     actions.extend(adapter_actions if apply else ["WOULD " + a if a.startswith(("ADD ", "REMOVE ")) else a for a in adapter_actions])
     state["package_version"] = version
@@ -472,8 +528,7 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
     if apply:
         for name, text in writes.items():
             path = root / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text)
+            write_regular_text(root, path, text, create=True, identity=managed_identities[name])
         provenance = state.setdefault("provenance", {})
         managed_files = provenance.setdefault("managed_files", [])
         for name in sorted(created_managed):
@@ -580,7 +635,7 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
         if name in [*files, STATE, ".gitignore", "INSTALL-FOLLOWUP.md"] and path.exists() and not path.is_file():
             raise ValueError(f"Expected file; preserving existing path: {path}")
     config_path = root / "config/workspace-config.yml"
-    environments = agentic_envs(config_path.read_text() if config_path.exists() else files["config/workspace-config.yml"])
+    environments = agentic_envs(read_regular_text(root, config_path, missing=files["config/workspace-config.yml"]))
     adapter_state = json.loads(json.dumps(prior_state)) if prior_state else {"adapters": {"links": {}, "pending": []}}
     provenance = adapter_state.setdefault("provenance", {})
     provenance.setdefault("managed_files", [])
@@ -599,14 +654,13 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
                     out.write(content)
                 provenance["managed_files"].append(name)
     ignore_path = root / ".gitignore"
-    ignore = ignore_path.read_text() if ignore_path.exists() else ""
+    ignore = read_regular_text(root, ignore_path, missing="")
     missing = [entry for entry in IGNORE if entry not in ignore.splitlines()]
     if missing:
         actions.append(f"{'ADD' if active else 'WOULD ADD'} missing .gitignore entries")
         if active:
-            with ignore_path.open("a") as out:
-                out.write(("\n" if ignore and not ignore.endswith("\n") else "") + "\n".join(missing) + "\n")
-            provenance["gitignore_entries"].extend(missing)
+            if add_gitignore_entries(root, ignore_path, missing):
+                provenance["gitignore_entries"].extend(missing)
     pack = root / "skills/addyosmani-agent-skills"
     if skills and not any(environments.get(env) for env in ADAPTERS):
         actions.append("SKIP skill downloads: no supported agentic environment is enabled")

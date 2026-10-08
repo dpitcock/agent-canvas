@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -36,6 +37,28 @@ def _now():
 
 def _text_output(value):
     return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")
+
+
+def _binary_digest(path, *, directory_descriptor=None):
+    """Hash a regular executable, resolving explicit relative paths from a pinned directory."""
+    descriptor = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+        if directory_descriptor is not None and not os.path.isabs(path) and "/" in path:
+            descriptor = os.open(path, flags, dir_fd=directory_descriptor)
+        else:
+            descriptor = os.open(path, flags)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 64 * 1024):
+            digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 class HostSupervisor:
@@ -414,8 +437,7 @@ class HostSupervisor:
         except subprocess.TimeoutExpired as error:
             output, status = _text_output(error.stdout)[:8192], "timeout"
         executable = shutil.which(command[0]) or command[0]
-        binary = Path(executable)
-        binary_digest = hashlib.sha256(binary.read_bytes()).hexdigest() if binary.is_file() else None
+        binary_digest = _binary_digest(executable, directory_descriptor=project_descriptor)
         return {"command": command, "command_digest": _digest(command), "binary_digest": binary_digest,
                 "exit_status": status, "output": output, "digest": hashlib.sha256(output.encode()).hexdigest(),
                 "timeout_s": timeout, "version": validator.get("version", "host-configured")}

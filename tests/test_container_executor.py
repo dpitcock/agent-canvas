@@ -141,6 +141,38 @@ class StagingTests(unittest.TestCase):
                     with self.assertRaises(executor.ConfigurationError):
                         executor.stage_inputs(pinned, ["missing.txt"], Path(staging), max_bytes=1024, max_files=1)
 
+    def test_rejected_stage_closes_retained_descriptors_when_cleanup_fails(self):
+        """A rejected stage must not leak its pinned descriptors after failed cleanup."""
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as staging:
+            project = Path(directory) / "project"
+            project.mkdir()
+            closed = []
+            original_close = executor.StagedInputs.close
+
+            def record_close(snapshot):
+                closed.append(snapshot)
+                original_close(snapshot)
+
+            with executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project)) as pinned:
+                with mock.patch.object(executor, "_remove_tree_fd", return_value=False), \
+                     mock.patch.object(executor.StagedInputs, "close", autospec=True, side_effect=record_close):
+                    with self.assertRaises(executor.ConfigurationError):
+                        executor.stage_inputs(pinned, ["missing.txt"], Path(staging), max_bytes=1024, max_files=1)
+            self.assertEqual(len(closed), 1)
+
+    def test_failed_stage_visibility_validation_removes_created_directory(self):
+        """Creation validation failure may not leave a private staging directory behind."""
+        with tempfile.TemporaryDirectory() as staging:
+            parent = Path(staging)
+            parent_fd = executor._open_staging_parent(parent)
+            try:
+                with mock.patch.object(executor.os, "lstat", side_effect=OSError("replaced")):
+                    with self.assertRaises(executor.ConfigurationError):
+                        executor._create_stage(parent_fd, parent)
+            finally:
+                os.close(parent_fd)
+            self.assertEqual(list(parent.iterdir()), [])
+
 
 class RuntimeValidationTests(unittest.TestCase):
     def test_parent_replacement_after_create_never_starts_the_container(self):
@@ -229,6 +261,67 @@ class RuntimeValidationTests(unittest.TestCase):
             self.assertEqual(receipt.exit_status, "cancelled")
             self.assertTrue(receipt.verify())
             self.assertEqual(list(Path(staging).iterdir()), [])
+
+    def test_truncated_output_closes_pipe_before_waiting_for_attached_process(self):
+        """The post-cap drain may not buffer an unbounded final communicate result."""
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as staging:
+            project = Path(directory) / "project"
+            project.mkdir()
+            (project / "input.txt").write_text("input")
+            request = executor.ExecutionRequest(
+                action_id="bounded-output", attempt_id="one", project=project,
+                image="example/tool@sha256:" + "a" * 64, command=["tool"], inputs=["input.txt"], max_output_bytes=1,
+            )
+
+            class Stdout:
+                def __init__(self):
+                    self.closed = False
+
+                def read1(self, _size):
+                    return b"too much output"
+
+                def close(self):
+                    self.closed = True
+
+            class Process:
+                def __init__(self):
+                    self.stdout = Stdout()
+                    self.returncode = 0
+
+                def poll(self):
+                    return None
+
+                def communicate(self, **_kwargs):
+                    raise AssertionError("communicate would buffer uncapped output")
+
+                def wait(self, **_kwargs):
+                    return 0
+
+            class Selector:
+                def register(self, *_args):
+                    pass
+
+                def select(self, **_kwargs):
+                    return [object()]
+
+                def close(self):
+                    pass
+
+            process = Process()
+
+            def docker_run(argv, **_kwargs):
+                if argv[1] in {"create", "kill"} or argv[1:3] == ["rm", "-f"]:
+                    return mock.Mock(returncode=0)
+                raise AssertionError(f"unexpected Docker command: {argv}")
+
+            with mock.patch.object(executor.ContainerExecutor, "_check_runtime", return_value=("27", "sha256:image")), \
+                 mock.patch.object(executor.subprocess, "run", side_effect=docker_run), \
+                 mock.patch.object(executor.subprocess, "Popen", return_value=process), \
+                 mock.patch.object(executor.selectors, "DefaultSelector", return_value=Selector()):
+                receipt = executor.ContainerExecutor.run(request, executor.ProjectIdentity.capture(project), Path(staging))
+            self.assertTrue(receipt.output_truncated)
+            self.assertEqual(receipt.output, "t")
+            self.assertTrue(process.stdout.closed)
 
     def test_requires_digest_pinned_image_and_rejects_host_fallback(self):
         with self.assertRaises(executor.ConfigurationError):

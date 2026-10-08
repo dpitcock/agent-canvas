@@ -665,6 +665,46 @@ class InstallSmoke(unittest.TestCase):
 
         self.assertEqual(uninstaller.adapter_links(state), state["adapters"]["links"])
 
+    def test_read_state_rejects_adapter_link_whose_name_disagrees_with_target_skill(self):
+        """A recorded link may only name the skill it targets."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            state_path = root / ".agent-canvas/state.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "options": {"workspace": "project", "environment": "local", "role": "application", "slack": ""},
+                "baselines": {}, "pending": {}, "resolutions": [],
+                "adapters": {"links": {
+                    ".agents/skills/addy-unrelated": "../../skills/addyosmani-agent-skills/skills/example",
+                }, "pending": []},
+            }))
+
+            with self.assertRaisesRegex(ValueError, "upgrade history"):
+                installer.read_state(root)
+
+    def test_gitignore_descriptor_helper_rejects_fifo_without_opening_it(self):
+        """A path swapped to a FIFO cannot make install wait or write elsewhere."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            ignore = root / ".gitignore"
+            os.mkfifo(ignore)
+
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                installer.add_gitignore_entries(root, ignore, ["/.owner-override"])
+
+    def test_uninstall_regular_text_helper_rejects_fifo_without_opening_it(self):
+        """Cleanup refuses a substituted FIFO instead of blocking on it."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            followup = root / "INSTALL-FOLLOWUP.md"
+            os.mkfifo(followup)
+
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                uninstaller.read_regular_text(root, followup)
+
     def test_followup_block_removal_preserves_surrounding_whitespace(self):
         original = (
             "    Project-owned indented note\n\n"
