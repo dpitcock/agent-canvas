@@ -7,11 +7,58 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from test_supervised import supervisor
+from test_supervised import supervisor, client
 from test_container_executor import executor
 
 
 class CompletionEdges(unittest.TestCase):
+    def test_renderer_delivers_recovered_terminal_commit_once(self):
+        for mode in ("plain", "validated", "blocker"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "project"
+                project.mkdir()
+                host = supervisor.HostSupervisor(root / "state")
+                host.create_task("task", project, [],
+                    validators=[{"id": "check", "command": ["true"]}] if mode == "validated" else [],
+                    blockers=[{"owner_action": "Choose."}] if mode == "blocker" else [])
+                renderer = client.SupervisedRenderer(host, "task", legacy_test_mode=True)
+                renderer.consume({"method": "item/completed", "params": {"item": {
+                    "type": "agentMessage", "id": "final", "phase": "final_answer", "text": "done"}}})
+                completion = {"method": "turn/completed", "params": {"turnId": "turn", "status": "completed"}}
+                original = os.fsync
+                def fail_terminal_directory(fd):
+                    if stat.S_ISDIR(os.fstat(fd).st_mode) and host.task("task", project=project)["status"] in {"complete", "blocked"}:
+                        raise OSError("directory sync failed")
+                    original(fd)
+                with patch.object(supervisor.os, "fsync", side_effect=fail_terminal_directory):
+                    output = renderer.consume(completion)
+                self.assertEqual(output, [{"kind": "final", "content": "Choose." if mode == "blocker" else "done",
+                    "decision": "blocker" if mode == "blocker" else "complete",
+                    "durability_warning": "state_directory_sync_failed"}])
+                self.assertEqual(renderer.consume(completion), [])
+
+    def test_post_replace_sync_failure_recovers_release_without_duplicate(self):
+        for blocked in (False, True):
+            with self.subTest(blocked=blocked), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "project"
+                project.mkdir()
+                host = supervisor.HostSupervisor(root / "state")
+                host.create_task("task", project, [], blockers=[{"owner_action": "Choose."}] if blocked else [])
+                original = os.fsync
+                def fail_directory(fd):
+                    if stat.S_ISDIR(os.fstat(fd).st_mode):
+                        raise OSError("directory sync failed")
+                    original(fd)
+                with patch.object(supervisor.os, "fsync", side_effect=fail_directory):
+                    decision = host.gate_final("task", "attempt", "done", project=project)
+                self.assertTrue(decision.release)
+                self.assertFalse(decision.durability_confirmed)
+                self.assertEqual(decision.message, "Choose." if blocked else "done")
+                self.assertFalse(host.gate_final("task", "retry", "done", project=project).release)
+                self.assertEqual(host.visible_messages("task", project=project), [decision.message])
+
     def test_cancelled_task_rejects_late_completion_and_reconciliation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

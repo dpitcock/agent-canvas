@@ -33,9 +33,14 @@ _VALIDATOR_LAUNCHER = (
 )
 
 
+class StateCommitUncertainError(OSError):
+    """Replacement is visible, but its directory sync was not confirmed."""
+
+
 class Decision:
-    def __init__(self, kind, *, release=False, message="", next_action=None):
+    def __init__(self, kind, *, release=False, message="", next_action=None, durability_confirmed=True):
         self.kind, self.release, self.message, self.next_action = kind, release, message, next_action
+        self.durability_confirmed = durability_confirmed
 
 
 def _digest(value):
@@ -273,11 +278,14 @@ class HostSupervisor:
             temp = Path(out.name)
         try:
             os.replace(temp, path)
-            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+                directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            except OSError as error:
+                raise StateCommitUncertainError("State replaced, but directory sync failed") from error
         finally:
             temp.unlink(missing_ok=True)
 
@@ -327,11 +335,48 @@ class HostSupervisor:
     def _event_path(self, task_id, project=None):
         return self._state_file(self._project_for_task(task_id, project) / "audit.jsonl", description="audit log")
 
+    @contextmanager
+    def _locked_audit(self, task_id, project=None):
+        """Serialize shared project audit recovery, reads and appends.
+
+        Callers holding a task lock acquire this lock second. The audit file
+        stays on the same inode; recovery only truncates an unfinished tail.
+        """
+        path = self._event_path(task_id, project)
+        with path.open("a+b", buffering=0) as out:
+            fcntl.flock(out, fcntl.LOCK_EX)
+            try:
+                out.seek(0)
+                data = out.read()
+                boundary = data.rfind(b"\n") + 1
+                try:
+                    events = [json.loads(line.decode("utf-8"))
+                              for line in data[:boundary].split(b"\n")[:-1]]
+                    if any(not isinstance(event, dict) or not {"task_id", "at", "type"} <= event.keys()
+                           for event in events):
+                        raise ValueError("Invalid audit event")
+                except (ValueError, UnicodeError) as error:
+                    raise ValueError(f"Host audit is unreadable: {path}") from error
+                # Validate complete records first: corruption must remain visible,
+                # even when an interrupted append follows the damaged record.
+                if boundary != len(data):
+                    out.truncate(boundary)
+                    out.flush()
+                    os.fsync(out.fileno())
+                out.seek(0, os.SEEK_END)
+                yield out, events
+            finally:
+                fcntl.flock(out, fcntl.LOCK_UN)
+
     def _event(self, task_id, event_type, *, project=None, **details):
         event = {"at": _now(), "type": event_type, "task_id": task_id, **details}
-        path = self._event_path(task_id, project)
-        with path.open("a", encoding="utf-8") as out:
-            out.write(json.dumps(event, sort_keys=True) + "\n")
+        with self._locked_audit(task_id, project) as (out, _):
+            remaining = memoryview((json.dumps(event, sort_keys=True) + "\n").encode("utf-8"))
+            while remaining:
+                written = os.write(out.fileno(), remaining)
+                if written <= 0:
+                    raise OSError("Audit append made no progress")
+                remaining = remaining[written:]
             out.flush()
             os.fsync(out.fileno())
         return event
@@ -340,9 +385,8 @@ class HostSupervisor:
         # The terminal decision and its audit event share one atomic task write.
         # Progress events remain in JSONL; it is not the complete delivery ledger.
         with self._locked_task(task_id, project=project) as task:
-            path = self._event_path(task_id, project)
-            events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-            events = [event for event in events if event["task_id"] == task_id]
+            with self._locked_audit(task_id, project) as (_, events):
+                events = [event for event in events if event["task_id"] == task_id]
             if task.get("release_event"):
                 events.append(task["release_event"])
             return sorted(events, key=lambda event: event["at"])
@@ -448,8 +492,20 @@ class HostSupervisor:
             task["release_event"]["blocker_id"] = task["blockers"][0].get("id")
         task["visible_messages"].append(message)
         task["status"] = "blocked" if blocker else "complete"
-        self._save_task(task)
-        return Decision("blocker" if blocker else "complete", release=True, message=message)
+        durability_confirmed = True
+        try:
+            self._save_task(task)
+        except StateCommitUncertainError:
+            # The task lock is still held. Recover only this exact transition,
+            # never a stale or unrelated terminal message.
+            committed = self.task(task["task_id"], project=task["project"])
+            if (committed.get("release_event") != task["release_event"]
+                    or committed.get("status") != task["status"]
+                    or committed.get("visible_messages") != task["visible_messages"]):
+                raise
+            durability_confirmed = False
+        return Decision("blocker" if blocker else "complete", release=True, message=message,
+                        durability_confirmed=durability_confirmed)
 
     def _remaining(self, task):
         return [(action_id, action) for action_id, action in task["actions"].items() if action["status"] != "complete"]

@@ -4,6 +4,10 @@
 
 One host state directory can serve multiple projects. Every task operation accepts a project identity and resolves state beneath that project's host registration. Task IDs may therefore repeat across projects without sharing actions, evidence, visible messages, or audit events; an unqualified lookup is rejected when it would be ambiguous.
 
+State writes sync the file and then its directory after replacement. If only the post-replacement directory sync fails during final release, the host verifies the exact saved terminal decision under the task lock and returns it with `durability_confirmed=False`. The renderer displays the saved final message with `durability_warning: state_directory_sync_failed`; it does not retry that already-visible transition. This preserves delivery in the running process without claiming crash durability. Failures before replacement remain retryable; loss of the client after a returned release still requires recovery from `visible_messages()`.
+
+Project audit reads and appends share a file lock across tasks. Recovery truncates only an unfinished, non-newline-terminated tail, after checking all complete records. Complete malformed records remain explicit errors rather than being silently discarded. Terminal release evidence remains in the task state, separate from this progress log.
+
 The custom renderer consumes Codex App Server item events. It forwards progress but buffers `item/agentMessage/delta` content. Only after `turn/completed` does it ask the host supervisor to release content. Remaining host actions queue a continuation instead; a blocker is delivered only after no independently authorized action remains.
 
 The POC uses atomic replacement for task state and fsynced append-only progress audit events. Terminal release authorization, its message, and its audit event are committed together in the task file; a failed state write cannot leave a successful release event behind. `HostSupervisor.audit(task_id)` combines that task's progress log with its committed release event. Reading `audit.jsonl` alone is not a complete audit. Existing historical JSONL events remain readable.

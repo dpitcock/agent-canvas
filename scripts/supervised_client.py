@@ -91,7 +91,10 @@ class SupervisedRenderer:
             raise
         self._reset_messages()
         if decision.release:
-            return [{"kind": "final", "content": decision.message, "decision": decision.kind}]
+            output = {"kind": "final", "content": decision.message, "decision": decision.kind}
+            if not decision.durability_confirmed:
+                output["durability_warning"] = "state_directory_sync_failed"
+            return [output]
         if decision.kind == "continue":
             return [{"kind": "continuation", "next_action": decision.next_action, "message": decision.message}]
         return [{"kind": decision.kind, "message": decision.message}]
