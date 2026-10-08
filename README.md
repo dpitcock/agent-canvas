@@ -142,6 +142,10 @@ python3 scripts/install.py /path/to/existing-project --apply
 
 The output labels work as **ADD**, **WOULD ADD**, **REUSE**, **SKIP**, or **DECIDE**. Normal installation with `--apply` adds missing files and ignore entries; it never replaces an existing AGENTS.md, config, version reference, or skill. Missing fields in an existing config are left for the follow-up merge, so project-specific settings remain intact. Differing files are recorded as pending conflicts. CODEOWNERS, other agents, hooks, CI, Git history, and application code are untouched. Replacing package defaults later requires the explicit `--upgrade` mode below.
 
+Managed text updates are prepared and synced in the destination directory before atomic publication, preserving the original when preparation fails. Adapter operations undo completed link changes if a later operation in that batch fails; unused ignore entries may remain. Installation as a whole is not a crash-recoverable transaction: forced termination or a later installation-record failure can still require manual reconciliation. Atomic file replacement does not promise directory-entry durability across power loss.
+
+Use installation and upgrades in a trusted local workspace without concurrent directory replacement. Some project reads still validate paths before opening them rather than pinning every ancestor; a same-account process swapping an ancestor can redirect such reads. Protection against malicious host-account control is outside the local-development trust model.
+
 ### Finish the conflicts with your agent
 
 Open the target project in Codex or Cline, open `INSTALL-FOLLOWUP.md`, and paste its **Prompt to run** into chat. The prompt asks your agent to:

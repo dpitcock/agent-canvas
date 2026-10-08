@@ -301,46 +301,103 @@ def pinned_parent(root, path, *, create=False, root_identity=None):
 
 
 def write_regular_text(root, path, text, *, create=False, identity=None, root_identity=None):
-    """Replace a descriptor-pinned regular project file without following links."""
-    flags = os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
-    if create:
-        flags |= os.O_CREAT | (os.O_EXCL if identity is None else 0)
+    """Publish a fully written replacement within the pinned parent directory."""
+    # Encode before touching the destination; invalid text cannot truncate it.
+    payload = text.encode("utf-8")
     try:
         with pinned_parent(root, path, create=create, root_identity=root_identity) as (parent, name):
-            descriptor = os.open(name, flags, 0o666, dir_fd=parent)
+            try:
+                descriptor = os.open(name, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+            except FileNotFoundError:
+                if not create or identity is not None:
+                    raise
+                current = None
+            else:
+                try:
+                    current = os.fstat(descriptor)
+                finally:
+                    os.close(descriptor)
+                if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                        or (create and identity is None)
+                        or (identity is not None and (current.st_dev, current.st_ino) != identity)):
+                    raise ValueError(f"Cannot safely update regular file: {path}")
+            temporary = f".agent-canvas-write-{uuid.uuid4().hex}"
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o666, dir_fd=parent)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    if current is not None:
+                        os.fchmod(handle.fileno(), stat.S_IMODE(current.st_mode))
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if current is None:
+                    # Exclusive publication: never overwrite a newly appeared file.
+                    os.link(temporary, name, src_dir_fd=parent, dst_dir_fd=parent,
+                            follow_symlinks=False)
+                else:
+                    observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
+                    if any(getattr(observed, field) != getattr(current, field) for field in fields):
+                        raise ValueError(f"Cannot safely update changed regular file: {path}")
+                    os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=parent)
+                except FileNotFoundError:
+                    pass
     except OSError as error:
         raise ValueError(f"Cannot safely update regular file: {path}") from error
-    current = os.fstat(descriptor)
-    if (not stat.S_ISREG(current.st_mode)
-            or current.st_nlink != 1
-            or (identity is not None and (current.st_dev, current.st_ino) != identity)):
-        os.close(descriptor)
-        raise ValueError(f"Cannot safely update regular file: {path}")
-    with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
-        handle.seek(0)
-        handle.truncate()
-        handle.write(text)
 
 
 def apply_adapters(operations, provenance=None, *, root=None, root_identity=None):
-    for operation, link, target in operations:
-        project = root if root is not None else link.parent.parent.parent
-        # Discovery links themselves are symlinks; validate and pin their parent.
-        with pinned_parent(project, link.parent / ".adapter", create=True,
-                           root_identity=root_identity) as (parent, _):
-            if operation == "remove":
-                os.unlink(link.name, dir_fd=parent)
-            else:
-                os.symlink(target, link.name, dir_fd=parent, target_is_directory=True)
-        if operation != "remove":
-            if link.parent.name == "skills" and link.parent.parent.name == ".cline":
-                ignore = project / ".gitignore"
-                entry = "/.cline/skills/" + link.name
-                if add_gitignore_entry(project, ignore, entry, root_identity=root_identity):
-                    if provenance is not None:
-                        entries = provenance.setdefault("gitignore_entries", [])
-                        if entry not in entries:
-                            entries.append(entry)
+    """Undo completed link changes if this adapter batch cannot finish."""
+    completed, descriptors, ignore_entries = [], [], {}
+    try:
+        for operation, link, target in operations:
+            project = root if root is not None else link.parent.parent.parent
+            # Retain the actual directory until commit/rollback, even if renamed.
+            with pinned_parent(project, link.parent / ".adapter", create=True,
+                               root_identity=root_identity) as (parent, _):
+                retained = os.dup(parent)
+                descriptors.append(retained)
+                if operation == "remove":
+                    previous = os.readlink(link.name, dir_fd=parent)
+                    os.unlink(link.name, dir_fd=parent)
+                    completed.append(("remove", retained, link.name, previous))
+                else:
+                    os.symlink(target, link.name, dir_fd=parent, target_is_directory=True)
+                    completed.append(("add", retained, link.name, target))
+            if operation != "remove":
+                if link.parent.name == "skills" and link.parent.parent.name == ".cline":
+                    ignore_entries.setdefault(project, []).append("/.cline/skills/" + link.name)
+        # Defer ignore updates until every link succeeds, with one append per project.
+        # A failed append can leave unused ignore patterns; link rollback still runs.
+        for project, planned in ignore_entries.items():
+            ignore = project / ".gitignore"
+            existing = read_regular_text(project, ignore, missing="").splitlines()
+            missing = [entry for entry in planned if entry not in existing]
+            if missing and add_gitignore_entries(project, ignore, missing, root_identity=root_identity):
+                if provenance is not None:
+                    entries = provenance.setdefault("gitignore_entries", [])
+                    entries.extend(entry for entry in missing if entry not in entries)
+    except Exception as error:
+        failures = []
+        for operation, parent, name, target in reversed(completed):
+            try:
+                if operation == "remove":
+                    os.symlink(target, name, dir_fd=parent, target_is_directory=True)
+                else:
+                    os.unlink(name, dir_fd=parent)
+            except OSError as rollback_error:
+                failures.append(f"{name}: {rollback_error}")
+        if failures:
+            raise ValueError(f"Adapter update failed ({error}); link rollback incomplete: "
+                             + "; ".join(failures)) from error
+        raise
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
 
 
 def read_state(root):
