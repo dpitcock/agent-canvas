@@ -671,6 +671,8 @@ class HostSupervisor:
         # Recheck older saved definitions before running any validator, not
         # halfway through execution after a receipt has already been replaced.
         self._validate_validator_ids(task["validators"])
+        for validator in task["validators"]:
+            self._validate_validator_definition(validator)
         receipts = {}
         with self._pinned_registered_project(task["project"]) as project_descriptor:
             for validator in task["validators"]:

@@ -26,11 +26,30 @@ IGNORE = {"/.owner-override", "/.agents/skills/addy-*/", "/skills/addyosmani-age
 ADAPTER_DIRS = {".agents/skills", ".cline/skills"}
 
 
-def root_path(target):
+def root_path(target, *, with_identity=False):
     root = Path(target).expanduser()
     if root.is_symlink() or not root.is_dir():
         raise ValueError("Target must be an existing, non-symlink project directory")
-    return root.resolve()
+    root = root.resolve()
+    descriptor = open_project_root(root)
+    try:
+        current = os.fstat(descriptor)
+        identity = (current.st_dev, current.st_ino)
+    finally:
+        os.close(descriptor)
+    return (root, identity) if with_identity else root
+
+
+def open_project_root(root, expected_identity=None):
+    """Pin the selected directory and reject a different directory at its path."""
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("Safe descriptor-relative removal is unavailable")
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    current = os.fstat(descriptor)
+    if expected_identity is not None and (current.st_dev, current.st_ino) != expected_identity:
+        os.close(descriptor)
+        raise ValueError("Project directory changed during cleanup")
+    return descriptor
 
 
 def safe_path(root, path):
@@ -69,13 +88,22 @@ def read_regular_text(root, path):
     return regular_text_snapshot(root, path)[0]
 
 
-def replace_regular_snapshot(root, path, text, identity):
+def replace_regular_snapshot(root, path, text, identity, *, root_identity):
     """Rewrite only the exact regular file that was read for this operation."""
     safe_path(root, path)
+    # Only the two root-level shared files are rewritten. Open through the
+    # checked root descriptor so a later rename cannot redirect the write.
+    if path.parent != root:
+        raise ValueError(f"Cannot safely update non-root file: {path}")
+    root_descriptor = open_project_root(root, root_identity)
     try:
-        descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
-    except OSError as error:
-        raise ValueError(f"Cannot safely update regular file: {path}") from error
+        try:
+            descriptor = os.open(path.name, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW,
+                                 dir_fd=root_descriptor)
+        except OSError as error:
+            raise ValueError(f"Cannot safely update regular file: {path}") from error
+    finally:
+        os.close(root_descriptor)
     with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
         current = os.fstat(handle.fileno())
         if (not stat.S_ISREG(current.st_mode)
@@ -87,7 +115,7 @@ def replace_regular_snapshot(root, path, text, identity):
         handle.write(text)
 
 
-def remove_path(root, path, *, recursive=True):
+def remove_path(root, path, *, recursive=True, root_identity):
     """Delete relative to no-follow directory descriptors, including cleanup."""
     relative = path.relative_to(root)
     if not relative.parts or ".." in relative.parts:
@@ -97,7 +125,7 @@ def remove_path(root, path, *, recursive=True):
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     descriptors = []
     try:
-        descriptors.append(os.open(root, flags))
+        descriptors.append(open_project_root(root, root_identity))
         for name in relative.parts[:-1]:
             descriptors.append(os.open(name, flags, dir_fd=descriptors[-1]))
         parent = descriptors[-1]
@@ -292,13 +320,13 @@ def followup_without_agent_canvas_block(text):
     return before + after, True
 
 
-def planned_removal(root, path, actions, apply):
+def planned_removal(root, path, actions, apply, *, root_identity):
     safe_path(root, path)
     if not path.exists() and not path.is_symlink():
         return
     actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {path.relative_to(root)}")
     if apply:
-        remove_path(root, path)
+        remove_path(root, path, root_identity=root_identity)
 
 
 def planned_regular_removal(root, path, actions, apply, identity):
@@ -330,7 +358,7 @@ def planned_regular_removal(root, path, actions, apply, identity):
     return True
 
 
-def remove_ignore_entries(root, state, actions, apply, *, remove_all=False):
+def remove_ignore_entries(root, state, actions, apply, *, remove_all=False, root_identity):
     path = root / ".gitignore"
     safe_path(root, path)
     if not path.exists():
@@ -366,14 +394,14 @@ def remove_ignore_entries(root, state, actions, apply, *, remove_all=False):
     if old != new:
         if apply:
             try:
-                replace_regular_snapshot(root, path, new, identity)
+                replace_regular_snapshot(root, path, new, identity, root_identity=root_identity)
             except ValueError:
                 actions.append("PRESERVE .gitignore: it changed during cleanup")
                 return
         actions.append(f"{'UPDATE' if apply else 'WOULD UPDATE'} .gitignore: remove Agent Canvas ignore entries")
 
 
-def remove_followup_block(root, actions, apply):
+def remove_followup_block(root, actions, apply, *, root_identity):
     path = root / FOLLOWUP
     safe_path(root, path)
     if not path.exists():
@@ -397,7 +425,7 @@ def remove_followup_block(root, actions, apply):
             try:
                 # Keep an empty regular file rather than unlinking a pathname
                 # that could have been replaced after its pinned read.
-                replace_regular_snapshot(root, path, updated, identity)
+                replace_regular_snapshot(root, path, updated, identity, root_identity=root_identity)
             except ValueError:
                 actions.append("PRESERVE INSTALL-FOLLOWUP.md: it changed during cleanup")
                 return
@@ -408,7 +436,7 @@ def uninstall(target, *, mode="preserve", apply=False):
     """Return a preview/apply action list for an Agent Canvas removal."""
     if mode not in {"preserve", "remove-all"}:
         raise ValueError("mode must be preserve or remove-all")
-    root = root_path(target)
+    root, root_identity = root_path(target, with_identity=True)
     state_path = root / STATE
     state = read_state(root, allow_damaged=mode == "remove-all") if (state_path.exists() or state_path.is_symlink()) else None
     actions = []
@@ -423,7 +451,7 @@ def uninstall(target, *, mode="preserve", apply=False):
             continue
         if path.is_symlink():
             if mode == "remove-all":
-                planned_removal(root, path, actions, apply)
+                planned_removal(root, path, actions, apply, root_identity=root_identity)
             else:
                 actions.append(f"PRESERVE {name}: it is a symlink")
             continue
@@ -437,7 +465,7 @@ def uninstall(target, *, mode="preserve", apply=False):
         else:
             owned_unchanged = False
         if mode == "remove-all":
-            planned_removal(root, path, actions, apply)
+            planned_removal(root, path, actions, apply, root_identity=root_identity)
         elif owned_unchanged:
             if not planned_regular_removal(root, path, actions, apply, identity):
                 actions.append(f"PRESERVE {name}: it changed during cleanup")
@@ -453,7 +481,7 @@ def uninstall(target, *, mode="preserve", apply=False):
         exact = path.is_symlink() and os.readlink(path) == expected
         if exact:
             if mode == "remove-all":
-                planned_removal(root, path, actions, apply)
+                planned_removal(root, path, actions, apply, root_identity=root_identity)
             else:
                 # As with regular files, there is no portable unlink of the
                 # verified object. Never recursively remove a replacement.
@@ -468,7 +496,7 @@ def uninstall(target, *, mode="preserve", apply=False):
 
     if mode == "remove-all":
         for path in installer_adapter_links(root, pack):
-            planned_removal(root, path, actions, apply)
+            planned_removal(root, path, actions, apply, root_identity=root_identity)
 
     # A legacy or malformed adapter record cannot authorize unlinking a link,
     # but a changed link under a supported adapter directory can still retain a
@@ -499,13 +527,13 @@ def uninstall(target, *, mode="preserve", apply=False):
     if pack.exists() or pack.is_symlink():
         if pack.is_symlink():
             if mode == "remove-all":
-                planned_removal(root, pack, actions, apply)
+                planned_removal(root, pack, actions, apply, root_identity=root_identity)
             else:
                 actions.append("PRESERVE skills/addyosmani-agent-skills: it is a symlink")
             pack = None
     if pack and pack.exists():
         if mode == "remove-all":
-            planned_removal(root, pack, actions, apply)
+            planned_removal(root, pack, actions, apply, root_identity=root_identity)
         elif pack_referenced_by_modified_adapter:
             actions.append("PRESERVE skills/addyosmani-agent-skills: preserved adapter link may reference it")
         elif pack_matches:
@@ -517,17 +545,18 @@ def uninstall(target, *, mode="preserve", apply=False):
             actions.append("PRESERVE skills/addyosmani-agent-skills: not proven to be an unchanged Agent Canvas pack")
 
     if state or mode == "remove-all":
-        remove_ignore_entries(root, state or {}, actions, apply, remove_all=mode == "remove-all")
+        remove_ignore_entries(root, state or {}, actions, apply, remove_all=mode == "remove-all",
+                              root_identity=root_identity)
     if mode == "remove-all":
-        planned_removal(root, root / FOLLOWUP, actions, apply)
+        planned_removal(root, root / FOLLOWUP, actions, apply, root_identity=root_identity)
     elif state:
-        remove_followup_block(root, actions, apply)
+        remove_followup_block(root, actions, apply, root_identity=root_identity)
     if mode == "preserve" and state:
         actions.append("PRESERVE .agent-canvas/state.json: state cleanup requires --mode remove-all")
     elif state or mode == "remove-all":
         state_root = state_path.parent
         planned_removal(root, state_root if not state_root.is_dir() or state_root.is_symlink() else state_path,
-                        actions, apply)
+                        actions, apply, root_identity=root_identity)
     if not actions:
         actions.append("NO AGENT CANVAS ARTIFACTS FOUND")
     return apply, actions

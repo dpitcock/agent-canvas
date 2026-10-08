@@ -34,7 +34,7 @@ def is_plan(path, root):
     return any(part.lower() in PLAN_PARTS for part in relative.parts) or bool(PLAN_NAME.search(path.name))
 
 
-def nuke_path(root, path, actions, apply):
+def nuke_path(root, path, actions, apply, *, root_identity):
     safe_path(root, path)
     if not path.exists() and not path.is_symlink():
         return
@@ -44,26 +44,26 @@ def nuke_path(root, path, actions, apply):
     if path.is_symlink() or path.is_file():
         actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {path.relative_to(root)}")
         if apply:
-            remove_path(root, path, recursive=False)
+            remove_path(root, path, recursive=False, root_identity=root_identity)
         return
     if not path.is_dir():
         actions.append(f"PRESERVE SPECIAL {path.relative_to(root)}")
         return
     for child in sorted(path.iterdir(), key=lambda item: item.name):
-        nuke_path(root, child, actions, apply)
+        nuke_path(root, child, actions, apply, root_identity=root_identity)
     if path.exists() and path.is_dir() and not any(path.iterdir()):
         actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {path.relative_to(root)}/")
         if apply:
-            remove_path(root, path, recursive=False)
+            remove_path(root, path, recursive=False, root_identity=root_identity)
 
 
 def nuke(target, *, apply=False):
-    root = root_path(target)
+    root, root_identity = root_path(target, with_identity=True)
     actions = []
     for relative in TARGETS:
         path = root / relative
         if path.exists() or path.is_symlink():
-            nuke_path(root, path, actions, apply)
+            nuke_path(root, path, actions, apply, root_identity=root_identity)
     # Shared application directories are not agent-owned trees. Only the exact
     # installed filenames are reset; never recurse into a replacement directory
     # or follow a shared root symlink to find one of these names.
@@ -75,7 +75,7 @@ def nuke(target, *, apply=False):
             safe_path(root, path)
             actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {relative}")
             if apply:
-                remove_path(root, path, recursive=False)
+                remove_path(root, path, recursive=False, root_identity=root_identity)
     if not actions:
         actions.append("NO AGENT, GOVERNANCE, OR WORKFLOW ARTIFACTS FOUND")
     return apply, actions

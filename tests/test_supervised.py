@@ -40,6 +40,23 @@ def complete_from_another_process(state_dir, project, start, action_id):
 
 
 class SupervisedTasks(unittest.TestCase):
+    def test_legacy_later_invalid_validator_never_runs_first_validator(self):
+        for i, malformed in enumerate(({"command": "true"}, {"command": ["true"], "timeout_s": 0})):
+            with self.subTest(malformed=malformed):
+                task_id = f"legacy-validator-{i}"
+                marker = self.project / f"must-not-run-{i}"
+                task = self.host.create_task(task_id, self.project, [], validators=[
+                    {"id": "first", "command": [sys.executable, "-c",
+                        f"from pathlib import Path; Path({str(marker)!r}).touch()"]},
+                    {"id": "second", "command": ["true"]}])
+                task["validators"][1].update(malformed)
+                self.host._save_task(task)  # Simulate state saved before definition validation.
+                for attempt in ("first-attempt", "retry"):
+                    with self.assertRaises(ValueError):
+                        self.host.gate_final(task_id, attempt, "done", project=self.project)
+                self.assertFalse(marker.exists())
+                self.assertEqual(self.host.task(task_id, project=self.project)["status"], "active")
+
     def test_invalid_validator_definition_does_not_reserve_task_id(self):
         invalid = [{"command": value} for value in (None, "true", [], [1], [""], ["true", "a\x00b"], ["true", "\ud800"])]
         invalid += [{"command": ["true"], "timeout_s": value}

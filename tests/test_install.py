@@ -21,6 +21,90 @@ nuke_spec.loader.exec_module(agent_nuke)
 
 
 class InstallSmoke(unittest.TestCase):
+    def test_cleanup_rejects_project_replacement_after_selection_and_between_deletions(self):
+        for module in (uninstaller, agent_nuke):
+            for after_first in (False, True):
+                with self.subTest(module=module.__name__, after_first=after_first), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp).resolve() / "project"
+                    root.mkdir()
+                    original = root.with_name("original")
+                    for relative in ("AGENTS.md", "config/workspace-config.yml"):
+                        path = root / relative
+                        path.parent.mkdir(exist_ok=True)
+                        path.write_text("original")
+
+                    def swap():
+                        root.rename(original)
+                        root.mkdir()
+                        for relative in ("AGENTS.md", "config/workspace-config.yml"):
+                            path = root / relative
+                            path.parent.mkdir(exist_ok=True)
+                            path.write_text("replacement")
+
+                    select = module.root_path
+                    remove = module.remove_path
+                    swapped = False
+
+                    def select_then_swap(*args, **kwargs):
+                        result = select(*args, **kwargs)
+                        swap()
+                        return result
+
+                    def remove_then_swap(*args, **kwargs):
+                        nonlocal swapped
+                        result = remove(*args, **kwargs)
+                        if not swapped:
+                            swapped = True
+                            swap()
+                        return result
+
+                    hook = "remove_path" if after_first else "root_path"
+                    with patch.object(module, hook, side_effect=remove_then_swap if after_first else select_then_swap):
+                        try:
+                            if module is uninstaller:
+                                module.uninstall(root, mode="remove-all", apply=True)
+                            else:
+                                module.nuke(root, apply=True)
+                        except (OSError, ValueError):
+                            pass
+                    for relative in ("AGENTS.md", "config/workspace-config.yml"):
+                        self.assertTrue((root / relative).exists(), f"replacement deleted: {relative}")
+                        self.assertEqual((root / relative).read_text(), "replacement")
+                    self.assertEqual((original / "config/workspace-config.yml").read_text(), "original")
+                    if not after_first:
+                        self.assertEqual((original / "AGENTS.md").read_text(), "original")
+
+    def test_cleanup_does_not_rewrite_files_in_replacement_project(self):
+        for mode in ("preserve", "remove-all"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve() / "project"
+                root.mkdir()
+                original = root.with_name("original")
+                select = uninstaller.root_path
+                ignore = "application\n/.owner-override\n"
+                followup = "notes\n" + uninstaller.BEGIN + "\nmanaged\n" + uninstaller.END + "\n"
+
+                def swap(*args, **kwargs):
+                    selected = select(*args, **kwargs)
+                    root.rename(original)
+                    root.mkdir()
+                    (root / ".gitignore").write_text(ignore)
+                    (root / "INSTALL-FOLLOWUP.md").write_text(followup)
+                    (root / ".agent-canvas").mkdir()
+                    (root / ".agent-canvas/state.json").write_text(json.dumps({
+                        "schema_version": 1, "baselines": {},
+                        "provenance": {"gitignore_entries": ["/.owner-override"]},
+                    }))
+                    return selected
+
+                with patch.object(uninstaller, "root_path", side_effect=swap):
+                    try:
+                        uninstaller.uninstall(root, mode=mode, apply=True)
+                    except (OSError, ValueError):
+                        pass
+                self.assertEqual((root / ".gitignore").read_text(), ignore)
+                self.assertEqual((root / "INSTALL-FOLLOWUP.md").read_text(), followup)
+
     def test_remove_all_cleans_dangling_standard_links_without_pack_or_state(self):
         for damaged in (False, True):
             with self.subTest(damaged=damaged), tempfile.TemporaryDirectory() as tmp:
@@ -87,6 +171,7 @@ class InstallSmoke(unittest.TestCase):
             victim.mkdir()
             (victim / "application.txt").write_text("keep")
             safe_path = uninstaller.safe_path
+            _, root_identity = uninstaller.root_path(root, with_identity=True)
             swapped = False
 
             def swap_after_check(checked_root, path):
@@ -99,7 +184,7 @@ class InstallSmoke(unittest.TestCase):
 
             with patch.object(uninstaller, "safe_path", swap_after_check):
                 try:
-                    uninstaller.planned_removal(root, target, [], True)
+                    uninstaller.planned_removal(root, target, [], True, root_identity=root_identity)
                 except (OSError, ValueError):
                     pass
             self.assertTrue(swapped)
@@ -119,6 +204,7 @@ class InstallSmoke(unittest.TestCase):
             victim = outside / target.name
             victim.write_text("keep")
             held = root / "held"
+            _, root_identity = uninstaller.root_path(root, with_identity=True)
             real_open = os.open
 
             def swap_after_open(path, flags, *args, **kwargs):
@@ -129,7 +215,7 @@ class InstallSmoke(unittest.TestCase):
                 return fd
 
             with patch.object(os, "open", swap_after_open):
-                uninstaller.planned_removal(root, target, [], True)
+                uninstaller.planned_removal(root, target, [], True, root_identity=root_identity)
             self.assertEqual(victim.read_text(), "keep")
             self.assertTrue(config.is_symlink())
             self.assertFalse((held / target.name).exists())
@@ -141,9 +227,10 @@ class InstallSmoke(unittest.TestCase):
             pack.mkdir(parents=True)
             keep = pack / "SKILL.md"
             keep.write_text("keep")
+            _, root_identity = uninstaller.root_path(root, with_identity=True)
             with patch.object(uninstaller.shutil.rmtree, "avoids_symlink_attacks", False):
                 try:
-                    uninstaller.planned_removal(root, pack, [], True)
+                    uninstaller.planned_removal(root, pack, [], True, root_identity=root_identity)
                 except (OSError, ValueError):
                     pass
             self.assertTrue(keep.exists())
@@ -164,6 +251,7 @@ class InstallSmoke(unittest.TestCase):
                 victim = outside / "application.txt"
                 victim.write_text("keep")
                 real_stat = os.stat
+                _, root_identity = uninstaller.root_path(root, with_identity=True)
                 swapped = False
 
                 def swap_after_stat(path, *args, **kwargs):
@@ -177,7 +265,7 @@ class InstallSmoke(unittest.TestCase):
 
                 with patch.object(os, "stat", swap_after_stat):
                     try:
-                        uninstaller.planned_removal(root, target, [], True)
+                        uninstaller.planned_removal(root, target, [], True, root_identity=root_identity)
                     except (OSError, ValueError):
                         pass
                 self.assertTrue(swapped)
@@ -324,7 +412,9 @@ class InstallSmoke(unittest.TestCase):
             _, identity = uninstaller.regular_text_snapshot(root, path)
             os.link(path, base / "external")
             with self.assertRaisesRegex(ValueError, "Cannot safely update"):
-                uninstaller.replace_regular_snapshot(root, path, "changed", identity)
+                uninstaller.replace_regular_snapshot(
+                    root, path, "changed", identity,
+                    root_identity=uninstaller.root_path(root, with_identity=True)[1])
             self.assertEqual((base / "external").read_text(), "original")
 
     def test_preserve_pack_replacement_after_fingerprint_survives_preview_and_apply(self):
