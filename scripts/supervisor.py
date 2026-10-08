@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -20,6 +21,13 @@ import fcntl
 DEFAULT_PROHIBITED = ("push", "publish", "pr_create", "merge", "destructive", "credential_change",
                       "config_change", "external_message")
 TERMINAL_STATUSES = frozenset(("complete", "blocked", "cancelled"))
+_VALIDATOR_LAUNCHER = (
+    "import os, sys\n"
+    "directory = int(sys.argv[1])\n"
+    "os.fchdir(directory)\n"
+    "os.close(directory)\n"
+    "os.execvp(sys.argv[2], sys.argv[2:])\n"
+)
 
 
 class Decision:
@@ -424,21 +432,24 @@ class HostSupervisor:
         timeout = validator.get("timeout_s", 30)
         if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 300:
             raise ValueError("Host validator timeout_s must be between 0 and 300")
+        declared_command = command
+        launch_command = command
         run_options = {"capture_output": True, "text": True, "timeout": timeout, "check": False, "cwd": project}
         if project_descriptor is not None:
-            def change_to_registered_project():
-                os.fchdir(project_descriptor)
-
-            run_options.update(cwd=None, pass_fds=(project_descriptor,), preexec_fn=change_to_registered_project)
+            # A freshly started interpreter may safely fchdir before it execs the
+            # validator.  Avoid preexec_fn: it executes in the forked child of
+            # this potentially multithreaded supervisor and can deadlock there.
+            launch_command = [sys.executable, "-c", _VALIDATOR_LAUNCHER, str(project_descriptor), *command]
+            run_options.update(cwd=None, pass_fds=(project_descriptor,))
         try:
-            run = subprocess.run(command, **run_options)
+            run = subprocess.run(launch_command, **run_options)
             output = (_text_output(run.stdout) + _text_output(run.stderr))[:8192]
             status = run.returncode
         except subprocess.TimeoutExpired as error:
             output, status = _text_output(error.stdout)[:8192], "timeout"
-        executable = shutil.which(command[0]) or command[0]
+        executable = shutil.which(declared_command[0]) or declared_command[0]
         binary_digest = _binary_digest(executable, directory_descriptor=project_descriptor)
-        return {"command": command, "command_digest": _digest(command), "binary_digest": binary_digest,
+        return {"command": declared_command, "command_digest": _digest(declared_command), "binary_digest": binary_digest,
                 "exit_status": status, "output": output, "digest": hashlib.sha256(output.encode()).hexdigest(),
                 "timeout_s": timeout, "version": validator.get("version", "host-configured")}
 

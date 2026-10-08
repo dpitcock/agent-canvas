@@ -301,6 +301,10 @@ class SupervisedTasks(unittest.TestCase):
         run = supervisor.subprocess.run
 
         def replace_project_before_spawn(*args, **kwargs):
+            self.assertNotIn("preexec_fn", kwargs)
+            descriptor = kwargs["pass_fds"][0]
+            self.assertIsNone(kwargs["cwd"])
+            self.assertEqual(args[0][:4], [sys.executable, "-c", supervisor._VALIDATOR_LAUNCHER, str(descriptor)])
             self.project.rename(self.base / "registered-project")
             replacement.rename(self.project)
             return run(*args, **kwargs)

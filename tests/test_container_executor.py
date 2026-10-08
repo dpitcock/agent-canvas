@@ -70,6 +70,17 @@ class StagingTests(unittest.TestCase):
                     executor.stage_inputs(pinned, ["input.txt"], staging_parent, max_bytes=1024, max_files=1)
             self.assertEqual(list(redirected.iterdir()), [])
 
+    def test_rejects_staging_parent_inside_the_project(self):
+        """A project-controlled directory cannot hold the trusted snapshot."""
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            staging = project / ".agent-canvas" / "staging"
+            staging.mkdir(parents=True, mode=0o700)
+            (project / "input.txt").write_text("input")
+            with executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project)) as pinned:
+                with self.assertRaisesRegex(executor.ConfigurationError, "outside the project"):
+                    executor.stage_inputs(pinned, ["input.txt"], staging, max_bytes=1024, max_files=1)
+
     def test_stages_declared_regular_file_from_pinned_root_after_path_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -322,6 +333,60 @@ class RuntimeValidationTests(unittest.TestCase):
             self.assertTrue(receipt.output_truncated)
             self.assertEqual(receipt.output, "t")
             self.assertTrue(process.stdout.closed)
+
+    def test_truncated_output_accepts_a_container_that_exited_before_kill(self):
+        """Docker's kill race is safe only after inspect confirms the container exited."""
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as staging:
+            project = Path(directory) / "project"
+            project.mkdir()
+            (project / "input.txt").write_text("input")
+            request = executor.ExecutionRequest(
+                action_id="kill-race", attempt_id="one", project=project,
+                image="example/tool@sha256:" + "a" * 64, command=["tool"], inputs=["input.txt"], max_output_bytes=1,
+            )
+
+            class Stdout:
+                def read1(self, _size):
+                    return b"too much output"
+
+                def close(self):
+                    pass
+
+            class Process:
+                def __init__(self):
+                    self.stdout, self.returncode = Stdout(), 0
+
+                def poll(self):
+                    return None
+
+                def wait(self, **_kwargs):
+                    return 0
+
+            class Selector:
+                def register(self, *_args):
+                    pass
+
+                def select(self, **_kwargs):
+                    return [object()]
+
+                def close(self):
+                    pass
+
+            def docker_run(argv, **_kwargs):
+                if argv[1] == "create" or argv[1:3] == ["rm", "-f"]:
+                    return mock.Mock(returncode=0)
+                if argv[1] == "kill":
+                    return mock.Mock(returncode=1)
+                if argv[1:3] == ["container", "inspect"]:
+                    return mock.Mock(returncode=0, stdout="exited\n")
+                raise AssertionError(f"unexpected Docker command: {argv}")
+
+            with mock.patch.object(executor.ContainerExecutor, "_check_runtime", return_value=("27", "sha256:image")), \
+                 mock.patch.object(executor.subprocess, "run", side_effect=docker_run), \
+                 mock.patch.object(executor.subprocess, "Popen", return_value=Process()), \
+                 mock.patch.object(executor.selectors, "DefaultSelector", return_value=Selector()):
+                receipt = executor.ContainerExecutor.run(request, executor.ProjectIdentity.capture(project), Path(staging))
+            self.assertTrue(receipt.output_truncated)
 
     def test_requires_digest_pinned_image_and_rejects_host_fallback(self):
         with self.assertRaises(executor.ConfigurationError):

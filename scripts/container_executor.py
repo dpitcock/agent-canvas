@@ -164,8 +164,8 @@ class ProjectIdentity:
 class PinnedProject:
     """A retained root descriptor.  Never reopen the workspace by pathname."""
 
-    def __init__(self, fd, identity):
-        self.fd, self.identity = fd, identity
+    def __init__(self, fd, identity, path):
+        self.fd, self.identity, self.path = fd, identity, Path(path)
 
     @classmethod
     def open(cls, root, expected):
@@ -179,7 +179,16 @@ class PinnedProject:
         if identity != expected:
             os.close(fd)
             raise ConfigurationError("project root identity changed before staging")
-        return cls(fd, identity)
+        try:
+            path = Path(root).resolve(strict=True)
+            resolved = os.stat(path, follow_symlinks=False)
+        except OSError as error:
+            os.close(fd)
+            raise ConfigurationError("project root changed before staging") from error
+        if (resolved.st_dev, resolved.st_ino) != (identity.device, identity.inode):
+            os.close(fd)
+            raise ConfigurationError("project root changed before staging")
+        return cls(fd, identity, path)
 
     def close(self):
         if self.fd is not None:
@@ -271,6 +280,14 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
     paths = tuple(declared)
     if len(paths) > max_files:
         raise InputRejected("declared input count exceeds the staging limit")
+    try:
+        Path(staging_parent).resolve(strict=True).relative_to(project.path)
+    except ValueError:
+        pass
+    except OSError as error:
+        raise ConfigurationError("staging parent must be a real host-owned directory") from error
+    else:
+        raise ConfigurationError("staging parent must be outside the project")
     parent_fd = _open_staging_parent(staging_parent)
     stage_fd = None
     root = None
@@ -480,6 +497,18 @@ class ContainerExecutor:
             f"No such object: {name}",
         ))
 
+    @classmethod
+    def _container_exited(cls, name):
+        """Confirm the container already exited before accepting a failed kill."""
+        try:
+            inspected = subprocess.run(
+                [cls.RUNTIME, "container", "inspect", "--format", "{{.State.Status}}", name],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return inspected.returncode == 0 and inspected.stdout.strip() == "exited"
+
     @staticmethod
     def _remove_stage(path):
         """Do not return a validation receipt while a stage may still exist."""
@@ -551,7 +580,7 @@ class ContainerExecutor:
                     selector.close()
                     if timed_out or cancelled or truncated:
                         stopped = subprocess.run([cls.RUNTIME, "kill", name], capture_output=True, timeout=10, check=False)
-                        if stopped.returncode:
+                        if stopped.returncode and not cls._container_exited(name):
                             raise ConfigurationError("Docker could not stop the output-limited container")
                         # ``communicate`` would buffer every byte emitted after
                         # the cap.  Closing the pipe first bounds host memory;
