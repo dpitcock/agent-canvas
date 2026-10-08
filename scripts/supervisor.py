@@ -56,7 +56,8 @@ def _binary_digest(path, *, directory_descriptor=None):
             descriptor = os.open(path, flags, dir_fd=directory_descriptor)
         else:
             descriptor = os.open(path, flags)
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        mode = os.fstat(descriptor).st_mode
+        if not stat.S_ISREG(mode) or not mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
             return None
         digest = hashlib.sha256()
         while chunk := os.read(descriptor, 64 * 1024):
@@ -67,6 +68,22 @@ def _binary_digest(path, *, directory_descriptor=None):
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def _validator_binary_digest(command, *, directory_descriptor=None):
+    """Hash the executable exactly as execvp will resolve it for a pinned project."""
+    if directory_descriptor is None or os.path.isabs(command) or "/" in command:
+        executable = shutil.which(command) or command
+        return _binary_digest(executable, directory_descriptor=directory_descriptor)
+    for directory in os.get_exec_path():
+        candidate = os.path.join(directory, command) if directory else command
+        digest = _binary_digest(
+            candidate,
+            directory_descriptor=None if os.path.isabs(candidate) else directory_descriptor,
+        )
+        if digest is not None:
+            return digest
+    return None
 
 
 class HostSupervisor:
@@ -447,8 +464,7 @@ class HostSupervisor:
             status = run.returncode
         except subprocess.TimeoutExpired as error:
             output, status = _text_output(error.stdout)[:8192], "timeout"
-        executable = shutil.which(declared_command[0]) or declared_command[0]
-        binary_digest = _binary_digest(executable, directory_descriptor=project_descriptor)
+        binary_digest = _validator_binary_digest(declared_command[0], directory_descriptor=project_descriptor)
         return {"command": declared_command, "command_digest": _digest(declared_command), "binary_digest": binary_digest,
                 "exit_status": status, "output": output, "digest": hashlib.sha256(output.encode()).hexdigest(),
                 "timeout_s": timeout, "version": validator.get("version", "host-configured")}

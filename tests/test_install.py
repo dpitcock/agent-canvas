@@ -267,6 +267,27 @@ class InstallSmoke(unittest.TestCase):
                     if should_exist:
                         self.assertTrue(managed.is_dir())
 
+    def test_preserve_uninstall_does_not_remove_directory_replacing_owned_file_during_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "project"
+            installer.install(target, home=base / "home")
+            managed = target / "AGENTS.md"
+            original_removal = uninstaller.planned_regular_removal
+
+            def replace_before_removal(root, path, actions, apply, identity):
+                if path == managed.resolve():
+                    managed.unlink()
+                    managed.mkdir()
+                    (managed / "application-file").write_text("preserve")
+                return original_removal(root, path, actions, apply, identity)
+
+            with patch.object(uninstaller, "planned_regular_removal", replace_before_removal):
+                uninstaller.uninstall(target, mode="preserve", apply=True)
+
+            self.assertTrue(managed.is_dir())
+            self.assertEqual((managed / "application-file").read_text(), "preserve")
+
     def test_remove_all_unlinks_dangling_managed_file_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "project"

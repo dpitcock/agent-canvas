@@ -56,10 +56,11 @@ def regular_text_snapshot(root, path):
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     except OSError as error:
         raise ValueError(f"Cannot safely read regular file: {path}") from error
+    identity = os.fstat(descriptor)
+    if not stat.S_ISREG(identity.st_mode):
+        os.close(descriptor)
+        raise ValueError(f"Cannot safely read regular file: {path}")
     with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-        identity = os.fstat(handle.fileno())
-        if not stat.S_ISREG(identity.st_mode):
-            raise ValueError(f"Cannot safely read regular file: {path}")
         return handle.read(), (identity.st_dev, identity.st_ino)
 
 
@@ -276,6 +277,33 @@ def planned_removal(root, path, actions, apply):
         remove_empty_parents(root, path)
 
 
+def planned_regular_removal(root, path, actions, apply, identity):
+    """Remove only the regular file whose pinned identity was verified."""
+    safe_path(root, path)
+    if not path.exists() and not path.is_symlink():
+        return False
+    if apply:
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return False
+        try:
+            current = os.fstat(descriptor)
+            if (not stat.S_ISREG(current.st_mode)
+                    or (current.st_dev, current.st_ino) != identity):
+                return False
+        finally:
+            os.close(descriptor)
+        try:
+            # unlink() rejects a replacement directory, unlike remove_path().
+            os.unlink(path)
+        except OSError:
+            return False
+        remove_empty_parents(root, path)
+    actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {path.relative_to(root)}")
+    return True
+
+
 def remove_ignore_entries(root, state, actions, apply):
     path = root / ".gitignore"
     safe_path(root, path)
@@ -369,11 +397,20 @@ def uninstall(target, *, mode="preserve", apply=False):
             else:
                 actions.append(f"PRESERVE {name}: it is a symlink")
             continue
-        owned_unchanged = (path.is_file() and name in baselines and baselines[name] is not None
-                           and path.read_text() == baselines[name]
-                           and name in managed_files)
-        if mode == "remove-all" or owned_unchanged:
+        identity = None
+        if name in baselines and baselines[name] is not None and name in managed_files:
+            try:
+                contents, identity = regular_text_snapshot(root, path)
+            except ValueError:
+                contents = None
+            owned_unchanged = contents == baselines[name]
+        else:
+            owned_unchanged = False
+        if mode == "remove-all":
             planned_removal(root, path, actions, apply)
+        elif owned_unchanged:
+            if not planned_regular_removal(root, path, actions, apply, identity):
+                actions.append(f"PRESERVE {name}: it changed during cleanup")
         else:
             actions.append(f"PRESERVE {name}: not proven to be an unchanged Agent Canvas file")
 

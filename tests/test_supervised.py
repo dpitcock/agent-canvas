@@ -286,6 +286,25 @@ class SupervisedTasks(unittest.TestCase):
         receipt = self.host.task("task-1")["evidence"]["validators"]["project-check"]
         self.assertEqual(receipt["binary_digest"], hashlib.sha256(check.read_bytes()).hexdigest())
 
+    def test_validator_receipt_hashes_bare_executable_from_relative_path_entry(self):
+        """A bare command must be hashed as execvp resolves it after entering the project."""
+        check = self.project / "check"
+        check.write_text("#!/bin/sh\nexit 0\n")
+        check.chmod(0o700)
+        self.task(validators=[{
+            "id": "project-check-from-path",
+            "command": ["check"],
+            "timeout_s": 2,
+        }])
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+
+        with patch.dict(os.environ, {"PATH": f".{os.pathsep}{os.environ['PATH']}"}):
+            decision = self.host.gate_final("task-1", "attempt-1", "finished")
+
+        self.assertTrue(decision.release)
+        receipt = self.host.task("task-1")["evidence"]["validators"]["project-check-from-path"]
+        self.assertEqual(receipt["binary_digest"], hashlib.sha256(check.read_bytes()).hexdigest())
+
     def test_host_validator_remains_in_registered_directory_if_project_path_is_replaced(self):
         """A path replacement just before spawn must not validate the substitute project."""
         (self.project / "validator-input.txt").write_text("registered project\n")
