@@ -381,6 +381,43 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(decision.kind, "blocker")
         self.assertEqual(self.host.visible_messages("task-1"), ["Choose the deployment region."])
 
+    def test_delivery_audit_failure_can_retry_without_losing_or_duplicating_output(self):
+        cases = (
+            ("plain", [], [], "final_released", "complete", "finished"),
+            ("validated", [{"id": "check", "command": ["true"]}], [], "final_released", "complete", "finished"),
+            ("blocker", [], [{"id": "choice", "owner_action": "Choose a region."}], "blocker_delivered", "blocker", "Choose a region."),
+            ("validation-start", [{"id": "check", "command": ["true"]}], [], "validation_started", "complete", "finished"),
+            ("validation-receipt", [{"id": "check", "command": ["true"]}], [], "validator_received", "complete", "finished"),
+        )
+        for task_id, validators, blockers, failed_event, decision_kind, message in cases:
+            with self.subTest(task_id=task_id):
+                self.host.create_task(task_id, self.project, [], validators=validators, blockers=blockers)
+                renderer = self.renderer(task_id)
+                renderer.consume({"method": "item/completed", "params": {"item": {
+                    "type": "agentMessage", "id": "final", "phase": "final_answer", "text": "finished",
+                }}})
+                completion = {"method": "turn/completed", "params": {"turnId": "turn-1", "status": "completed"}}
+                original_event = self.host._event
+
+                def fail_audit(task_id, event, **kwargs):
+                    if event == failed_event:
+                        raise OSError("audit unavailable")
+                    return original_event(task_id, event, **kwargs)
+
+                with patch.object(self.host, "_validate", return_value=(True, {"check": {"exit_status": 0}})):
+                    with patch.object(self.host, "_event", side_effect=fail_audit):
+                        with self.assertRaisesRegex(OSError, "audit unavailable"):
+                            renderer.consume(completion)
+                    self.assertEqual(self.host.task(task_id)["status"], "active")
+                    self.assertNotIn("validation_attempt", self.host.task(task_id))
+                    self.assertEqual(self.host.visible_messages(task_id), [])
+                    self.assertEqual(renderer.consume(completion), [
+                        {"kind": "final", "content": message, "decision": decision_kind},
+                    ])
+                self.assertEqual(renderer.consume(completion), [])
+                self.assertFalse(self.host.gate_final(task_id, "replay", "finished").release)
+                self.assertEqual(self.host.visible_messages(task_id), [message])
+
     def test_completed_final_is_not_released_twice_when_a_turn_is_replayed(self):
         self.task()
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})

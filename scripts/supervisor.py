@@ -635,25 +635,46 @@ class HostSupervisor:
             if task["blockers"]:
                 blocker = task["blockers"][0]
                 message = blocker.get("owner_action", "Owner authorization is required.")
+                self._event(task_id, "blocker_delivered", project=task["project"], blocker_id=blocker.get("id"))
                 task["visible_messages"].append(message)
                 task["status"] = "blocked"
                 self._save_task(task)
-                self._event(task_id, "blocker_delivered", project=task["project"], blocker_id=blocker.get("id"))
                 return Decision("blocker", release=True, message=message)
             if not task["validators"]:
+                # Audit failure must leave delivery retryable.  Commit terminal
+                # state only after all fallible audit writes, under this lock.
+                self._event(task_id, "final_released", project=task["project"], attempt_id=attempt_id)
                 task["visible_messages"].append(content)
                 task["status"] = "complete"
                 self._save_task(task)
-                self._event(task_id, "final_released", project=task["project"], attempt_id=attempt_id)
                 return Decision("complete", release=True, message=content)
+            self._event(task_id, "validation_started", project=task["project"], attempt_id=attempt_id)
             task["status"] = "validating"
             task["validation_attempt"] = attempt_id
             self._save_task(task)
-            self._event(task_id, "validation_started", project=task["project"], attempt_id=attempt_id)
 
         try:
             valid, receipts = self._validate(task)
+            with self._locked_task(task_id, project=project) as current:
+                if current["status"] != "validating" or current.get("validation_attempt") != attempt_id:
+                    return Decision(current["status"], message="Automatic continuation is disabled until an explicit resume.")
+                current["evidence"]["validators"].update(receipts)
+                for validator_id, receipt in receipts.items():
+                    self._event(task_id, "validator_received", project=current["project"], validator_id=validator_id, receipt=receipt)
+                current.pop("validation_attempt", None)
+                if not valid:
+                    self._event(task_id, "continuation_queued", project=current["project"], reason="validator_failed")
+                    current["status"] = "active"
+                    self._save_task(current)
+                    return Decision("continue", message="Host validator failed; repair the reported action.")
+                self._event(task_id, "final_released", project=current["project"], attempt_id=attempt_id)
+                current["visible_messages"].append(content)
+                current["status"] = "complete"
+                self._save_task(current)
+                return Decision("complete", release=True, message=content)
         except Exception:
+            # Validation and delivery-audit failures both release this attempt's
+            # claim, so the renderer can retry without explicit recovery.
             with self._locked_task(task_id, project=project) as current:
                 if current["status"] == "validating" and current.get("validation_attempt") == attempt_id:
                     current["status"] = "active"
@@ -661,24 +682,6 @@ class HostSupervisor:
                     self._save_task(current)
                     self._event(task_id, "validation_aborted", project=current["project"], attempt_id=attempt_id)
             raise
-
-        with self._locked_task(task_id, project=project) as current:
-            if current["status"] != "validating" or current.get("validation_attempt") != attempt_id:
-                return Decision(current["status"], message="Automatic continuation is disabled until an explicit resume.")
-            current["evidence"]["validators"].update(receipts)
-            for validator_id, receipt in receipts.items():
-                self._event(task_id, "validator_received", project=current["project"], validator_id=validator_id, receipt=receipt)
-            current.pop("validation_attempt", None)
-            if not valid:
-                current["status"] = "active"
-                self._save_task(current)
-                self._event(task_id, "continuation_queued", project=current["project"], reason="validator_failed")
-                return Decision("continue", message="Host validator failed; repair the reported action.")
-            current["visible_messages"].append(content)
-            current["status"] = "complete"
-            self._save_task(current)
-            self._event(task_id, "final_released", project=current["project"], attempt_id=attempt_id)
-            return Decision("complete", release=True, message=content)
 
     def visible_messages(self, task_id, *, project=None):
         return self.task(task_id, project=project)["visible_messages"]
