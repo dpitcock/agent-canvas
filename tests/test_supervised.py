@@ -40,6 +40,19 @@ def complete_from_another_process(state_dir, project, start, action_id):
 
 
 class SupervisedTasks(unittest.TestCase):
+    def test_invalid_validator_definition_does_not_reserve_task_id(self):
+        invalid = [{"command": value} for value in (None, "true", [], [1], [""], ["true", "a\x00b"], ["true", "\ud800"])]
+        invalid += [{"command": ["true"], "timeout_s": value}
+                    for value in (None, True, "1", 0, -1, 301, 10**1000, float("nan"), float("inf"))]
+        for i, definition in enumerate(invalid):
+            with self.subTest(definition=repr(definition)):
+                task_id = f"invalid-validator-{i}"
+                with self.assertRaises(ValueError):
+                    self.host.create_task(task_id, self.project, [], validators=[{"id": "check", **definition}])
+                task = self.host.create_task(task_id, self.project, [],
+                    validators=[{"id": "check", "command": ["true", ""], "timeout_s": 0.5}])
+                self.assertEqual(task["validators"][0]["command"], ["true", ""])
+
     def test_malformed_blockers_rejected_before_task_persistence(self):
         for i, blocker in enumerate(("bad", None, [], {"owner_action": 42},
                                      {"owner_action": None}, {"owner_action": " "},

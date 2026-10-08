@@ -369,6 +369,8 @@ class HostSupervisor:
         actions = list(actions)
         validators = list(validators)
         self._validate_validator_ids(validators)
+        for validator in validators:
+            self._validate_validator_definition(validator)
         blockers = list(blockers)
         for blocker in blockers:
             if not isinstance(blocker, dict):
@@ -612,13 +614,26 @@ class HostSupervisor:
         process.wait(timeout=1)
         return _text_output(bytes(retained)), "timeout" if timed_out else process.returncode
 
-    def _validator_receipt(self, validator, *, project=None, project_descriptor=None):
+    @staticmethod
+    def _validate_validator_definition(validator):
         command = validator.get("command")
-        if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
+        if (not isinstance(command, list) or not command
+                or not all(isinstance(part, str) for part in command) or not command[0]):
             raise ValueError("Host validator command must be a nonempty argument list")
+        for part in command:
+            if "\x00" in part:
+                raise ValueError("Host validator arguments cannot contain NUL")
+            try:
+                part.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError("Host validator arguments must be valid UTF-8") from exc
         timeout = validator.get("timeout_s", 30)
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0 or timeout > 300:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 300 or not math.isfinite(timeout):
             raise ValueError("Host validator timeout_s must be between 0 and 300")
+        return command, timeout
+
+    def _validator_receipt(self, validator, *, project=None, project_descriptor=None):
+        command, timeout = self._validate_validator_definition(validator)
         declared_command = command
         snapshot_path, binary_digest = self._validator_snapshot(command[0], project_descriptor=project_descriptor)
         if snapshot_path is None or binary_digest is None:

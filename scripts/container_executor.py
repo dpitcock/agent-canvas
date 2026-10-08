@@ -547,7 +547,11 @@ class ContainerExecutor:
                                      capture_output=True, text=True, timeout=5, check=True).stdout.strip()
             # Inspect is intentionally before create: Docker create otherwise pulls a
             # missing image, which makes an unapproved image available implicitly.
-            image_metadata = runtime.run(["image", "inspect", request.image, "--format", "{{json .}}"],
+            # Return fixed-size metadata, not labels/history or volume names.
+            # A nonempty volume map needs only a constant rejection marker.
+            image_format = ('{"Id":{{json .Id}},"Config":{"Volumes":'
+                            '{{if .Config.Volumes}}{"declared":{}}{{else}}null{{end}}}}')
+            image_metadata = runtime.run(["image", "inspect", request.image, "--format", image_format],
                                             capture_output=True, text=True, timeout=5, check=True).stdout.strip()
         except (OSError, subprocess.SubprocessError) as error:
             raise ConfigurationError("Docker daemon or the pinned image is unavailable") from error

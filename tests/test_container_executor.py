@@ -663,8 +663,12 @@ class RuntimeValidationTests(unittest.TestCase):
                     mock.patch.object(executor.subprocess, "run", side_effect=[
                         SimpleNamespace(stdout="27\n"),
                         SimpleNamespace(stdout=json.dumps({"Id": image_id, "Config": config})),
-                    ]):
+                    ]) as run:
                 self.assertEqual(executor.ContainerExecutor._check_runtime(request, self.runtime), ("27", image_id))
+                # The CLI contract emits only an immutable ID and a constant
+                # volume marker, never labels/history or volume names.
+                self.assertEqual(run.call_args.args[0][-1],
+                    '{"Id":{{json .Id}},"Config":{"Volumes":{{if .Config.Volumes}}{"declared":{}}{{else}}null{{end}}}}')
 
     def test_runtime_rejects_volumes_and_malformed_metadata_before_create(self):
         project_dir = tempfile.TemporaryDirectory()
