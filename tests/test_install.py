@@ -181,6 +181,93 @@ class InstallSmoke(unittest.TestCase):
             self.assertNotIn("pack", installer.read_state(root)["adapters"])
             self.assertFalse((root / ".agents/skills/addy-example").is_symlink())
             self.assertIn("FAILED skill installation:", (root / "INSTALL-FOLLOWUP.md").read_text())
+            self.assertEqual(sorted(p.name for p in (root / "skills").iterdir()),
+                             ["addyosmani-agent-skills.ref"])
+            _, actions = installer.install(root, apply=True, skills=True, home=base / "home", downloader=download)
+            self.assertFalse([action for action in actions if action.startswith("FAILED")], actions)
+            self.assertEqual((root / "skills/addyosmani-agent-skills/skills/example/SKILL.md").read_text(),
+                             "example")
+            self.assertTrue((root / ".agents/skills/addy-example").is_symlink())
+            self.assertEqual(sorted(p.name for p in (root / "skills").iterdir()),
+                             ["addyosmani-agent-skills", "addyosmani-agent-skills.ref"])
+
+    def test_invalid_download_does_not_block_valid_retry(self):
+        for invalid in ("empty", "symlink"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                root = base / "project"
+
+                def download(destination, revision):
+                    skill = destination / "skills/example"
+                    skill.mkdir(parents=True)
+                    (skill / "SKILL.md").write_text("example")
+
+                def invalid_download(destination, revision):
+                    download(destination, revision)
+                    if invalid == "empty":
+                        (destination / "skills/example/SKILL.md").unlink()
+                    else:
+                        (destination / "unexpected").symlink_to("skills")
+
+                _, actions = installer.install(root, skills=True, home=base / "home", downloader=invalid_download)
+                self.assertTrue(any(action.startswith("FAILED skill installation:") for action in actions))
+                self.assertEqual(sorted(p.name for p in (root / "skills").iterdir()),
+                                 ["addyosmani-agent-skills.ref"])
+                _, actions = installer.install(root, apply=True, skills=True, home=base / "home", downloader=download)
+                self.assertFalse([action for action in actions if action.startswith("FAILED")], actions)
+                self.assertTrue((root / ".agents/skills/addy-example").is_symlink())
+
+    def test_failed_copy_cleanup_stays_in_original_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "project"
+
+            def download(destination, revision):
+                skill = destination / "skills/example"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("example")
+
+            def replace_then_fail(incoming, destination):
+                root.rename(base / "original")
+                root.mkdir()
+                (root / "application.txt").write_text("keep")
+                raise OSError("Disk full")
+
+            with patch.object(installer.shutil, "copyfileobj", side_effect=replace_then_fail):
+                with self.assertRaisesRegex(ValueError, "Project directory changed"):
+                    installer.install(root, skills=True, home=base / "home", downloader=download)
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["application.txt"])
+            self.assertEqual(sorted(p.name for p in (base / "original/skills").iterdir()),
+                             ["addyosmani-agent-skills.ref"])
+
+    def test_pack_publication_preserves_destination_created_during_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "project"
+            pack = root / "skills/addyosmani-agent-skills"
+
+            def download(destination, revision):
+                skill = destination / "skills/example"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("example")
+
+            copy_file = installer.shutil.copyfileobj
+            created = None
+
+            def create_then_copy(incoming, destination):
+                nonlocal created
+                pack.mkdir()
+                created = pack.stat().st_ino
+                return copy_file(incoming, destination)
+
+            with patch.object(installer.shutil, "copyfileobj", side_effect=create_then_copy):
+                _, actions = installer.install(root, skills=True, home=base / "home", downloader=download)
+            self.assertTrue(any(action.startswith("FAILED skill installation:") for action in actions))
+            self.assertEqual(pack.stat().st_ino, created)
+            self.assertEqual(list(pack.iterdir()), [])
+            self.assertNotIn("pack", installer.read_state(root)["adapters"])
+            self.assertEqual(sorted(p.name for p in pack.parent.iterdir()),
+                             ["addyosmani-agent-skills", "addyosmani-agent-skills.ref"])
 
     def test_new_project_can_be_installed_with_supervision(self):
         with tempfile.TemporaryDirectory() as tmp:

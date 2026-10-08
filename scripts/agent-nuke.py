@@ -29,6 +29,8 @@ PLAN_NAME = re.compile(r"(?:^|[-_.])(plan|plans|epic|epics|task|tasks|spec|specs
 
 def is_plan(path, root):
     relative = path.relative_to(root)
+    if relative.parts[:2] == (".github", "workflows"):
+        return False
     if relative.parts[0] in AGENT_TREES:
         return False
     return any(part.lower() in PLAN_PARTS for part in relative.parts) or bool(PLAN_NAME.search(path.name))

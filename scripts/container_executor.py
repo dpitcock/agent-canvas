@@ -405,8 +405,13 @@ class ExecutionRequest:
     pids: int = 64
 
     def __post_init__(self):
-        if not self.action_id or not self.attempt_id:
-            raise ConfigurationError("action and attempt identifiers are required")
+        for identifier in (self.action_id, self.attempt_id):
+            if not isinstance(identifier, str) or not identifier.strip():
+                raise ConfigurationError("action and attempt identifiers must be nonempty strings")
+            try:
+                identifier.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ConfigurationError("action and attempt identifiers must be valid UTF-8") from error
         if not isinstance(self.image, str) or self.image.count(_DIGEST_PREFIX) != 1:
             raise ConfigurationError("image must be digest-pinned (name@sha256:<digest>)")
         _, digest = self.image.rsplit(_DIGEST_PREFIX, 1)
@@ -633,11 +638,11 @@ class ContainerExecutor:
     @classmethod
     def _run(cls, request, identity, staging_parent, runtime, cancellation):
         version, _image_id = cls._check_runtime(request, runtime)
-        with PinnedProject.open(request.project, identity) as pinned:
-            snapshot = stage_inputs(pinned, request.inputs, staging_parent, max_bytes=16 * 1024 * 1024, max_files=128)
         name = "agent-canvas-" + _sha256(f"{request.action_id}:{request.attempt_id}:{uuid.uuid4()}".encode())[:24]
         output, truncated, timed_out, cancelled, status = b"", False, False, False, "launch_failed"
         create_attempted = False
+        with PinnedProject.open(request.project, identity) as pinned:
+            snapshot = stage_inputs(pinned, request.inputs, staging_parent, max_bytes=16 * 1024 * 1024, max_files=128)
         try:
             # A cancellation before either Docker lifecycle transition must not
             # start a new container.  Staging remains necessary to bind the

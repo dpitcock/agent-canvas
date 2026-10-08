@@ -672,6 +672,31 @@ def copy_pack(source, parent, name):
         raise ValueError(f"Skill pack contains a non-regular file: {source}")
 
 
+def publish_pack(source, parent, name):
+    """Publish a complete copy, keeping failed copies out of the final name."""
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise ValueError("Safe skill-pack cleanup is unavailable on this platform")
+    temporary = f".agent-canvas-pack-{uuid.uuid4().hex}"
+    os.mkdir(temporary, 0o700, dir_fd=parent)
+    descriptor = None
+    try:
+        descriptor = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        copy_pack(source, descriptor, "pack")
+        # Preserve a destination created while downloading/copying, including
+        # an empty directory (which rename would otherwise replace).
+        try:
+            os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(f"Skill pack destination already exists: {name}")
+        os.rename("pack", name, src_dir_fd=descriptor, dst_dir_fd=parent)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        shutil.rmtree(temporary, dir_fd=parent)
+
+
 def render_files(source, *, workspace, environment, role, slack):
     rules = (source / "AGENTS.md").read_text()
     if role == "application":
@@ -770,13 +795,14 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
                 with tempfile.TemporaryDirectory(prefix=".agent-canvas-download-") as tmp:
                     checkout = Path(tmp) / "pack"
                     downloader(checkout, ref)
+                    discovered_skills = sorted((checkout / "skills").glob("*/SKILL.md"))
+                    if not discovered_skills:
+                        raise ValueError("Skill pack is empty")
+                    fingerprint = pack_fingerprint(checkout)
                     with pinned_parent(root, pack, create=True, root_identity=root_identity) as (parent, name):
-                        copy_pack(checkout, parent, name)
-                discovered_skills = sorted((pack / "skills").glob("*/SKILL.md"))
-                if not discovered_skills:
-                    raise ValueError("Skill pack is empty")
+                        publish_pack(checkout, parent, name)
                 adapter_state.setdefault("adapters", {"links": {}, "pending": []})["pack"] = {
-                    "revision": ref, "fingerprint": pack_fingerprint(pack)}
+                    "revision": ref, "fingerprint": fingerprint}
                 actions.append(f"ADD Osmani skill pack; found {len(discovered_skills)} skills")
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
                 actions.append(f"FAILED skill installation: {error}; retain safe additions and resolve in follow-up")
