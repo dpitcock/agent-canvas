@@ -378,6 +378,16 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
         try:
             if snapshot is not None:
                 cleanup_ok = snapshot.remove()
+            elif root is not None:
+                # No files have been copied before the stage descriptor opens.
+                # Remove the empty directory without acquiring another fd.
+                try:
+                    os.rmdir(root.name, dir_fd=parent_fd)
+                    cleanup_ok = True
+                except FileNotFoundError:
+                    cleanup_ok = True
+                except OSError:
+                    cleanup_ok = False
         finally:
             if snapshot is not None:
                 snapshot.close()
@@ -417,7 +427,7 @@ class ExecutionRequest:
         _, digest = self.image.rsplit(_DIGEST_PREFIX, 1)
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise ConfigurationError("image digest must be a lower-case sha256")
-        if not self.command or not all(isinstance(value, str) and value for value in self.command):
+        if not isinstance(self.command, (list, tuple)) or not self.command or not all(isinstance(value, str) and value for value in self.command):
             raise ConfigurationError("command must be a nonempty argument vector")
         if not isinstance(self.timeout_s, int) or not 0 < self.timeout_s <= 300:
             raise ConfigurationError("timeout must be between one and 300 seconds")
@@ -684,10 +694,10 @@ class ContainerExecutor:
                             if truncated:
                                 break
                             continue
-                        if process.poll() is not None:
-                            # A terminated writer cannot add new bytes.  An
-                            # empty read is EOF, so all bounded output has
-                            # already been captured.
+                        if events and process.poll() is not None:
+                            # Only an actual empty read is EOF. A selector
+                            # timeout followed by exit may still leave bytes
+                            # to drain on the next iteration under these caps.
                             break
                         if not events:
                             continue

@@ -236,6 +236,25 @@ class TrustedRuntimeTests(unittest.TestCase):
 
 
 class StagingTests(unittest.TestCase):
+    def test_stage_open_failure_removes_new_empty_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project, staging = base / "project", base / "staging"
+            project.mkdir()
+            staging.mkdir(mode=0o700)
+            original_open = os.open
+
+            def fail_stage_open(path, flags, *args, **kwargs):
+                if str(path).startswith("agent-canvas-input-") and kwargs.get("dir_fd") is not None:
+                    raise OSError("descriptor limit")
+                return original_open(path, flags, *args, **kwargs)
+
+            with executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project)) as pinned:
+                with mock.patch.object(executor.os, "open", side_effect=fail_stage_open):
+                    with self.assertRaises((OSError, executor.ConfigurationError)):
+                        executor.stage_inputs(pinned, [], staging, max_bytes=1024, max_files=1)
+            self.assertEqual(list(staging.iterdir()), [])
+
     def test_parent_replacement_after_snapshot_creation_does_not_redirect_stage_io(self):
         """The descriptor-owned stage remains isolated even if its visible path moves."""
         with tempfile.TemporaryDirectory() as directory:
@@ -399,6 +418,12 @@ class StagingTests(unittest.TestCase):
 
 
 class RuntimeValidationTests(unittest.TestCase):
+    def test_command_requires_an_argument_vector(self):
+        for command in ("tool", {"tool": "arg"}, {"tool"}, b"tool"):
+            with self.subTest(command=command), self.assertRaises(executor.ConfigurationError):
+                executor.ExecutionRequest(action_id="a", attempt_id="b", project=Path("/tmp/project"),
+                    image="example/tool@sha256:" + "a" * 64, command=command, inputs=[])
+
     def setUp(self):
         # These tests isolate lifecycle/metadata behavior; real executable
         # selection and subprocess launches are covered by TrustedRuntimeTests.
@@ -562,10 +587,16 @@ class RuntimeValidationTests(unittest.TestCase):
                     return 0
 
             class Selector:
+                def __init__(self):
+                    self.first = True
+
                 def register(self, *_args):
                     pass
 
                 def select(self, **_kwargs):
+                    if self.first:
+                        self.first = False
+                        return []  # Exit became observable after this timeout.
                     return [object()]
 
                 def close(self):
