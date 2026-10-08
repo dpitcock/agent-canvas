@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import uuid
 
 
 MANAGED = (
@@ -68,8 +69,13 @@ def safe_path(root, path):
     raise ValueError(f"Path is outside the project: {path}")
 
 
+def snapshot_identity(status):
+    return (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns,
+            status.st_ctime_ns, status.st_mode, status.st_nlink)
+
+
 def regular_text_snapshot(root, path):
-    """Return text and inode identity from a no-follow regular-file descriptor."""
+    """Return text and change metadata from a no-follow regular-file descriptor."""
     safe_path(root, path)
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
@@ -80,7 +86,10 @@ def regular_text_snapshot(root, path):
         os.close(descriptor)
         raise ValueError(f"Cannot safely read regular file: {path}")
     with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-        return handle.read(), (identity.st_dev, identity.st_ino)
+        text = handle.read()
+        if snapshot_identity(os.fstat(handle.fileno())) != snapshot_identity(identity):
+            raise ValueError(f"File changed while reading: {path}")
+        return text, snapshot_identity(identity)
 
 
 def read_regular_text(root, path):
@@ -90,29 +99,53 @@ def read_regular_text(root, path):
 
 def replace_regular_snapshot(root, path, text, identity, *, root_identity):
     """Rewrite only the exact regular file that was read for this operation."""
+    payload = text.encode("utf-8")
     safe_path(root, path)
     # Only the two root-level shared files are rewritten. Open through the
     # checked root descriptor so a later rename cannot redirect the write.
     if path.parent != root:
         raise ValueError(f"Cannot safely update non-root file: {path}")
     root_descriptor = open_project_root(root, root_identity)
+    temporary = None
     try:
         try:
             descriptor = os.open(path.name, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW,
                                  dir_fd=root_descriptor)
         except OSError as error:
             raise ValueError(f"Cannot safely update regular file: {path}") from error
-    finally:
-        os.close(root_descriptor)
-    with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
-        current = os.fstat(handle.fileno())
-        if (not stat.S_ISREG(current.st_mode)
-                or current.st_nlink != 1
-                or (current.st_dev, current.st_ino) != identity):
+        try:
+            current = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                or snapshot_identity(current) != identity):
             raise ValueError(f"Cannot safely update regular file: {path}")
-        handle.seek(0)
-        handle.truncate()
-        handle.write(text)
+        name = f".agent-canvas-cleanup-{uuid.uuid4().hex}"
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=root_descriptor)
+        temporary = name
+        try:
+            os.fchmod(descriptor, stat.S_IMODE(current.st_mode))
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("Cleanup write made no progress")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        observed = os.stat(path.name, dir_fd=root_descriptor, follow_symlinks=False)
+        if snapshot_identity(observed) != identity:
+            raise ValueError(f"Cannot safely update changed regular file: {path}")
+        os.replace(temporary, path.name, src_dir_fd=root_descriptor, dst_dir_fd=root_descriptor)
+        temporary = None
+    finally:
+        try:
+            if temporary is not None:
+                os.unlink(temporary, dir_fd=root_descriptor)
+        finally:
+            os.close(root_descriptor)
 
 
 def remove_path(root, path, *, recursive=True, root_identity):
