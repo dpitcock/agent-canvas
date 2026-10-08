@@ -444,6 +444,7 @@ class ExecutionRequest:
             raise ConfigurationError("CPU limit must be numeric") from error
         if not 0 < cpus <= 4:
             raise ConfigurationError("CPU limit must be greater than zero and at most four")
+        object.__setattr__(self, "cpus", format(cpus, ".15g"))
         object.__setattr__(self, "command", tuple(self.command))
         if not isinstance(self.inputs, (list, tuple)):
             raise ConfigurationError("inputs must be an ordered list or tuple of paths")

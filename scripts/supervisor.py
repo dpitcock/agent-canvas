@@ -345,34 +345,38 @@ class HostSupervisor:
         stays on the same inode; recovery only truncates an unfinished tail.
         """
         path = self._event_path(task_id, project)
-        with path.open("a+b", buffering=0) as out:
+        # Buffer reads for audit iteration; writes use os.write exclusively, so
+        # closing this stream after unlocking cannot flush a pending record.
+        with path.open("a+b") as out:
             fcntl.flock(out, fcntl.LOCK_EX)
             try:
-                out.seek(0)
-                data = out.read()
-                boundary = data.rfind(b"\n") + 1
-                try:
-                    events = [json.loads(line.decode("utf-8"))
-                              for line in data[:boundary].split(b"\n")[:-1]]
-                    if any(not isinstance(event, dict) or not {"task_id", "at", "type"} <= event.keys()
-                           for event in events):
-                        raise ValueError("Invalid audit event")
-                except (ValueError, UnicodeError) as error:
-                    raise ValueError(f"Host audit is unreadable: {path}") from error
-                # Validate complete records first: corruption must remain visible,
-                # even when an interrupted append follows the damaged record.
-                if boundary != len(data):
+                size = out.seek(0, os.SEEK_END)
+                cursor = size
+                boundary = 0
+                # Appends inspect only the unfinished tail, in bounded blocks.
+                # Complete records (including corruption) are left untouched;
+                # audit() validates them while streaming the history.
+                while cursor:
+                    start = max(0, cursor - 65536)
+                    out.seek(start)
+                    chunk = out.read(cursor - start)
+                    newline = chunk.rfind(b"\n")
+                    if newline >= 0:
+                        boundary = start + newline + 1
+                        break
+                    cursor = start
+                if boundary != size:
                     out.truncate(boundary)
                     out.flush()
                     os.fsync(out.fileno())
                 out.seek(0, os.SEEK_END)
-                yield out, events
+                yield out
             finally:
                 fcntl.flock(out, fcntl.LOCK_UN)
 
     def _event(self, task_id, event_type, *, project=None, **details):
         event = {"at": _now(), "type": event_type, "task_id": task_id, **details}
-        with self._locked_audit(task_id, project) as (out, _):
+        with self._locked_audit(task_id, project) as out:
             remaining = memoryview((json.dumps(event, sort_keys=True) + "\n").encode("utf-8"))
             while remaining:
                 written = os.write(out.fileno(), remaining)
@@ -387,8 +391,18 @@ class HostSupervisor:
         # The terminal decision and its audit event share one atomic task write.
         # Progress events remain in JSONL; it is not the complete delivery ledger.
         with self._locked_task(task_id, project=project) as task:
-            with self._locked_audit(task_id, project) as (_, events):
-                events = [event for event in events if event["task_id"] == task_id]
+            events = []
+            with self._locked_audit(task_id, project) as source:
+                source.seek(0)
+                try:
+                    for line in source:
+                        event = json.loads(line.decode("utf-8"))
+                        if not isinstance(event, dict) or not {"task_id", "at", "type"} <= event.keys():
+                            raise ValueError("Invalid audit event")
+                        if event["task_id"] == task_id:
+                            events.append(event)
+                except (ValueError, UnicodeError) as error:
+                    raise ValueError(f"Host audit is unreadable: {source.name}") from error
             if task.get("release_event"):
                 events.append(task["release_event"])
             return sorted(events, key=lambda event: event["at"])

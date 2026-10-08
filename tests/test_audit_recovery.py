@@ -5,6 +5,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import tempfile
+import tracemalloc
 import unittest
 from unittest.mock import patch
 
@@ -69,19 +70,85 @@ class AuditRecovery(unittest.TestCase):
         event = self.host._event("second", "resumed", project=self.project)
         self.assertEqual(self.path.read_bytes(), original + (json.dumps(event, sort_keys=True) + "\n").encode())
 
-    def test_complete_corruption_fails_closed_for_read_and_append(self):
+    def test_append_preserves_complete_corruption_and_read_reports_it(self):
         original = self.path.read_bytes()
         for corruption in (b'{broken}\n', b'\xff\n'):
             with self.subTest(corruption=corruption):
                 contents = original + corruption + original + b'{"partial":'
                 self.path.write_bytes(contents)
-                for operation in (
-                    lambda: self.host.audit("second", project=self.project),
-                    lambda: self.host._event("second", "resumed", project=self.project),
-                ):
-                    with self.assertRaises(ValueError):
-                        operation()
-                    self.assertEqual(self.path.read_bytes(), contents)
+                event = self.host._event("second", "resumed", project=self.project)
+                self.assertEqual(self.path.read_bytes(), original + corruption + original
+                                 + (json.dumps(event, sort_keys=True) + "\n").encode())
+                with self.assertRaises(ValueError):
+                    self.host.audit("second", project=self.project)
+                self.assertIn(corruption, self.path.read_bytes())
+
+    def test_append_recovers_empty_or_entirely_unfinished_log(self):
+        for tail in (b"", b'{"partial":"' + b'x' * 150000 + b'\xe2\x82'):
+            with self.subTest(tail_size=len(tail)):
+                self.path.write_bytes(tail)
+                event = self.host._event("second", "resumed", project=self.project)
+                self.assertEqual(self.path.read_bytes(),
+                                 (json.dumps(event, sort_keys=True) + "\n").encode())
+                self.assertEqual(self.host.audit("second", project=self.project), [event])
+
+    def test_append_reads_only_bounded_tail_independent_of_history_size(self):
+        real_open = Path.open
+        reads = []
+        testcase = self
+
+        class ObservedFile:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+            def read(self, size=-1):
+                testcase.assertGreaterEqual(size, 0, "Audit append read the entire history")
+                testcase.assertLessEqual(size, 65536)
+                data = self.stream.read(size)
+                reads.append(len(data))
+                return data
+
+        def observed_open(path, *args, **kwargs):
+            stream = real_open(path, *args, **kwargs)
+            return ObservedFile(stream) if path == self.path else stream
+
+        record = b'{"task_id":"other","at":0,"type":"history"}\n'
+        for tail in (b"", b'{"partial":"' + b'x' * 150000 + b'\xe2\x82'):
+            totals = []
+            for count in (2048, 65536):
+                history = record * count
+                self.path.write_bytes(history + tail)
+                reads.clear()
+                with patch.object(Path, "open", observed_open):
+                    event = self.host._event("second", "resumed", project=self.project)
+                totals.append(sum(reads))
+                self.assertEqual(self.path.read_bytes(), history
+                                 + (json.dumps(event, sort_keys=True) + "\n").encode())
+            self.assertEqual(totals[0], totals[1], "Append I/O grew with complete history")
+            self.assertLessEqual(totals[1], len(tail) + 65536)
+
+    def test_audit_does_not_retain_unrelated_task_history(self):
+        original = self.path.read_bytes()
+        record = (json.dumps({"task_id": "other", "at": 0, "type": "history",
+                              "message": "x" * 256}) + "\n").encode()
+        self.path.write_bytes(original + record * 20000)
+        tracemalloc.start()
+        try:
+            events = self.host.audit("first", project=self.project)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual([event["type"] for event in events], ["task_created"])
+        self.assertLess(peak, 2 * 1024 * 1024, "Audit retained unrelated history in memory")
 
     def test_other_task_read_and_append_wait_for_active_writer(self):
         context = multiprocessing.get_context("fork")

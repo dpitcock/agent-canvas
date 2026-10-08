@@ -679,6 +679,8 @@ def publish_pack(source, parent, name):
     temporary = f".agent-canvas-pack-{uuid.uuid4().hex}"
     os.mkdir(temporary, 0o700, dir_fd=parent)
     descriptor = None
+    published = False
+    cleanup_warning = None
     try:
         descriptor = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
         copy_pack(source, descriptor, "pack")
@@ -691,10 +693,17 @@ def publish_pack(source, parent, name):
         else:
             raise FileExistsError(f"Skill pack destination already exists: {name}")
         os.rename("pack", name, src_dir_fd=descriptor, dst_dir_fd=parent)
+        published = True
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        shutil.rmtree(temporary, dir_fd=parent)
+        try:
+            shutil.rmtree(temporary, dir_fd=parent)
+        except OSError as error:
+            if not published:
+                raise
+            cleanup_warning = f"Published skill pack; temporary cleanup failed: {error}"
+    return cleanup_warning
 
 
 def render_files(source, *, workspace, environment, role, slack):
@@ -786,6 +795,7 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
         elif not active:
             actions.append("WOULD DOWNLOAD Osmani skills at the retained .ref version; check enabled plugins first")
         else:
+            pack_published = False
             try:
                 ref = (root / "skills/addyosmani-agent-skills.ref").read_text().strip()
                 if not re.fullmatch(r"[0-9a-fA-F]{40}", ref):
@@ -800,12 +810,18 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
                         raise ValueError("Skill pack is empty")
                     fingerprint = pack_fingerprint(checkout)
                     with pinned_parent(root, pack, create=True, root_identity=root_identity) as (parent, name):
-                        publish_pack(checkout, parent, name)
-                adapter_state.setdefault("adapters", {"links": {}, "pending": []})["pack"] = {
-                    "revision": ref, "fingerprint": fingerprint}
+                        cleanup_warning = publish_pack(checkout, parent, name)
+                    pack_published = True
+                    adapter_state.setdefault("adapters", {"links": {}, "pending": []})["pack"] = {
+                        "revision": ref, "fingerprint": fingerprint}
+                    if cleanup_warning:
+                        actions.append(f"WARNING {cleanup_warning}")
                 actions.append(f"ADD Osmani skill pack; found {len(discovered_skills)} skills")
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
-                actions.append(f"FAILED skill installation: {error}; retain safe additions and resolve in follow-up")
+                if pack_published:
+                    actions.append(f"WARNING skill pack published; post-publication cleanup failed: {error}")
+                else:
+                    actions.append(f"FAILED skill installation: {error}; retain safe additions and resolve in follow-up")
     else:
         actions.append("SKIP skill downloads; use follow-up to confirm existing packs or install missing ones")
     operations, adapter_actions = adapter_plan(root, environments, adapter_state, home=home)
