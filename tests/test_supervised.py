@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -108,6 +109,12 @@ class SupervisedTasks(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "authorization"):
                     self.host.create_task(task_id, self.project, [action],
                                           permitted_operations=permitted_operations)
+
+    def test_task_creation_rejects_prohibited_authorization_even_without_actions(self):
+        """A task must not persist a default-prohibited capability for later use."""
+        with self.assertRaisesRegex(ValueError, "prohibited"):
+            self.host.create_task("push-capability", self.project, [],
+                                  permitted_operations=("read", "push"))
 
     def test_task_creation_preserves_generator_definitions(self):
         actions = ({"id": "write-doc", "operation": "write"} for _ in range(1))
@@ -286,6 +293,35 @@ class SupervisedTasks(unittest.TestCase):
         receipt = self.host.task("task-1")["evidence"]["validators"]["project-check"]
         self.assertEqual(receipt["binary_digest"], hashlib.sha256(check.read_bytes()).hexdigest())
 
+    def test_validator_receipt_hashes_the_project_executable_snapshot_it_runs(self):
+        """Rewriting a validator after launch must not change the executed-binary receipt."""
+        check = self.project / "check"
+        original = b"#!/bin/sh\necho started > started\nsleep 0.2\necho original\n"
+        replacement = b"#!/bin/sh\necho replacement\n"
+        check.write_bytes(original)
+        check.chmod(0o700)
+        result = []
+
+        with self.host._pinned_registered_project(self.project) as descriptor:
+            worker = threading.Thread(target=lambda: result.append(self.host._validator_receipt(
+                {"id": "project-check", "command": ["./check"], "timeout_s": 2},
+                project_descriptor=descriptor,
+            )))
+            worker.start()
+            deadline = time.monotonic() + 2
+            while not (self.project / "started").exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue((self.project / "started").exists())
+            check.write_bytes(replacement)
+            check.chmod(0o700)
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        receipt = result[0]
+        self.assertEqual(receipt["exit_status"], 0)
+        self.assertIn("original", receipt["output"])
+        self.assertEqual(receipt["binary_digest"], hashlib.sha256(original).hexdigest())
+
     def test_validator_receipt_hashes_bare_executable_from_relative_path_entry(self):
         """A bare command must be hashed as execvp resolves it after entering the project."""
         check = self.project / "check"
@@ -317,7 +353,7 @@ class SupervisedTasks(unittest.TestCase):
             "timeout_s": 2,
         }])
         task = self.host.task("task-1")
-        run = supervisor.subprocess.run
+        popen = supervisor.subprocess.Popen
 
         def replace_project_before_spawn(*args, **kwargs):
             self.assertNotIn("preexec_fn", kwargs)
@@ -326,9 +362,9 @@ class SupervisedTasks(unittest.TestCase):
             self.assertEqual(args[0][:4], [sys.executable, "-c", supervisor._VALIDATOR_LAUNCHER, str(descriptor)])
             self.project.rename(self.base / "registered-project")
             replacement.rename(self.project)
-            return run(*args, **kwargs)
+            return popen(*args, **kwargs)
 
-        with patch.object(supervisor.subprocess, "run", side_effect=replace_project_before_spawn):
+        with patch.object(supervisor.subprocess, "Popen", side_effect=replace_project_before_spawn):
             valid, receipts = self.host._validate(task)
 
         self.assertTrue(valid)
@@ -503,13 +539,28 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual({action_id for action_id, action in actions.items() if action["status"] == "complete"}, set(action_ids))
 
     def test_validator_receipt_decodes_byte_output_before_hashing(self):
-        """A timeout-compatible byte stream still yields a text receipt and digest."""
-        timeout = supervisor.subprocess.TimeoutExpired(["ignored"], 1, output=b"validator output")
-        with patch.object(supervisor.subprocess, "run", side_effect=timeout):
-            receipt = self.host._validator_receipt({"id": "check", "command": ["ignored"]})
+        """A timed-out byte stream still yields a text receipt and digest."""
+        receipt = self.host._validator_receipt({
+            "id": "check",
+            "command": [sys.executable, "-c", "import sys, time; sys.stdout.buffer.write(b'validator output'); sys.stdout.flush(); time.sleep(10)"],
+            "timeout_s": 0.1,
+        })
 
         self.assertEqual(receipt["output"], "validator output")
         self.assertEqual(receipt["digest"], "af0c829e3106013e4ef9555521848126776f8a7054fc42e1b64b94dbc4627de1")
+        self.assertEqual(receipt["exit_status"], "timeout")
+
+    def test_validator_receipt_bounds_retained_output_while_draining_the_process(self):
+        """Validator receipts retain at most 8 KiB even when a child writes much more."""
+        with patch.object(supervisor.subprocess, "run", side_effect=AssertionError("must stream output")):
+            receipt = self.host._validator_receipt({
+                "id": "large-output",
+                "command": [sys.executable, "-c", "import sys; sys.stdout.write('x' * 65536)"],
+                "timeout_s": 2,
+            })
+
+        self.assertEqual(receipt["exit_status"], 0)
+        self.assertEqual(len(receipt["output"].encode()), 8192)
 
     def test_continuation_cannot_broaden_default_prohibited_operations(self):
         self.task()
@@ -517,6 +568,17 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(result.kind, "blocker")
         self.assertIn("explicit owner authorization", result.message)
         self.assertNotIn("push", self.host.task("task-1")["authorization"]["permitted_operations"])
+
+    def test_corrupt_legacy_authorization_cannot_permit_default_prohibited_operation(self):
+        """Request-time enforcement protects state written before capability validation."""
+        self.task()
+        with self.host._locked_task("task-1") as task:
+            task["authorization"]["permitted_operations"].append("push")
+            self.host._save_task(task)
+
+        result = self.host.request_operation("task-1", "push")
+
+        self.assertEqual(result.kind, "blocker")
 
     def test_child_evidence_must_be_joined_before_parent_finalizes(self):
         self.task(actions=[{"id": "child", "operation": "delegate", "child_task_id": "child-1"}])

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import selectors
 import stat
 import subprocess
 import sys
@@ -351,6 +352,9 @@ class HostSupervisor:
         validators = list(validators)
         blockers = list(blockers)
         permitted_operations = tuple(permitted_operations)
+        prohibited = sorted(set(permitted_operations).intersection(DEFAULT_PROHIBITED))
+        if prohibited:
+            raise ValueError("task authorization includes prohibited operations: " + ", ".join(prohibited))
         registration = self.provision(project)
         path = self._state_file(self._tasks_dir(project, create=True) / f"{task_id}.json", description="task state")
         action_map = {}
@@ -442,6 +446,98 @@ class HostSupervisor:
             self._event(task_id, "action_completed", project=task["project"], action_id=action_id, evidence=action["evidence"])
             self._event(task_id, "child_evidence_joined", project=task["project"], action_id=action_id, child_task_id=child_task_id)
 
+    def _validator_snapshot(self, command, *, project_descriptor=None):
+        """Copy the opened executable into host state and return its immutable launch path."""
+        descriptor = None
+        snapshot_descriptor = None
+        snapshot_path = None
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            if os.path.isabs(command):
+                descriptor = os.open(command, flags)
+            elif "/" in command:
+                if project_descriptor is None:
+                    return None, None
+                descriptor = os.open(command, flags, dir_fd=project_descriptor)
+            else:
+                for directory in os.get_exec_path():
+                    candidate = os.path.join(directory, command) if directory else command
+                    try:
+                        descriptor = os.open(
+                            candidate, flags,
+                            **({"dir_fd": project_descriptor}
+                               if project_descriptor is not None and not os.path.isabs(candidate) else {}),
+                        )
+                        break
+                    except OSError:
+                        continue
+                if descriptor is None:
+                    return None, None
+            mode = os.fstat(descriptor).st_mode
+            if not stat.S_ISREG(mode) or not mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+                return None, None
+            snapshots = self._state_directory(self.root / "validator-snapshots", create=True,
+                                              description="validator snapshot directory")
+            snapshot_descriptor, snapshot_path = tempfile.mkstemp(prefix="validator-", dir=snapshots)
+            os.fchmod(snapshot_descriptor, 0o700)
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 64 * 1024):
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(snapshot_descriptor, view):]
+            os.fsync(snapshot_descriptor)
+            os.close(snapshot_descriptor)
+            snapshot_descriptor = None
+            return snapshot_path, digest.hexdigest()
+        except OSError:
+            if snapshot_path is not None:
+                try:
+                    os.unlink(snapshot_path)
+                except OSError:
+                    pass
+            return None, None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if snapshot_descriptor is not None:
+                os.close(snapshot_descriptor)
+
+    @staticmethod
+    def _stream_validator_output(process, timeout):
+        """Drain both pipes without retaining more than the receipt cap in host memory."""
+        retained = bytearray()
+        timed_out = False
+        deadline = time.monotonic() + timeout
+        kill_deadline = None
+        with selectors.DefaultSelector() as selector:
+            for stream in (process.stdout, process.stderr):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ)
+            while selector.get_map() or process.poll() is None:
+                now = time.monotonic()
+                if not timed_out and now >= deadline:
+                    timed_out = True
+                    process.terminate()
+                    kill_deadline = now + 1
+                elif timed_out and process.poll() is None and now >= kill_deadline:
+                    process.kill()
+                wait_for = 0.05 if timed_out else max(0, min(0.05, deadline - now))
+                for key, _ in selector.select(wait_for):
+                    while True:
+                        try:
+                            chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            break
+                        remaining = 8192 - len(retained)
+                        if remaining > 0:
+                            retained.extend(chunk[:remaining])
+        process.wait()
+        return _text_output(bytes(retained)), "timeout" if timed_out else process.returncode
+
     def _validator_receipt(self, validator, *, project=None, project_descriptor=None):
         command = validator.get("command")
         if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
@@ -450,21 +546,27 @@ class HostSupervisor:
         if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 300:
             raise ValueError("Host validator timeout_s must be between 0 and 300")
         declared_command = command
-        launch_command = command
-        run_options = {"capture_output": True, "text": True, "timeout": timeout, "check": False, "cwd": project}
+        snapshot_path, binary_digest = self._validator_snapshot(command[0], project_descriptor=project_descriptor)
+        launch_command = [snapshot_path or command[0], *command[1:]]
+        run_options = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "cwd": project}
         if project_descriptor is not None:
             # A freshly started interpreter may safely fchdir before it execs the
             # validator.  Avoid preexec_fn: it executes in the forked child of
             # this potentially multithreaded supervisor and can deadlock there.
             launch_command = [sys.executable, "-c", _VALIDATOR_LAUNCHER, str(project_descriptor), *command]
+            if snapshot_path is not None:
+                launch_command = [sys.executable, "-c", _VALIDATOR_LAUNCHER, str(project_descriptor),
+                                  snapshot_path, *command[1:]]
             run_options.update(cwd=None, pass_fds=(project_descriptor,))
         try:
-            run = subprocess.run(launch_command, **run_options)
-            output = (_text_output(run.stdout) + _text_output(run.stderr))[:8192]
-            status = run.returncode
-        except subprocess.TimeoutExpired as error:
-            output, status = _text_output(error.stdout)[:8192], "timeout"
-        binary_digest = _validator_binary_digest(declared_command[0], directory_descriptor=project_descriptor)
+            with subprocess.Popen(launch_command, **run_options) as process:
+                output, status = self._stream_validator_output(process, timeout)
+        finally:
+            if snapshot_path is not None:
+                try:
+                    os.unlink(snapshot_path)
+                except OSError:
+                    pass
         return {"command": declared_command, "command_digest": _digest(declared_command), "binary_digest": binary_digest,
                 "exit_status": status, "output": output, "digest": hashlib.sha256(output.encode()).hexdigest(),
                 "timeout_s": timeout, "version": validator.get("version", "host-configured")}
@@ -588,7 +690,7 @@ class HostSupervisor:
 
     def request_operation(self, task_id, operation, *, project=None):
         task = self.task(task_id, project=project)
-        if operation in task["authorization"]["permitted_operations"]:
+        if operation not in DEFAULT_PROHIBITED and operation in task["authorization"]["permitted_operations"]:
             return Decision("permitted")
         message = f"{operation} requires explicit owner authorization in a new authorization revision."
         self._event(task_id, "authorization_blocked", project=task["project"], operation=operation)
