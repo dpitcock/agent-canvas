@@ -12,6 +12,37 @@ from test_container_executor import executor
 
 
 class CompletionEdges(unittest.TestCase):
+    def test_validation_claim_sync_failure_does_not_strand_renderer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(root / "state")
+            host.create_task("task", project, [], validators=[{"id": "check", "command": ["true"]}])
+            renderer = client.SupervisedRenderer(host, "task", legacy_test_mode=True)
+            renderer.consume({"method": "item/completed", "params": {"item": {
+                "type": "agentMessage", "id": "final", "phase": "final_answer", "text": "done"}}})
+            completion = {"method": "turn/completed", "params": {"turnId": "turn", "status": "completed"}}
+            original = os.fsync
+            def fail_claim_sync(fd):
+                if stat.S_ISDIR(os.fstat(fd).st_mode) and host.task("task", project=project)["status"] == "validating":
+                    raise OSError("claim sync failed")
+                original(fd)
+            with patch.object(supervisor.os, "fsync", side_effect=fail_claim_sync):
+                self.assertEqual(renderer.consume(completion), [{"kind": "final", "content": "done", "decision": "complete"}])
+            self.assertEqual(renderer.consume(completion), [])
+            self.assertEqual(host.task("task", project=project)["status"], "complete")
+
+    def test_file_sync_failure_removes_uncommitted_temporary_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "task.json"
+            path.write_text('{"old": true}')
+            with patch.object(supervisor.os, "fsync", side_effect=OSError("file sync failed")):
+                with self.assertRaises(OSError):
+                    supervisor.HostSupervisor._write(path, {"new": True})
+            self.assertEqual(list(Path(tmp).iterdir()), [path])
+            self.assertEqual(json.loads(path.read_text()), {"old": True})
+
     def test_renderer_delivers_recovered_terminal_commit_once(self):
         for mode in ("plain", "validated", "blocker"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:

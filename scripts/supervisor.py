@@ -271,12 +271,13 @@ class HostSupervisor:
     def _write(path, value):
         HostSupervisor._state_file(path, description="state file")
         data = json.dumps(value, indent=2, sort_keys=True) + "\n"
-        with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as out:
-            out.write(data)
-            out.flush()
-            os.fsync(out.fileno())
-            temp = Path(out.name)
+        temp = None
         try:
+            with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as out:
+                temp = Path(out.name)
+                out.write(data)
+                out.flush()
+                os.fsync(out.fileno())
             os.replace(temp, path)
             try:
                 directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
@@ -287,7 +288,8 @@ class HostSupervisor:
             except OSError as error:
                 raise StateCommitUncertainError("State replaced, but directory sync failed") from error
         finally:
-            temp.unlink(missing_ok=True)
+            if temp is not None:
+                temp.unlink(missing_ok=True)
 
     @staticmethod
     def _read(path):
@@ -786,7 +788,16 @@ class HostSupervisor:
             self._event(task_id, "validation_started", project=task["project"], attempt_id=attempt_id)
             task["status"] = "validating"
             task["validation_attempt"] = attempt_id
-            self._save_task(task)
+            try:
+                self._save_task(task)
+            except StateCommitUncertainError:
+                # A visible claim belongs to this caller, which must either
+                # execute it or enter the recovery handler below. Do not leave
+                # a persisted validating state with no validator running.
+                committed = self.task(task_id, project=task["project"])
+                if (committed.get("status") != "validating"
+                        or committed.get("validation_attempt") != attempt_id):
+                    raise
 
         try:
             valid, receipts = self._validate(task)
