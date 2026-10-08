@@ -21,6 +21,38 @@ nuke_spec.loader.exec_module(agent_nuke)
 
 
 class InstallSmoke(unittest.TestCase):
+    @unittest.skipIf(os.geteuid() == 0, "Root bypasses directory write permissions")
+    def test_skills_install_in_writable_project_with_read_only_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            parent = base / "read-only"
+            root = parent / "project"
+            root.mkdir(parents=True)
+
+            def download(destination, revision):
+                skill = destination / "skills/example"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("example")
+                script = skill / "run.sh"
+                script.write_text("#!/bin/sh\n")
+                script.chmod(0o755)
+                (destination / ".opencode").mkdir()
+                (destination / ".opencode/skills").symlink_to("../skills")
+
+            parent.chmod(0o555)
+            try:
+                with self.assertRaises(PermissionError):
+                    (parent / "unwritable").mkdir()
+                _, actions = installer.install(root, skills=True, home=base / "home", downloader=download)
+                self.assertFalse([action for action in actions if action.startswith("FAILED")], actions)
+                pack = root / "skills/addyosmani-agent-skills"
+                self.assertEqual((pack / "skills/example/SKILL.md").read_text(), "example")
+                self.assertEqual((pack / "skills/example/run.sh").stat().st_mode & 0o777, 0o755)
+                self.assertEqual(os.readlink(pack / ".opencode/skills"), "../skills")
+                self.assertTrue((root / ".agents/skills/addy-example").is_symlink())
+            finally:
+                parent.chmod(0o755)
+
     def test_provision_rejects_project_replaced_inside_registration(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -100,6 +132,55 @@ class InstallSmoke(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Project directory changed"):
                 installer.install(root, skills=True, home=base / "home", downloader=download)
             self.assertEqual(sorted(p.name for p in root.iterdir()), ["application.txt"])
+
+    def test_pack_copy_does_not_follow_project_replaced_during_placement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "project"
+
+            def download(destination, revision):
+                skill = destination / "skills/example"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("example")
+                (skill / "notes.txt").write_text("notes")
+
+            copy_file = installer.shutil.copyfileobj
+            replaced = False
+
+            def replace_then_copy(incoming, destination):
+                nonlocal replaced
+                if not replaced:
+                    replaced = True
+                    root.rename(base / "original")
+                    root.mkdir()
+                    (root / "application.txt").write_text("keep")
+                return copy_file(incoming, destination)
+
+            with patch.object(installer.shutil, "copyfileobj", side_effect=replace_then_copy):
+                with self.assertRaisesRegex(ValueError, "Project directory changed"):
+                    installer.install(root, skills=True, home=base / "home", downloader=download)
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["application.txt"])
+            original = base / "original/skills/addyosmani-agent-skills/skills/example"
+            self.assertEqual((original / "SKILL.md").read_text(), "example")
+            self.assertEqual((original / "notes.txt").read_text(), "notes")
+
+    def test_failed_pack_copy_is_reported_and_never_linked_or_tracked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "project"
+
+            def download(destination, revision):
+                skill = destination / "skills/example"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("example")
+
+            with patch.object(installer.shutil, "copyfileobj", side_effect=OSError("Disk full")):
+                _, actions = installer.install(root, skills=True, home=base / "home", downloader=download)
+            self.assertTrue(any(action.startswith("FAILED skill installation:") and "Disk full" in action
+                                for action in actions))
+            self.assertNotIn("pack", installer.read_state(root)["adapters"])
+            self.assertFalse((root / ".agents/skills/addy-example").is_symlink())
+            self.assertIn("FAILED skill installation:", (root / "INSTALL-FOLLOWUP.md").read_text())
 
     def test_new_project_can_be_installed_with_supervision(self):
         with tempfile.TemporaryDirectory() as tmp:

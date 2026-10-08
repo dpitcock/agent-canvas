@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import stat
@@ -647,6 +648,30 @@ def download_skills(destination, revision):
         checkout.rename(destination)
 
 
+def copy_pack(source, parent, name):
+    """Copy a private download through destination descriptors, across filesystems."""
+    mode = source.lstat().st_mode
+    if stat.S_ISLNK(mode):
+        os.symlink(os.readlink(source), name, dir_fd=parent)
+    elif stat.S_ISDIR(mode):
+        os.mkdir(name, 0o700, dir_fd=parent)
+        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            for child in source.iterdir():
+                copy_pack(child, descriptor, child.name)
+            os.fchmod(descriptor, stat.S_IMODE(mode))
+        finally:
+            os.close(descriptor)
+    elif stat.S_ISREG(mode):
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=parent)
+        with os.fdopen(descriptor, "wb") as destination, source.open("rb") as incoming:
+            shutil.copyfileobj(incoming, destination)
+            os.fchmod(destination.fileno(), stat.S_IMODE(mode))
+    else:
+        raise ValueError(f"Skill pack contains a non-regular file: {source}")
+
+
 def render_files(source, *, workspace, environment, role, slack):
     rules = (source / "AGENTS.md").read_text()
     if role == "application":
@@ -740,13 +765,13 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
                 ref = (root / "skills/addyosmani-agent-skills.ref").read_text().strip()
                 if not re.fullmatch(r"[0-9a-fA-F]{40}", ref):
                     raise ValueError("Existing skill reference is not a full commit SHA; preserved for manual resolution")
-                # Download outside the project, then place the pack through its
-                # verified parent descriptor. A renamed project cannot redirect it.
-                with tempfile.TemporaryDirectory(prefix=".agent-canvas-download-", dir=root.parent) as tmp:
+                # Use private system staging: a writable project need not have a
+                # writable parent or share a filesystem with the temporary directory.
+                with tempfile.TemporaryDirectory(prefix=".agent-canvas-download-") as tmp:
                     checkout = Path(tmp) / "pack"
                     downloader(checkout, ref)
                     with pinned_parent(root, pack, create=True, root_identity=root_identity) as (parent, name):
-                        os.rename(checkout, name, dst_dir_fd=parent)
+                        copy_pack(checkout, parent, name)
                 discovered_skills = sorted((pack / "skills").glob("*/SKILL.md"))
                 if not discovered_skills:
                     raise ValueError("Skill pack is empty")
