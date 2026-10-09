@@ -273,7 +273,7 @@ class SupervisedTasks(unittest.TestCase):
     def test_rejects_projects_symlink_before_writing_supervised_workspace(self):
         """A preexisting state/projects link must not redirect durable state into a project."""
         state_dir = self.base / "linked-host-state"
-        state_dir.mkdir()
+        state_dir.mkdir(mode=0o700)
         os.symlink(self.project, state_dir / "projects")
         host = supervisor.HostSupervisor(state_dir)
 

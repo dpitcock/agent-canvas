@@ -21,7 +21,12 @@ class AuditRecovery(unittest.TestCase):
         self.project.mkdir()
         self.host = supervisor.HostSupervisor(root / "state")
         for task_id in ("first", "second"):
-            self.host.create_task(task_id, self.project, [])
+            task = self.host.create_task(task_id, self.project, [])
+            # Exercise historical JSONL-only creation records as well as tail recovery.
+            creation = task.pop("creation_event")
+            self.host._save_task(task)
+            self.host._event(task_id, "task_created", project=self.project,
+                             authorization_digest=creation["authorization_digest"])
         self.path = self.host._event_path("first", self.project)
 
     def test_read_recovers_partial_utf8_tail_preserving_all_complete_records(self):

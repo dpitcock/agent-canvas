@@ -102,10 +102,11 @@ class HostSupervisor:
 
     def _ensure_root(self):
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        try:
-            self.root.chmod(0o700)
-        except OSError:
-            pass
+        status = self.root.stat()
+        if status.st_uid != os.geteuid() or status.st_mode & 0o777 != 0o700:
+            raise ValueError("Supervisor state root must be caller-owned with mode 0700; choose a dedicated private directory")
+        if any(entry.name not in {"projects", "validator-snapshots"} for entry in self.root.iterdir()):
+            raise ValueError("Supervisor state root must be dedicated to supervisor state")
 
     def _projects_dir(self):
         """Return the host-owned project state directory without following a link."""
@@ -405,6 +406,8 @@ class HostSupervisor:
                     raise ValueError(f"Host audit is unreadable: {source.name}") from error
             if task.get("release_event"):
                 events.append(task["release_event"])
+            if task.get("creation_event"):
+                events.append(task["creation_event"])
             return sorted(events, key=lambda event: event["at"])
 
     @staticmethod
@@ -482,8 +485,9 @@ class HostSupervisor:
             task = {"schema_version": 1, "task_id": task_id, "project": registration["project"], "status": "active",
                     "authorization": authorization, "actions": action_map, "validators": list(validators),
                     "blockers": list(blockers), "evidence": {"validators": {}}, "visible_messages": []}
+            task["creation_event"] = {"at": _now(), "type": "task_created", "task_id": task_id,
+                                      "authorization_digest": authorization["digest"]}
             self._write(path, task)
-            self._event(task_id, "task_created", project=project, authorization_digest=authorization["digest"])
             return task
 
     def task(self, task_id, *, project=None):
