@@ -5,6 +5,31 @@ from test_container_executor import executor
 
 
 class InputDepthTests(unittest.TestCase):
+    def test_filesystem_equivalent_paths_are_rejected_and_stage_removed(self):
+        for names in (("Input", "input"), ("café", "cafe\u0301")):
+            with self.subTest(names=names), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                project = base / "project"
+                staging = base / "staging"
+                project.mkdir()
+                staging.mkdir()
+                (project / names[0]).write_text("data")
+                if not (project / names[1]).exists():
+                    # A case/normalization-sensitive filesystem has no collision.
+                    (project / names[1]).write_text("other")
+                    with executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project)) as pinned:
+                        snapshot = executor.stage_inputs(pinned, names, staging, max_bytes=1024, max_files=2)
+                        try:
+                            self.assertEqual(len(snapshot.files), 2)
+                            self.assertTrue(snapshot.remove())
+                        finally:
+                            snapshot.close()
+                else:
+                    with executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project)) as pinned:
+                        with self.assertRaises(executor.InputRejected):
+                            executor.stage_inputs(pinned, names, staging, max_bytes=1024, max_files=2)
+                self.assertEqual(list(staging.iterdir()), [])
+
     def test_duplicate_paths_are_rejected_and_partial_stage_removed(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

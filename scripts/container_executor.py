@@ -360,6 +360,8 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
                         parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
                         0o600, dir_fd=target_parent,
                     )
+                except FileExistsError as error:
+                    raise InputRejected("declared input paths collide on the staging filesystem") from error
                 finally:
                     os.close(target_parent)
                 with os.fdopen(os.dup(fd), "rb", closefd=True) as source, os.fdopen(target_fd, "wb", closefd=True) as output:
