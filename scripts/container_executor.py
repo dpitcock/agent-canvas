@@ -426,6 +426,12 @@ class ExecutionRequest:
                 raise ConfigurationError("action and attempt identifiers must be valid UTF-8") from error
         if not isinstance(self.image, str) or self.image.count(_DIGEST_PREFIX) != 1:
             raise ConfigurationError("image must be digest-pinned (name@sha256:<digest>)")
+        if "\0" in self.image:
+            raise ConfigurationError("image cannot contain NUL")
+        try:
+            self.image.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ConfigurationError("image must be valid UTF-8") from error
         _, digest = self.image.rsplit(_DIGEST_PREFIX, 1)
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise ConfigurationError("image digest must be a lower-case sha256")

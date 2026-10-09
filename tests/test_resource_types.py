@@ -6,9 +6,16 @@ from test_container_executor import executor
 class ResourceTypes(unittest.TestCase):
     def request(self, **values):
         command = values.pop("command", ["true"])
+        image = values.pop("image", "alpine@sha256:" + "a" * 64)
         return executor.ExecutionRequest(action_id="a", attempt_id="b", project=Path("/tmp/project"),
-                                         image="alpine@sha256:" + "a" * 64,
+                                         image=image,
                                          command=command, inputs=[], **values)
+
+    def test_image_rejects_nul_and_surrogates(self):
+        for name in ("bad\0name", "bad\ud800name"):
+            with self.subTest(name=name):
+                with self.assertRaises(executor.ConfigurationError):
+                    self.request(image=name + "@sha256:" + "a" * 64)
 
     def test_command_rejects_nul_and_surrogates(self):
         for value in ("bad\0argument", "bad\ud800argument"):
