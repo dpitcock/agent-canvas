@@ -9,6 +9,72 @@ from test_supervised import supervisor, installer
 
 
 class SupervisedMergeTests(unittest.TestCase):
+    def test_missing_file_retry_preserves_concurrently_completed_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            project = base / "project"
+            project.mkdir()
+            state = base / "state"
+            installer.install(project, apply=True, supervised=True, supervisor_state_dir=state, home=base / "home")
+            host = supervisor.HostSupervisor(state)
+            with patch.object(host, "_event", side_effect=OSError("failed import")):
+                with self.assertRaises(OSError):
+                    host.import_owner_override(project, [], source_digest="a" * 64)
+            def concurrent_import(*args, **kwargs):
+                host.import_owner_override(project, ["pause"], source_digest="b" * 64)
+                return None
+            with patch.object(installer, "root_owner_override", side_effect=concurrent_import):
+                installer.upgrade(project, apply=True, supervised=True, supervisor_state_dir=state, home=base / "home")
+            current = host.provision(project)["owner_override"]
+            self.assertEqual(current["modes"], ["pause"])
+            self.assertEqual(current["source_digest"], "b" * 64)
+            self.assertEqual(host.create_task("new", project, [])["status"], "paused")
+
+    def test_resume_waits_for_project_override_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(Path(tmp) / "state")
+            host.create_task("task", project, [])
+            host.pause("task", project=project)
+            entered, proceed, resumed = threading.Event(), threading.Event(), threading.Event()
+            errors = []
+            original = host._read
+            def read_then_wait(path):
+                result = original(path)
+                if path.name == "task.json" and threading.current_thread().name == "import-worker":
+                    entered.set()
+                    if not proceed.wait(3):
+                        raise RuntimeError("import read barrier timed out")
+                return result
+            def importing():
+                try:
+                    host.import_owner_override(project, ["pause"], source_digest="a" * 64)
+                except Exception as error:
+                    errors.append(error)
+            def resuming():
+                try:
+                    host.resume("task", project=project)
+                except Exception as error:
+                    errors.append(error)
+                finally:
+                    resumed.set()
+            with patch.object(host, "_read", side_effect=read_then_wait):
+                importer = threading.Thread(target=importing, name="import-worker")
+                importer.start()
+                self.assertTrue(entered.wait(1))
+                resume = threading.Thread(target=resuming)
+                resume.start()
+                try:
+                    self.assertFalse(resumed.wait(0.05))
+                finally:
+                    proceed.set()
+                    importer.join(3)
+                    resume.join(3)
+            self.assertFalse(importer.is_alive() or resume.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(host.task("task", project=project)["status"], "active")
+
     def test_missing_override_preserves_completed_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp).resolve()

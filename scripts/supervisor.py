@@ -364,7 +364,7 @@ class HostSupervisor:
         self._write(registration, value)
         return value
 
-    def import_owner_override(self, project, modes, *, source_digest):
+    def import_owner_override(self, project, modes, *, source_digest, only_if_incomplete=False):
         """Import an owner-provided snapshot; never reread workspace overrides here."""
         if not isinstance(modes, (list, tuple, set)) or any(mode not in OWNER_OVERRIDE_MODES for mode in modes):
             raise ValueError("Unknown owner override mode")
@@ -373,6 +373,8 @@ class HostSupervisor:
         project = self._project_path(project)
         with self._locked_project(project):
             current = self._provision_locked(project)
+            if only_if_incomplete and current.get("owner_override", {}).get("import_complete") is not False:
+                return current
             normalized = sorted(set(modes))
             current["owner_override"] = {"modes": normalized, "source_digest": source_digest,
                                          "imported_at": _now(), "import_complete": False}
@@ -1017,24 +1019,21 @@ class HostSupervisor:
             self._event(task_id, "paused", project=task["project"])
 
     def resume(self, task_id, *, project=None):
-        # Match gate_final's task -> interrupt order to avoid an ABBA deadlock.
-        # The task lock also makes clearing the interrupt part of the same valid
-        # paused-to-active transition.
-        with self._locked_task(task_id, project=project) as task:
-            with self._locked_interrupt(task_id, task["project"]) as interrupt_path:
-                pending = self._read(interrupt_path).get("status") if interrupt_path.exists() else None
-                if task["status"] != "paused":
-                    if task["status"] in TERMINAL_STATUSES:
-                        raise ValueError("A terminal task cannot resume")
-                    if pending == "paused":
-                        raise ValueError("A pause transition is pending")
-                    raise ValueError("Only a paused task can resume")
-                if pending == "cancelled":
-                    raise ValueError("A cancellation is pending")
-                interrupt_path.unlink(missing_ok=True)
-                task["status"] = "active"
-                self._save_task(task)
-                self._event(task_id, "resumed", project=task["project"])
+        # Serialize explicit resume with imports using project -> task -> interrupt.
+        with self._locked_decision(task_id, project) as (task, interrupt_path):
+            pending = self._read(interrupt_path).get("status") if interrupt_path.exists() else None
+            if task["status"] != "paused":
+                if task["status"] in TERMINAL_STATUSES:
+                    raise ValueError("A terminal task cannot resume")
+                if pending == "paused":
+                    raise ValueError("A pause transition is pending")
+                raise ValueError("Only a paused task can resume")
+            if pending == "cancelled":
+                raise ValueError("A cancellation is pending")
+            interrupt_path.unlink(missing_ok=True)
+            task["status"] = "active"
+            self._save_task(task)
+            self._event(task_id, "resumed", project=task["project"])
 
     def cancel(self, task_id, *, project=None):
         self._request_interrupt(task_id, "cancelled", project=project)
