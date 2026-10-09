@@ -509,6 +509,7 @@ def uninstall(target, *, mode="preserve", apply=False):
     pack = root / "skills/addyosmani-agent-skills"
     pack_referenced_by_modified_adapter = False
     adapters = adapter_links(state)
+    planned_adapter_paths = set()
     for relative, expected in adapters.items():
         path = root / relative
         safe_path(root, path)
@@ -516,6 +517,7 @@ def uninstall(target, *, mode="preserve", apply=False):
         if exact:
             if mode == "remove-all":
                 planned_removal(root, path, actions, apply, root_identity=root_identity)
+                planned_adapter_paths.add(path)
             else:
                 # As with regular files, there is no portable unlink of the
                 # verified object. Never recursively remove a replacement.
@@ -530,7 +532,8 @@ def uninstall(target, *, mode="preserve", apply=False):
 
     if mode == "remove-all":
         for path in installer_adapter_links(root, pack):
-            planned_removal(root, path, actions, apply, root_identity=root_identity)
+            if path not in planned_adapter_paths:
+                planned_removal(root, path, actions, apply, root_identity=root_identity)
 
     # A legacy or malformed adapter record cannot authorize unlinking a link,
     # but a changed link under a supported adapter directory can still retain a
