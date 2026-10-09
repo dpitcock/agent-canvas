@@ -148,7 +148,7 @@ def replace_regular_snapshot(root, path, text, identity, *, root_identity):
             os.close(root_descriptor)
 
 
-def remove_path(root, path, *, recursive=True, root_identity):
+def remove_path(root, path, *, recursive=True, prune_parents=True, root_identity):
     """Delete relative to no-follow directory descriptors, including cleanup."""
     relative = path.relative_to(root)
     if not relative.parts or ".." in relative.parts:
@@ -175,7 +175,8 @@ def remove_path(root, path, *, recursive=True, root_identity):
         else:
             # unlink never follows the leaf, even if it becomes a symlink.
             os.unlink(name, dir_fd=parent)
-        remove_empty_parents(relative, descriptors)
+        if prune_parents:
+            remove_empty_parents(relative, descriptors)
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)

@@ -39,24 +39,27 @@ def is_plan(path, root):
 def nuke_path(root, path, actions, apply, *, root_identity):
     safe_path(root, path)
     if not path.exists() and not path.is_symlink():
-        return
+        return True
     if is_plan(path, root):
         actions.append(f"PRESERVE PLAN {path.relative_to(root)}")
-        return
+        return False
     if path.is_symlink() or path.is_file():
         actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {path.relative_to(root)}")
         if apply:
-            remove_path(root, path, recursive=False, root_identity=root_identity)
-        return
+            remove_path(root, path, recursive=False, prune_parents=False, root_identity=root_identity)
+        return True
     if not path.is_dir():
         actions.append(f"PRESERVE SPECIAL {path.relative_to(root)}")
-        return
+        return False
+    removable = True
     for child in sorted(path.iterdir(), key=lambda item: item.name):
-        nuke_path(root, child, actions, apply, root_identity=root_identity)
-    if path.exists() and path.is_dir() and not any(path.iterdir()):
+        if not nuke_path(root, child, actions, apply, root_identity=root_identity):
+            removable = False
+    if removable:
         actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {path.relative_to(root)}/")
         if apply:
-            remove_path(root, path, recursive=False, root_identity=root_identity)
+            remove_path(root, path, recursive=False, prune_parents=False, root_identity=root_identity)
+    return removable
 
 
 def nuke(target, *, apply=False):
@@ -81,7 +84,7 @@ def nuke(target, *, apply=False):
             safe_path(root, path)
             actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {relative}")
             if apply:
-                remove_path(root, path, recursive=False, root_identity=root_identity)
+                remove_path(root, path, recursive=False, prune_parents=False, root_identity=root_identity)
     if not actions:
         actions.append("NO AGENT, GOVERNANCE, OR WORKFLOW ARTIFACTS FOUND")
     return apply, actions
