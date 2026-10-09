@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 
 import fcntl
@@ -364,7 +365,7 @@ class HostSupervisor:
         self._write(registration, value)
         return value
 
-    def import_owner_override(self, project, modes, *, source_digest, only_if_incomplete=False):
+    def import_owner_override(self, project, modes, *, source_digest, expected_incomplete=None):
         """Import an owner-provided snapshot; never reread workspace overrides here."""
         if not isinstance(modes, (list, tuple, set)) or any(mode not in OWNER_OVERRIDE_MODES for mode in modes):
             raise ValueError("Unknown owner override mode")
@@ -373,11 +374,16 @@ class HostSupervisor:
         project = self._project_path(project)
         with self._locked_project(project):
             current = self._provision_locked(project)
-            if only_if_incomplete and current.get("owner_override", {}).get("import_complete") is not False:
-                return current
+            if expected_incomplete is not None:
+                observed = current.get("owner_override", {})
+                if observed.get("import_complete") is not False:
+                    return current
+                if observed != expected_incomplete:
+                    raise ValueError("Owner override import changed; retry recovery from the current snapshot")
             normalized = sorted(set(modes))
             current["owner_override"] = {"modes": normalized, "source_digest": source_digest,
-                                         "imported_at": _now(), "import_complete": False}
+                                         "imported_at": _now(), "generation": uuid.uuid4().hex,
+                                         "import_complete": False}
             self._write(self._registration(project), current)
             self._event(None, "owner_override_imported", project=project, modes=normalized, source_digest=source_digest)
             tasks = self._tasks_dir(project, create=True)

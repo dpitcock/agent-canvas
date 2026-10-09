@@ -9,6 +9,36 @@ from test_supervised import supervisor, installer
 
 
 class SupervisedMergeTests(unittest.TestCase):
+    def test_missing_file_retry_cannot_clear_a_newer_incomplete_import(self):
+        for mode in ("pause", "reset"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve()
+                project = base / "project"
+                project.mkdir()
+                state = base / "state"
+                installer.install(project, apply=True, supervised=True, supervisor_state_dir=state, home=base / "home")
+                host = supervisor.HostSupervisor(state)
+                host.create_task("task", project, [{"id": "work", "operation": "write"}])
+                def interrupted_import():
+                    with patch.object(host, "_event", side_effect=OSError("interrupted")):
+                        with self.assertRaises(OSError):
+                            host.import_owner_override(project, [mode], source_digest="a" * 64)
+                def newer_import(*args, **kwargs):
+                    interrupted_import()
+                    return None
+                # Even identical contents and timestamps are separate imports.
+                with patch.object(supervisor, "_now", return_value=123):
+                    interrupted_import()
+                    with patch.object(installer, "root_owner_override", side_effect=newer_import):
+                        with self.assertRaisesRegex(ValueError, "changed"):
+                            installer.upgrade(project, apply=True, supervised=True,
+                                supervisor_state_dir=state, home=base / "home")
+                current = host.provision(project)["owner_override"]
+                self.assertFalse(current["import_complete"])
+                self.assertEqual(current["modes"], [mode])
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    host.claim_action("task", "work", "attempt", project=project)
+
     def test_missing_file_retry_preserves_concurrently_completed_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp).resolve()

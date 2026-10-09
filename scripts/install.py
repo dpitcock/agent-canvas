@@ -127,7 +127,7 @@ def provision_supervised(root, state_dir, *, root_identity=None):
             # An owner-run retry after deleting the file must finish recovery.
             # Completed snapshots remain unchanged when the file is absent.
             override = {"modes": [], "source_digest": hashlib.sha256(b"").hexdigest(),
-                        "only_if_incomplete": True}
+                        "expected_incomplete": registration["owner_override"]}
         if override is not None:
             registration = host.import_owner_override(root, **override)
     return {"enabled": True, "state_dir": str(state_dir), "registration_digest": digest(registration),
