@@ -206,29 +206,24 @@ def add_gitignore_entry(root, ignore, entry, *, root_identity=None):
 
 
 def add_gitignore_entries(root, ignore, entries, *, root_identity=None):
-    """Append missing entries through one pinned regular-file descriptor."""
-    safe_destination(root, ignore)
-    try:
-        with pinned_parent(root, ignore, root_identity=root_identity) as (parent, name):
-            descriptor = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK
-                                 | getattr(os, "O_NOFOLLOW", 0), 0o666, dir_fd=parent)
-    except OSError as error:
-        raise ValueError("Cannot safely update .gitignore: it is not a regular file") from error
-    current = os.fstat(descriptor)
-    if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
-        os.close(descriptor)
-        raise ValueError("Cannot safely update .gitignore: it must be a regular file with one link")
-    with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
-        old = handle.read()
-        missing = [entry for entry in entries if entry not in old.splitlines()]
-        if not missing:
-            return False
-        handle.write(("\n" if old and not old.endswith("\n") else "") + "\n".join(missing) + "\n")
-        return True
+    """Publish missing entries only while the original snapshot still matches."""
+    old, identity = regular_text_snapshot(root, ignore, missing="")
+    missing = [entry for entry in entries if entry not in old.splitlines()]
+    if not missing:
+        return False
+    updated = old + ("\n" if old and not old.endswith("\n") else "") + "\n".join(missing) + "\n"
+    write_regular_text(root, ignore, updated, create=True, identity=identity,
+                       root_identity=root_identity)
+    return True
+
+
+def snapshot_identity(status):
+    return (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns,
+            status.st_ctime_ns, status.st_mode, status.st_nlink)
 
 
 def regular_text_snapshot(root, path, *, missing=None):
-    """Read a regular project file and retain its device/inode identity."""
+    """Read a regular file and retain metadata from before and after reading."""
     safe_destination(root, path)
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
@@ -236,11 +231,16 @@ def regular_text_snapshot(root, path, *, missing=None):
         return missing, None
     except OSError as error:
         raise ValueError(f"Cannot safely read regular file: {path}") from error
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+    current = os.fstat(descriptor)
+    if not stat.S_ISREG(current.st_mode):
         os.close(descriptor)
         raise ValueError(f"Cannot safely read regular file: {path}")
     with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-        return handle.read(), (os.fstat(handle.fileno()).st_dev, os.fstat(handle.fileno()).st_ino)
+        text = handle.read()
+        identity = snapshot_identity(current)
+        if snapshot_identity(os.fstat(handle.fileno())) != identity:
+            raise ValueError(f"File changed while reading: {path}")
+        return text, identity
 
 
 def read_regular_text(root, path, *, missing=None):
@@ -319,7 +319,7 @@ def write_regular_text(root, path, text, *, create=False, identity=None, root_id
                     os.close(descriptor)
                 if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
                         or (create and identity is None)
-                        or (identity is not None and (current.st_dev, current.st_ino) != identity)):
+                        or (identity is not None and snapshot_identity(current) != identity)):
                     raise ValueError(f"Cannot safely update regular file: {path}")
             temporary = f".agent-canvas-write-{uuid.uuid4().hex}"
             descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -337,8 +337,7 @@ def write_regular_text(root, path, text, *, create=False, identity=None, root_id
                             follow_symlinks=False)
                 else:
                     observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
-                    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
-                    if any(getattr(observed, field) != getattr(current, field) for field in fields):
+                    if snapshot_identity(observed) != snapshot_identity(current):
                         raise ValueError(f"Cannot safely update changed regular file: {path}")
                     os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
             finally:

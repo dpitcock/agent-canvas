@@ -63,6 +63,10 @@ def nuke(target, *, apply=False):
     root, root_identity = root_path(target, with_identity=True)
     actions = []
     for relative in TARGETS:
+        # The ancestor traversal already handles these entries, including links.
+        # Preview must not revisit a descendant through a link scheduled for removal.
+        if any(str(parent) in TARGETS for parent in Path(relative).parents):
+            continue
         path = root / relative
         if path.exists() or path.is_symlink():
             nuke_path(root, path, actions, apply, root_identity=root_identity)
