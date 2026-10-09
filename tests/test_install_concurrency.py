@@ -15,6 +15,34 @@ nuke = load("agent-nuke")
 
 
 class InstallConcurrency(unittest.TestCase):
+    def test_upgrade_does_not_overwrite_config_edited_after_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve() / "project"
+            root.mkdir()
+            installer.install(root, apply=True, home=Path(tmp) / "home")
+            config = root / "config/workspace-config.yml"
+            original = config.read_text()
+            edited = original.replace("codex: true", "codex: false")
+            self.assertNotEqual(original, edited)
+            snapshot = installer.regular_text_snapshot
+            render = installer.render_files
+            reads = []
+            def snapshot_then_edit(project, path, **kwargs):
+                result = snapshot(project, path, **kwargs)
+                if path == config:
+                    reads.append(path)
+                    if len(reads) == 1:
+                        config.write_text(edited)
+                return result
+            def upgraded_files(*args, **kwargs):
+                files = render(*args, **kwargs)
+                files["config/workspace-config.yml"] += "\n# Package update\n"
+                return files
+            with patch.object(installer, "regular_text_snapshot", snapshot_then_edit), patch.object(installer, "render_files", upgraded_files):
+                with self.assertRaises(ValueError):
+                    installer.upgrade(root, apply=True, home=Path(tmp) / "home")
+            self.assertEqual(config.read_text(), edited)
+
     def test_stale_snapshot_rejects_in_place_edit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -571,7 +571,8 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
     options = state["options"] if state else dict(workspace=root.name, environment="local", role="application", slack="")
     files = render_files(source, **options)
     config_path = root / "config/workspace-config.yml"
-    config_text, _ = regular_text_snapshot(root, config_path, missing=files["config/workspace-config.yml"])
+    config_snapshot = regular_text_snapshot(root, config_path, missing=None)
+    config_text = config_snapshot[0] if config_snapshot[0] is not None else files["config/workspace-config.yml"]
     environments = agentic_envs(config_text)
     version = digest(files)
     if state is None:
@@ -596,7 +597,9 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
     created_managed = set()
     for name, incoming in files.items():
         path = root / name
-        local, managed_identities[name] = regular_text_snapshot(root, path, missing=None)
+        # Keep environment selection and merge/write authorization on one snapshot.
+        local, managed_identities[name] = (config_snapshot if path == config_path
+                                           else regular_text_snapshot(root, path, missing=None))
         known = name in state["baselines"] and state["baselines"][name] is not None
         base = state["baselines"].get(name)
         if name in resolve:

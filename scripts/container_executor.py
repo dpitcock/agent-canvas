@@ -431,6 +431,13 @@ class ExecutionRequest:
             raise ConfigurationError("image digest must be a lower-case sha256")
         if not isinstance(self.command, (list, tuple)) or not self.command or not all(isinstance(value, str) and value for value in self.command):
             raise ConfigurationError("command must be a nonempty argument vector")
+        for value in self.command:
+            if "\0" in value:
+                raise ConfigurationError("command arguments cannot contain NUL")
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ConfigurationError("command arguments must be valid UTF-8") from exc
         if isinstance(self.timeout_s, bool) or not isinstance(self.timeout_s, int) or not 0 < self.timeout_s <= 300:
             raise ConfigurationError("timeout must be between one and 300 seconds")
         if isinstance(self.max_output_bytes, bool) or not isinstance(self.max_output_bytes, int) or not 0 <= self.max_output_bytes <= 1_048_576:
