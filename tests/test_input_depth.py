@@ -5,6 +5,20 @@ from test_container_executor import executor
 
 
 class InputDepthTests(unittest.TestCase):
+    def test_invalid_encoding_is_rejected_and_partial_stage_removed(self):
+        for relative in ("bad\0input", "bad\ud800input"):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                project = base / "project"
+                staging = base / "staging"
+                project.mkdir()
+                staging.mkdir()
+                (project / "first").write_text("data")
+                with executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project)) as pinned:
+                    with self.assertRaises(executor.InputRejected):
+                        executor.stage_inputs(pinned, ["first", relative], staging, max_bytes=1024, max_files=2)
+                self.assertEqual(list(staging.iterdir()), [])
+
     def test_excessive_depth_is_rejected_and_partial_stage_removed(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

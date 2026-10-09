@@ -75,6 +75,12 @@ def _canonical(value):
 def _safe_relative(path):
     if not isinstance(path, str) or not path or path.startswith("/"):
         raise InputRejected("input paths must be nonempty relative paths")
+    if "\0" in path:
+        raise InputRejected("input paths cannot contain NUL")
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise InputRejected("input paths must be valid UTF-8") from error
     parts = path.split("/")
     if len(parts) > 64:
         raise InputRejected("input path depth exceeds 64 components")
