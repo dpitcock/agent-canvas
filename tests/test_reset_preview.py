@@ -5,6 +5,21 @@ from test_install_concurrency import nuke
 
 
 class ResetPreviewTests(unittest.TestCase):
+    def test_remove_all_retains_unlisted_shared_parents(self):
+        for relative in ("agents/review-coordinator.md", "config/workspace-config.yml",
+                         "skills/addyosmani-agent-skills.ref"):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / relative
+                path.parent.mkdir()
+                path.write_text("managed")
+                _, preview = nuke._uninstall.uninstall(root, mode="remove-all")
+                self.assertTrue(path.exists())
+                _, applied = nuke._uninstall.uninstall(root, mode="remove-all", apply=True)
+                self.assertFalse(path.exists())
+                self.assertTrue(path.parent.is_dir())
+                self.assertEqual([a.replace("WOULD REMOVE", "REMOVE") for a in preview], applied)
+
     def test_preview_lists_every_removed_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

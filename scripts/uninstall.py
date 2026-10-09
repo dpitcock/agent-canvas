@@ -360,7 +360,7 @@ def planned_removal(root, path, actions, apply, *, root_identity):
         return
     actions.append(f"{'REMOVE' if apply else 'WOULD REMOVE'} {path.relative_to(root)}")
     if apply:
-        remove_path(root, path, root_identity=root_identity)
+        remove_path(root, path, prune_parents=False, root_identity=root_identity)
 
 
 def planned_regular_removal(root, path, actions, apply, identity):

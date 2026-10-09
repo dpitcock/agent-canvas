@@ -580,7 +580,7 @@ class InstallSmoke(unittest.TestCase):
                 self.assertTrue(swapped)
                 self.assertEqual(victim.read_text(), "keep")
 
-    def test_remove_all_prunes_empty_parents_and_keeps_unrelated_files(self):
+    def test_remove_all_retains_shared_parents_and_unrelated_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             config = root / "config"
@@ -593,7 +593,8 @@ class InstallSmoke(unittest.TestCase):
             uninstaller.uninstall(root, mode="remove-all", apply=True)
             self.assertEqual((config / "application.yml").read_text(), "keep")
             self.assertFalse((config / "workspace-config.yml").exists())
-            self.assertFalse((root / "skills").exists())
+            self.assertTrue((root / "skills").is_dir())
+            self.assertEqual(list((root / "skills").iterdir()), [])
 
     def test_preserve_adapter_replacement_directory_survives(self):
         with tempfile.TemporaryDirectory() as tmp:

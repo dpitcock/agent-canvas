@@ -253,6 +253,8 @@ python3 scripts/uninstall.py /path/to/project --mode remove-all --apply
 
 `remove-all` deletes the complete Agent Canvas follow-up file as well as managed settings, installed skill links/packs, and the installation record. It still does not touch application code, Git history, or unrelated project files.
 
+Parent directories not explicitly listed for removal are retained even when empty; apply does not silently prune shared `agents/`, `skills/`, or `config/` directories beyond the preview.
+
 Removal uses no-follow directory descriptors to prevent ancestor symlinks from redirecting cleanup outside the project. Recursive cleanup requires Python 3.11+ on a platform with symlink-safe, descriptor-relative `shutil.rmtree`; unsupported operations fail closed rather than falling back to pathname deletion.
 
 Even without readable installation history, `remove-all` removes the three exact fixed ignore entries (`/.owner-override`, `/.agents/skills/addy-*/`, and `/skills/addyosmani-agent-skills/`). It preserves unrelated ignore text and dynamic Cline entries without recorded ownership.
