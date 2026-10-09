@@ -3,7 +3,7 @@ agentic_envs:
   codex: true
   cline: true
   claude_code: false # Reserved; adapter not yet implemented.
-# One approval per PR in every environment; required or requested reviews are recorded on the PR.
+# Numeric GitHub minimum; Staff/QA (+ accessibility for frontend) passes and the Codex loop still apply.
 approvals_required: 1
 target_environment: local
 repo_role: toolkit-authoring
