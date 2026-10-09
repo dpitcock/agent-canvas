@@ -5,10 +5,47 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from test_supervised import supervisor
+from test_supervised import supervisor, installer
 
 
 class SupervisedMergeTests(unittest.TestCase):
+    def test_missing_override_preserves_completed_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            project = base / "project"
+            project.mkdir()
+            override = project / ".owner-override"
+            override.write_text("OWNER_OVERRIDE=pause")
+            installer.install(project, apply=True, supervised=True, supervisor_state_dir=base / "state", home=base / "home")
+            host = supervisor.HostSupervisor(base / "state")
+            before = host.provision(project)["owner_override"]
+            override.unlink()
+            installer.upgrade(project, apply=True, supervised=True, supervisor_state_dir=base / "state", home=base / "home")
+            self.assertEqual(host.provision(project)["owner_override"], before)
+
+    def test_missing_override_completes_interrupted_installer_import(self):
+        for operation in ("install", "upgrade"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve()
+                project = base / "project"
+                project.mkdir()
+                state = base / "state"
+                installer.install(project, apply=True, supervised=True, supervisor_state_dir=state, home=base / "home")
+                host = supervisor.HostSupervisor(state)
+                host.create_task("task", project, [{"id": "work", "operation": "write"}])
+                override = project / ".owner-override"
+                override.write_text("OWNER_OVERRIDE=pause")
+                with patch.object(host, "_event", side_effect=OSError("interrupted import")):
+                    with self.assertRaises(OSError):
+                        host.import_owner_override(project, ["pause"], source_digest="a" * 64)
+                override.unlink()
+                getattr(installer, operation)(project, apply=True, supervised=True,
+                    supervisor_state_dir=state, home=base / "home")
+                self.assertEqual(host.recover("task", project=project).kind, "continue")
+                registration = host.provision(project)
+                self.assertTrue(registration["owner_override"]["import_complete"])
+                self.assertEqual(registration["owner_override"]["modes"], [])
+
     def test_failed_override_import_blocks_decisions_until_retry(self):
         for mode, expected in (("pause", "paused"), ("reset", "cancelled")):
             for failure in ("audit", "transition"):
