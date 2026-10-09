@@ -338,8 +338,12 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
         # host enumeration stays disabled, while the mount itself is read-only.
         os.fchmod(stage_fd, 0o711)
         manifest, copied, total = [], [], 0
+        seen_paths = set()
         for declared_path in paths:
             parts = _safe_relative(declared_path)
+            if parts in seen_paths:
+                raise InputRejected("declared input paths must be unique")
+            seen_paths.add(parts)
             fd = _open_relative(project.fd, parts)
             try:
                 before = os.fstat(fd)
