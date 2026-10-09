@@ -351,7 +351,10 @@ def stage_inputs(project, declared, staging_parent, *, max_bytes, max_files):
                     raise InputRejected("only singly-linked regular files may be staged")
                 if before.st_size < 0 or before.st_size > max_bytes - total:
                     raise InputRejected("input bytes exceed the staging limit")
-                target_parent = _open_or_create_parent(stage_fd, parts)
+                try:
+                    target_parent = _open_or_create_parent(stage_fd, parts)
+                except (FileExistsError, NotADirectoryError) as error:
+                    raise InputRejected("declared input paths collide on the staging filesystem") from error
                 # The path was derived solely from safe components under root.
                 digest = hashlib.sha256()
                 copied_bytes = 0

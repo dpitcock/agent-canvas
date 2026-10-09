@@ -1,10 +1,34 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from test_container_executor import executor
 
 
 class InputDepthTests(unittest.TestCase):
+    def test_file_parent_collision_is_rejected_and_stage_removed(self):
+        for declarations in (("Input", "input/child"), ("input/child", "Input")):
+            with self.subTest(declarations=declarations), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                project = base / "project"
+                staging = base / "staging"
+                project.mkdir()
+                staging.mkdir()
+                (project / "first").write_text("first")
+                (project / "second").write_text("second")
+                open_source = executor._open_relative
+                # Fold declarations to model destination name equivalence on every
+                # filesystem, while mapping the distinct source files to real FDs.
+                names = tuple("input" if name == "Input" else name for name in declarations)
+                def source_mapping(fd, parts):
+                    source = {("input",): ("first",), ("input", "child"): ("second",)}[parts]
+                    return open_source(fd, source)
+                with executor.PinnedProject.open(project, executor.ProjectIdentity.capture(project)) as pinned:
+                    with patch.object(executor, "_open_relative", source_mapping):
+                        with self.assertRaises(executor.InputRejected):
+                            executor.stage_inputs(pinned, names, staging, max_bytes=1024, max_files=2)
+                self.assertEqual(list(staging.iterdir()), [])
+
     def test_filesystem_equivalent_paths_are_rejected_and_stage_removed(self):
         for names in (("Input", "input"), ("café", "cafe\u0301")):
             with self.subTest(names=names), tempfile.TemporaryDirectory() as tmp:
