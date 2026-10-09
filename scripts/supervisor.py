@@ -374,7 +374,8 @@ class HostSupervisor:
         with self._locked_project(project):
             current = self._provision_locked(project)
             normalized = sorted(set(modes))
-            current["owner_override"] = {"modes": normalized, "source_digest": source_digest, "imported_at": _now()}
+            current["owner_override"] = {"modes": normalized, "source_digest": source_digest,
+                                         "imported_at": _now(), "import_complete": False}
             self._write(self._registration(project), current)
             self._event(None, "owner_override_imported", project=project, modes=normalized, source_digest=source_digest)
             tasks = self._tasks_dir(project, create=True)
@@ -390,6 +391,8 @@ class HostSupervisor:
                 elif "pause" in normalized and task["status"] != "paused":
                     self.pause(path.stem, project=project)
                     self._event(path.stem, "owner_override_paused", project=project)
+            current["owner_override"]["import_complete"] = True
+            self._write(self._registration(project), current)
             return current
 
     def _project_for_task(self, task_id, project=None):
@@ -657,6 +660,9 @@ class HostSupervisor:
         task_path = self._task_path(task_id, project)
         registered = self._read(task_path.parents[1] / "registration.json")["project"]
         with self._locked_project(registered):
+            registration = self._read(self._registration(registered))
+            if registration.get("owner_override", {}).get("import_complete") is False:
+                raise ValueError("Owner override import is incomplete; retry the host import before automatic decisions")
             with self._locked_task(task_id, project=registered) as task, self._locked_interrupt(task_id, registered) as path:
                 yield task, path
 

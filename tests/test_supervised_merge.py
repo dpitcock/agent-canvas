@@ -9,6 +9,34 @@ from test_supervised import supervisor
 
 
 class SupervisedMergeTests(unittest.TestCase):
+    def test_failed_override_import_blocks_decisions_until_retry(self):
+        for mode, expected in (("pause", "paused"), ("reset", "cancelled")):
+            for failure in ("audit", "transition"):
+                with self.subTest(mode=mode, failure=failure), tempfile.TemporaryDirectory() as tmp:
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    host = supervisor.HostSupervisor(Path(tmp) / "state")
+                    for task_id in ("first", "second"):
+                        host.create_task(task_id, project, [{"id": "work", "operation": "write"}])
+                    method = "_event" if failure == "audit" else ("pause" if mode == "pause" else "cancel")
+                    with patch.object(host, method, side_effect=OSError("import interrupted")):
+                        with self.assertRaises(OSError):
+                            host.import_owner_override(project, [mode], source_digest="a" * 64)
+                    restarted = supervisor.HostSupervisor(Path(tmp) / "state")
+                    for action in (
+                        lambda: restarted.claim_action("second", "work", "attempt", project=project),
+                        lambda: restarted.recover("second", project=project),
+                        lambda: restarted.gate_final("second", "attempt", "done", project=project),
+                    ):
+                        with self.assertRaisesRegex(ValueError, "incomplete"):
+                            action()
+                    self.assertEqual(restarted.visible_messages("second", project=project), [])
+                    restarted.import_owner_override(project, [mode], source_digest="a" * 64)
+                    self.assertEqual(restarted.recover("second", project=project).kind, expected)
+                    if mode == "pause":
+                        restarted.resume("second", project=project)
+                        self.assertEqual(restarted.claim_action("second", "work", "resumed", project=project).kind, "dispatch")
+
     def test_override_import_serializes_decisions_for_later_tasks(self):
         for mode, expected in (("pause", "paused"), ("reset", "cancelled")):
             for decision in ("claim", "recover", "final"):
