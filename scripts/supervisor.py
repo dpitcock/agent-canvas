@@ -387,7 +387,7 @@ class HostSupervisor:
                 if "reset" in normalized:
                     self.cancel(path.stem, project=project)
                     self._event(path.stem, "owner_override_reset", project=project)
-                elif "pause" in normalized and task["status"] == "active":
+                elif "pause" in normalized and task["status"] != "paused":
                     self.pause(path.stem, project=project)
                     self._event(path.stem, "owner_override_paused", project=project)
             return current
@@ -467,6 +467,7 @@ class HostSupervisor:
                     raise ValueError(f"Host audit is unreadable: {source.name}") from error
             if task.get("release_event"):
                 events.append(task["release_event"])
+            events.extend(task.get("prior_release_events", []))
             if task.get("creation_event"):
                 events.append(task["creation_event"])
             return sorted(events, key=lambda event: event["at"])
@@ -571,6 +572,8 @@ class HostSupervisor:
         This records a host decision, not an acknowledgement that a UI rendered
         it. A client crash after this commit can recover the visible message.
         """
+        if task.get("release_event"):
+            task.setdefault("prior_release_events", []).append(task["release_event"])
         task["release_event"] = {
             "at": _now(), "task_id": task["task_id"],
             "type": "blocker_release_committed" if blocker else "final_release_committed",
@@ -595,6 +598,7 @@ class HostSupervisor:
             # never a stale or unrelated terminal message.
             committed = self.task(task["task_id"], project=task["project"])
             if (committed.get("release_event") != task["release_event"]
+                    or committed.get("prior_release_events") != task.get("prior_release_events")
                     or committed.get("status") != task["status"]
                     or committed.get("visible_messages") != task["visible_messages"]):
                 raise
