@@ -2,14 +2,19 @@
 """Install Agent Canvas additively; leave semantic conflicts for the project owner."""
 
 import argparse
+from contextlib import contextmanager
 import difflib
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
+import stat
+import uuid
 
 SOURCE = Path(__file__).resolve().parents[1]
 IGNORE = ("/.owner-override", "/.agents/skills/addy-*/", "/skills/addyosmani-agent-skills/")
@@ -23,6 +28,31 @@ END = "<!-- agent-canvas:upgrade:end -->"
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def provision_supervised(root, state_dir, *, root_identity=None):
+    """Register a project in host state; never treat project files as authority."""
+    root = Path(root).resolve()
+    state_dir = (Path.home() / ".agent-canvas-supervisor") if state_dir is None else Path(state_dir).expanduser()
+    state_dir = state_dir.resolve()
+    try:
+        state_dir.relative_to(root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Supervisor state directory must be outside the project workspace")
+    try:
+        root.relative_to(state_dir)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Supervisor state directory must be outside the project workspace")
+    spec = importlib.util.spec_from_file_location("agent_canvas_supervisor", SOURCE / "scripts/supervisor.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with pinned_parent(root, root / ".registration", root_identity=root_identity):
+        registration = module.HostSupervisor(state_dir).provision(root, expected_identity=root_identity)
+    return {"enabled": True, "state_dir": str(state_dir), "registration_digest": digest(registration)}
 
 
 ADAPTERS = {"codex": ".agents/skills", "cline": ".cline/skills"}
@@ -170,72 +200,293 @@ def adapter_plan(root, environments, state, home=None):
     return operations, actions
 
 
-def apply_adapters(operations):
-    for operation, link, target in operations:
-        if operation == "remove":
-            link.unlink()
-        else:
-            link.parent.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(target, target_is_directory=True)
-            if link.parent.name == "skills" and link.parent.parent.name == ".cline":
-                root = link.parent.parent.parent
-                ignore = root / ".gitignore"
-                safe_destination(root, ignore)
-                old = ignore.read_text() if ignore.exists() else ""
-                entry = "/.cline/skills/" + link.name
-                if entry not in old.splitlines():
-                    ignore.write_text(old + ("\n" if old and not old.endswith("\n") else "") + entry + "\n")
+def add_gitignore_entry(root, ignore, entry, *, root_identity=None):
+    """Append one entry through a descriptor pinned to a regular .gitignore."""
+    return add_gitignore_entries(root, ignore, [entry], root_identity=root_identity)
+
+
+def add_gitignore_entries(root, ignore, entries, *, root_identity=None):
+    """Publish missing entries only while the original snapshot still matches."""
+    old, identity = regular_text_snapshot(root, ignore, missing="")
+    missing = [entry for entry in entries if entry not in old.splitlines()]
+    if not missing:
+        return False
+    updated = old + ("\n" if old and not old.endswith("\n") else "") + "\n".join(missing) + "\n"
+    write_regular_text(root, ignore, updated, create=True, identity=identity,
+                       root_identity=root_identity)
+    return True
+
+
+def snapshot_identity(status):
+    return (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns,
+            status.st_ctime_ns, status.st_mode, status.st_nlink)
+
+
+def regular_text_snapshot(root, path, *, missing=None):
+    """Read a regular file and retain metadata from before and after reading."""
+    safe_destination(root, path)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return missing, None
+    except OSError as error:
+        raise ValueError(f"Cannot safely read regular file: {path}") from error
+    current = os.fstat(descriptor)
+    if not stat.S_ISREG(current.st_mode):
+        os.close(descriptor)
+        raise ValueError(f"Cannot safely read regular file: {path}")
+    with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+        text = handle.read()
+        identity = snapshot_identity(current)
+        if snapshot_identity(os.fstat(handle.fileno())) != identity:
+            raise ValueError(f"File changed while reading: {path}")
+        return text, identity
+
+
+def read_regular_text(root, path, *, missing=None):
+    """Read only a descriptor-pinned regular project file."""
+    return regular_text_snapshot(root, path, missing=missing)[0]
+
+
+def select_project(target, *, allow_missing=False):
+    """Capture the selected project once, before planning or writing its files."""
+    root = Path(target).expanduser().resolve()
+    try:
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError as error:
+        if allow_missing:
+            return root, None
+        raise ValueError("Target must be an existing project directory") from error
+    except OSError as error:
+        raise ValueError("Target must be an existing project directory") from error
+    try:
+        current = os.fstat(descriptor)
+        return root, (current.st_dev, current.st_ino)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def pinned_parent(root, path, *, create=False, root_identity=None):
+    """Traverse project directories without following replacement symlinks."""
+    safe_destination(root, path)
+    relative = path.relative_to(root)
+    if not relative.parts or ".." in relative.parts:
+        raise ValueError(f"Destination is outside project: {path}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if create and root_identity is None:
+        root.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(root, flags)
+    except OSError as error:
+        if root_identity is not None:
+            raise ValueError("Project directory changed during installation") from error
+        raise
+    try:
+        current = os.fstat(descriptor)
+        if root_identity is not None and (current.st_dev, current.st_ino) != root_identity:
+            raise ValueError("Project directory changed during installation")
+        for name in relative.parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(name, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            child = os.open(name, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor, relative.name
+    finally:
+        os.close(descriptor)
+
+
+def write_regular_text(root, path, text, *, create=False, identity=None, root_identity=None):
+    """Publish a fully written replacement within the pinned parent directory."""
+    # Encode before touching the destination; invalid text cannot truncate it.
+    payload = text.encode("utf-8")
+    try:
+        with pinned_parent(root, path, create=create, root_identity=root_identity) as (parent, name):
+            try:
+                descriptor = os.open(name, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+            except FileNotFoundError:
+                if not create or identity is not None:
+                    raise
+                current = None
+            else:
+                try:
+                    current = os.fstat(descriptor)
+                finally:
+                    os.close(descriptor)
+                if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                        or (create and identity is None)
+                        or (identity is not None and snapshot_identity(current) != identity)):
+                    raise ValueError(f"Cannot safely update regular file: {path}")
+            temporary = f".agent-canvas-write-{uuid.uuid4().hex}"
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o666, dir_fd=parent)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    if current is not None:
+                        os.fchmod(handle.fileno(), stat.S_IMODE(current.st_mode))
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if current is None:
+                    # Exclusive publication: never overwrite a newly appeared file.
+                    os.link(temporary, name, src_dir_fd=parent, dst_dir_fd=parent,
+                            follow_symlinks=False)
+                else:
+                    observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                    if snapshot_identity(observed) != snapshot_identity(current):
+                        raise ValueError(f"Cannot safely update changed regular file: {path}")
+                    os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=parent)
+                except FileNotFoundError:
+                    pass
+    except OSError as error:
+        raise ValueError(f"Cannot safely update regular file: {path}") from error
+
+
+def apply_adapters(operations, provenance=None, *, root=None, root_identity=None):
+    """Undo completed link changes if this adapter batch cannot finish."""
+    completed, descriptors, ignore_entries = [], [], {}
+    try:
+        for operation, link, target in operations:
+            project = root if root is not None else link.parent.parent.parent
+            # Retain the actual directory until commit/rollback, even if renamed.
+            with pinned_parent(project, link.parent / ".adapter", create=True,
+                               root_identity=root_identity) as (parent, _):
+                retained = os.dup(parent)
+                descriptors.append(retained)
+                if operation == "remove":
+                    previous = os.readlink(link.name, dir_fd=parent)
+                    os.unlink(link.name, dir_fd=parent)
+                    completed.append(("remove", retained, link.name, previous))
+                else:
+                    os.symlink(target, link.name, dir_fd=parent, target_is_directory=True)
+                    completed.append(("add", retained, link.name, target))
+            if operation != "remove":
+                if link.parent.name == "skills" and link.parent.parent.name == ".cline":
+                    ignore_entries.setdefault(project, []).append("/.cline/skills/" + link.name)
+        # Defer ignore updates until every link succeeds, with one append per project.
+        # A failed append can leave unused ignore patterns; link rollback still runs.
+        for project, planned in ignore_entries.items():
+            ignore = project / ".gitignore"
+            existing = read_regular_text(project, ignore, missing="").splitlines()
+            missing = [entry for entry in planned if entry not in existing]
+            if missing and add_gitignore_entries(project, ignore, missing, root_identity=root_identity):
+                if provenance is not None:
+                    entries = provenance.setdefault("gitignore_entries", [])
+                    entries.extend(entry for entry in missing if entry not in entries)
+    except Exception as error:
+        failures = []
+        for operation, parent, name, target in reversed(completed):
+            try:
+                if operation == "remove":
+                    os.symlink(target, name, dir_fd=parent, target_is_directory=True)
+                else:
+                    os.unlink(name, dir_fd=parent)
+            except OSError as rollback_error:
+                failures.append(f"{name}: {rollback_error}")
+        if failures:
+            raise ValueError(f"Adapter update failed ({error}); link rollback incomplete: "
+                             + "; ".join(failures)) from error
+        raise
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
 
 
 def read_state(root):
     path = root / STATE
-    safe_destination(root, path)
-    if not path.exists():
+    try:
+        text = read_regular_text(root, path, missing=None)
+    except ValueError as error:
+        raise ValueError("Cannot safely read a non-regular .agent-canvas/state.json") from error
+    if text is None:
         return None
     try:
-        state = json.loads(path.read_text())
-        assert state["schema_version"] == 1
-        assert isinstance(state["options"], dict)
-        assert set(state["options"]) == {"workspace", "environment", "role", "slack"}
-        assert all(isinstance(v, str) for v in state["options"].values())
-        assert state["options"]["environment"] in {"local", "dev", "production"}
-        assert state["options"]["role"] in {"application", "toolkit-authoring"}
-        assert isinstance(state["baselines"], dict) and set(state["baselines"]) <= set(MANAGED)
-        assert all(v is None or isinstance(v, str) for v in state["baselines"].values())
-        assert isinstance(state["pending"], dict) and set(state["pending"]) <= set(MANAGED)
-        assert all(isinstance(v, dict) and isinstance(v["incoming"], str) for v in state["pending"].values())
-        assert isinstance(state["resolutions"], list)
+        state = json.loads(text)
+        if not isinstance(state, dict) or state.get("schema_version") != 1:
+            raise ValueError
+        options = state.get("options")
+        if not (isinstance(options, dict) and set(options) == {"workspace", "environment", "role", "slack"}
+                and all(isinstance(value, str) for value in options.values())
+                and options["environment"] in {"local", "dev", "production"}
+                and options["role"] in {"application", "toolkit-authoring"}):
+            raise ValueError
+        baselines = state.get("baselines")
+        if not (isinstance(baselines, dict) and set(baselines) <= set(MANAGED)
+                and all(value is None or isinstance(value, str) for value in baselines.values())):
+            raise ValueError
+        pending = state.get("pending")
+        if not (isinstance(pending, dict) and set(pending) <= set(MANAGED)
+                and all(isinstance(value, dict) and isinstance(value.get("incoming"), str)
+                        for value in pending.values()) and isinstance(state.get("resolutions"), list)):
+            raise ValueError
+        if "provenance" in state:
+            provenance = state["provenance"]
+            if not (isinstance(provenance, dict) and set(provenance) <= {"managed_files", "gitignore_entries"}
+                    and isinstance(provenance.get("managed_files", []), list)
+                    and set(provenance.get("managed_files", [])) <= set(MANAGED)
+                    and isinstance(provenance.get("gitignore_entries", []), list)
+                    and all(entry in IGNORE or re.fullmatch(r"/\.cline/skills/[^/]+", entry)
+                            for entry in provenance.get("gitignore_entries", []))):
+                raise ValueError
+        if "supervised" in state:
+            supervised = state["supervised"]
+            if not (isinstance(supervised, dict) and supervised.get("enabled") is True
+                    and isinstance(supervised.get("state_dir"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", supervised.get("registration_digest", ""))):
+                raise ValueError
         if "adapters" in state:
             adapter = state["adapters"]
-            assert isinstance(adapter, dict) and isinstance(adapter["links"], dict)
-            assert isinstance(adapter["pending"], list) and all(isinstance(item, str) for item in adapter["pending"])
+            if not (isinstance(adapter, dict) and isinstance(adapter.get("links"), dict)
+                    and isinstance(adapter.get("pending"), list)
+                    and all(isinstance(item, str) for item in adapter["pending"])):
+                raise ValueError
             for name, target in adapter["links"].items():
-                assert isinstance(name, str) and isinstance(target, str) and name == str(Path(name))
-                assert str(Path(name).parent) in ADAPTERS.values() and Path(name).name not in {".", ".."}
-                expected = Path("../../skills/addyosmani-agent-skills/skills") / Path(target).name
-                assert target == str(expected) and Path(target).name not in {".", ".."}
+                if not (isinstance(name, str) and isinstance(target, str) and name == str(Path(name))
+                        and str(Path(name).parent) in ADAPTERS.values() and Path(name).name not in {".", ".."}):
+                    raise ValueError
+                directory = str(Path(name).parent)
+                link_name = Path(name).name
+                skill_name = link_name.removeprefix("addy-") if directory == ".agents/skills" else link_name
+                expected = Path("../../skills/addyosmani-agent-skills/skills") / skill_name
+                if (not skill_name or (directory == ".agents/skills" and not link_name.startswith("addy-"))
+                        or target != str(expected)):
+                    raise ValueError
             if "pack" in adapter:
-                assert re.fullmatch(r"[0-9a-f]{64}", adapter["pack"]["fingerprint"])
-                assert re.fullmatch(r"[0-9a-fA-F]{40}", adapter["pack"]["revision"])
+                pack = adapter["pack"]
+                if not (isinstance(pack, dict) and re.fullmatch(r"[0-9a-f]{64}", pack.get("fingerprint", ""))
+                        and re.fullmatch(r"[0-9a-fA-F]{40}", pack.get("revision", ""))):
+                    raise ValueError
         return state
     except (ValueError, KeyError, TypeError, AssertionError) as error:
         raise ValueError(f"Cannot read upgrade history in {path}; preserve it and repair or restore it") from error
 
 
-def save_state(root, state):
+def save_state(root, state, *, root_identity=None):
     path = root / STATE
     safe_destination(root, path)
     text = json.dumps(state, indent=2, sort_keys=True) + "\n"
     if path.exists() and path.read_text() == text:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
-        out.write(text)
-        temporary = Path(out.name)
-    try:
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with pinned_parent(root, path, create=True, root_identity=root_identity) as (parent, name):
+        temporary = ".state-" + uuid.uuid4().hex
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as out:
+                out.write(text)
+            os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=parent)
+            except FileNotFoundError:
+                pass
 
 
 def merge_text(base, local, incoming):
@@ -268,10 +519,10 @@ def merge_text(base, local, incoming):
     return "".join(lines), False
 
 
-def upgrade_followup(root, actions, pending, source=SOURCE, *, state=None, preserve_current=False):
+def upgrade_followup(root, actions, pending, source=SOURCE, *, state=None, preserve_current=False,
+                     root_identity=None):
     path = root / "INSTALL-FOLLOWUP.md"
-    safe_destination(root, path)
-    old = path.read_text() if path.exists() else "# Agent Canvas installation follow-up\n"
+    old, identity = regular_text_snapshot(root, path, missing="# Agent Canvas installation follow-up\n")
     marker = f"<!-- agent-canvas:proposal:{digest([str(source), state])} -->"
     if BEGIN in old or END in old:
         if old.count(BEGIN) != 1 or old.count(END) != 1 or old.index(BEGIN) >= old.index(END):
@@ -302,14 +553,12 @@ Pending files: {', '.join('`' + name + '`' for name in sorted(pending)) or 'none
     else:
         updated = old.rstrip() + "\n\n" + block + "\n"
     if updated != old:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(updated)
+        write_regular_text(root, path, updated, create=True, identity=identity, root_identity=root_identity)
 
 
-def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=None):
-    root = Path(target).expanduser().resolve()
-    if not root.is_dir():
-        raise ValueError("Install the project first; upgrade target must exist")
+def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=None,
+            supervised=False, supervisor_state_dir=None):
+    root, root_identity = select_project(target)
     for name in (*MANAGED, STATE, ".gitignore", "INSTALL-FOLLOWUP.md"):
         path = root / name
         safe_destination(root, path)
@@ -322,19 +571,35 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
     options = state["options"] if state else dict(workspace=root.name, environment="local", role="application", slack="")
     files = render_files(source, **options)
     config_path = root / "config/workspace-config.yml"
-    environments = agentic_envs(config_path.read_text() if config_path.exists() else files["config/workspace-config.yml"])
+    config_snapshot = regular_text_snapshot(root, config_path, missing=None)
+    config_text = config_snapshot[0] if config_snapshot[0] is not None else files["config/workspace-config.yml"]
+    environments = agentic_envs(config_text)
     version = digest(files)
     if state is None:
         state = dict(schema_version=1, options=options, baselines={}, pending={}, resolutions=[])
+    supervised_record = None
+    if supervised:
+        if apply:
+            supervised_record = provision_supervised(root, supervisor_state_dir, root_identity=root_identity)
+            state["supervised"] = supervised_record
+            actions = ["REGISTER supervised project in host-owned state"]
+        else:
+            actions = ["WOULD REGISTER supervised project in host-owned state"]
+    else:
+        actions = []
     for name in resolve:
         if name not in MANAGED or name not in state["pending"]:
             raise ValueError(f"No pending conflict to resolve: {name}")
         if state["pending"][name]["incoming"] != files[name]:
             raise ValueError(f"Package changed since this conflict was recorded: {name}; preview/apply the new proposal first")
-    actions, writes = [], {}
+    writes = {}
+    managed_identities = {}
+    created_managed = set()
     for name, incoming in files.items():
         path = root / name
-        local = path.read_text() if path.exists() else None
+        # Keep environment selection and merge/write authorization on one snapshot.
+        local, managed_identities[name] = (config_snapshot if path == config_path
+                                           else regular_text_snapshot(root, path, missing=None))
         known = name in state["baselines"] and state["baselines"][name] is not None
         base = state["baselines"].get(name)
         if name in resolve:
@@ -365,28 +630,35 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
             state["pending"].pop(name, None)
             if result != local:
                 writes[name] = result
+                if local is None:
+                    created_managed.add(name)
                 diff = "".join(difflib.unified_diff((local or "").splitlines(True), (result or "").splitlines(True),
                                                      fromfile=name, tofile=name + " (proposed)"))
                 actions.append(f"{'UPDATE' if apply else 'WOULD UPDATE'} {name}\n{diff}")
-    config_text = writes.get("config/workspace-config.yml", config_path.read_text() if config_path.exists() else files["config/workspace-config.yml"])
+    config_text = writes.get("config/workspace-config.yml", config_text)
     operations, adapter_actions = adapter_plan(root, agentic_envs(config_text), state, home=home)
     actions.extend(adapter_actions if apply else ["WOULD " + a if a.startswith(("ADD ", "REMOVE ")) else a for a in adapter_actions])
     state["package_version"] = version
     if not writes and not operations and json.dumps(state, sort_keys=True) == original_state:
         actions = actions or ["NO CHANGES: prior decisions and local customizations preserved"]
-        upgrade_followup(root, actions, state["pending"], source=source, state=state, preserve_current=True)
+        upgrade_followup(root, actions, state["pending"], source=source, state=state, preserve_current=True, root_identity=root_identity)
         return apply, actions
     if not actions:
         actions.append("RECONCILED: current files preserved; baseline or pending records updated")
     # Prepare the handoff before changing tracked files; malformed markers cannot partially apply an upgrade.
-    upgrade_followup(root, actions, state["pending"], source=source, state=state)
+    upgrade_followup(root, actions, state["pending"], source=source, state=state, root_identity=root_identity)
     if apply:
         for name, text in writes.items():
             path = root / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text)
-        apply_adapters(operations)
-        save_state(root, state)
+            write_regular_text(root, path, text, create=True, identity=managed_identities[name], root_identity=root_identity)
+        provenance = state.setdefault("provenance", {})
+        managed_files = provenance.setdefault("managed_files", [])
+        for name in sorted(created_managed):
+            if name not in managed_files:
+                managed_files.append(name)
+        apply_adapters(operations, provenance, root=root, root_identity=root_identity)
+        save_state(root, state, root_identity=root_identity)
+        upgrade_followup(root, actions, state["pending"], source=source, state=state, root_identity=root_identity)
     return apply, actions
 
 
@@ -435,6 +707,64 @@ def download_skills(destination, revision):
         checkout.rename(destination)
 
 
+def copy_pack(source, parent, name):
+    """Copy a private download through destination descriptors, across filesystems."""
+    mode = source.lstat().st_mode
+    if stat.S_ISLNK(mode):
+        os.symlink(os.readlink(source), name, dir_fd=parent)
+    elif stat.S_ISDIR(mode):
+        os.mkdir(name, 0o700, dir_fd=parent)
+        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            for child in source.iterdir():
+                copy_pack(child, descriptor, child.name)
+            os.fchmod(descriptor, stat.S_IMODE(mode))
+        finally:
+            os.close(descriptor)
+    elif stat.S_ISREG(mode):
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=parent)
+        with os.fdopen(descriptor, "wb") as destination, source.open("rb") as incoming:
+            shutil.copyfileobj(incoming, destination)
+            os.fchmod(destination.fileno(), stat.S_IMODE(mode))
+    else:
+        raise ValueError(f"Skill pack contains a non-regular file: {source}")
+
+
+def publish_pack(source, parent, name):
+    """Publish a complete copy, keeping failed copies out of the final name."""
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise ValueError("Safe skill-pack cleanup is unavailable on this platform")
+    temporary = f".agent-canvas-pack-{uuid.uuid4().hex}"
+    os.mkdir(temporary, 0o700, dir_fd=parent)
+    descriptor = None
+    published = False
+    cleanup_warning = None
+    try:
+        descriptor = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        copy_pack(source, descriptor, "pack")
+        # Preserve a destination created while downloading/copying, including
+        # an empty directory (which rename would otherwise replace).
+        try:
+            os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(f"Skill pack destination already exists: {name}")
+        os.rename("pack", name, src_dir_fd=descriptor, dst_dir_fd=parent)
+        published = True
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            shutil.rmtree(temporary, dir_fd=parent)
+        except OSError as error:
+            if not published:
+                raise
+            cleanup_warning = f"Published skill pack; temporary cleanup failed: {error}"
+    return cleanup_warning
+
+
 def render_files(source, *, workspace, environment, role, slack):
     rules = (source / "AGENTS.md").read_text()
     if role == "application":
@@ -461,10 +791,9 @@ def render_files(source, *, workspace, environment, role, slack):
 
 
 def install(target, *, apply=False, skills=False, workspace=None, environment="local",
-            role="application", slack="", source=SOURCE, home=None, downloader=download_skills):
-    root = Path(target).expanduser().resolve()
-    if root.exists() and not root.is_dir():
-        raise ValueError("Target must be a directory")
+            role="application", slack="", source=SOURCE, home=None, downloader=download_skills,
+            supervised=False, supervisor_state_dir=None):
+    root, root_identity = select_project(target, allow_missing=True)
     existing = root.exists() and any(p.name != ".git" for p in root.iterdir())
     active = apply or not existing
     discovered = inventory(root) if root.exists() else []
@@ -484,8 +813,19 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
         if name in [*files, STATE, ".gitignore", "INSTALL-FOLLOWUP.md"] and path.exists() and not path.is_file():
             raise ValueError(f"Expected file; preserving existing path: {path}")
     config_path = root / "config/workspace-config.yml"
-    environments = agentic_envs(config_path.read_text() if config_path.exists() else files["config/workspace-config.yml"])
+    environments = agentic_envs(read_regular_text(root, config_path, missing=files["config/workspace-config.yml"]))
+    if root_identity is None:
+        # Validate the proposal before creating a new project. Never adopt a
+        # directory that appeared since selection, or recreate an existing one.
+        try:
+            root.mkdir(parents=True)
+        except FileExistsError as error:
+            raise ValueError("Project directory changed during installation") from error
+        root, root_identity = select_project(root)
     adapter_state = json.loads(json.dumps(prior_state)) if prior_state else {"adapters": {"links": {}, "pending": []}}
+    provenance = adapter_state.setdefault("provenance", {})
+    provenance.setdefault("managed_files", [])
+    provenance.setdefault("gitignore_entries", [])
     actions = []
     for name, content in files.items():
         path = root / name
@@ -495,17 +835,16 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
         else:
             actions.append(f"{'ADD' if active else 'WOULD ADD'} {name}")
             if active:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("x") as out:
-                    out.write(content)
+                write_regular_text(root, path, content, create=True, root_identity=root_identity)
+                provenance["managed_files"].append(name)
     ignore_path = root / ".gitignore"
-    ignore = ignore_path.read_text() if ignore_path.exists() else ""
+    ignore = read_regular_text(root, ignore_path, missing="")
     missing = [entry for entry in IGNORE if entry not in ignore.splitlines()]
     if missing:
         actions.append(f"{'ADD' if active else 'WOULD ADD'} missing .gitignore entries")
         if active:
-            with ignore_path.open("a") as out:
-                out.write(("\n" if ignore and not ignore.endswith("\n") else "") + "\n".join(missing) + "\n")
+            if add_gitignore_entries(root, ignore_path, missing, root_identity=root_identity):
+                provenance["gitignore_entries"].extend(missing)
     pack = root / "skills/addyosmani-agent-skills"
     if skills and not any(environments.get(env) for env in ADAPTERS):
         actions.append("SKIP skill downloads: no supported agentic environment is enabled")
@@ -515,25 +854,39 @@ def install(target, *, apply=False, skills=False, workspace=None, environment="l
         elif not active:
             actions.append("WOULD DOWNLOAD Osmani skills at the retained .ref version; check enabled plugins first")
         else:
+            pack_published = False
             try:
                 ref = (root / "skills/addyosmani-agent-skills.ref").read_text().strip()
                 if not re.fullmatch(r"[0-9a-fA-F]{40}", ref):
                     raise ValueError("Existing skill reference is not a full commit SHA; preserved for manual resolution")
-                downloader(pack, ref)
-                discovered_skills = sorted((pack / "skills").glob("*/SKILL.md"))
-                if not discovered_skills:
-                    raise ValueError("Skill pack is empty")
-                adapter_state.setdefault("adapters", {"links": {}, "pending": []})["pack"] = {
-                    "revision": ref, "fingerprint": pack_fingerprint(pack)}
+                # Use private system staging: a writable project need not have a
+                # writable parent or share a filesystem with the temporary directory.
+                with tempfile.TemporaryDirectory(prefix=".agent-canvas-download-") as tmp:
+                    checkout = Path(tmp) / "pack"
+                    downloader(checkout, ref)
+                    discovered_skills = sorted((checkout / "skills").glob("*/SKILL.md"))
+                    if not discovered_skills:
+                        raise ValueError("Skill pack is empty")
+                    fingerprint = pack_fingerprint(checkout)
+                    with pinned_parent(root, pack, create=True, root_identity=root_identity) as (parent, name):
+                        cleanup_warning = publish_pack(checkout, parent, name)
+                    pack_published = True
+                    adapter_state.setdefault("adapters", {"links": {}, "pending": []})["pack"] = {
+                        "revision": ref, "fingerprint": fingerprint}
+                    if cleanup_warning:
+                        actions.append(f"WARNING {cleanup_warning}")
                 actions.append(f"ADD Osmani skill pack; found {len(discovered_skills)} skills")
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
-                actions.append(f"FAILED skill installation: {error}; retain safe additions and resolve in follow-up")
+                if pack_published:
+                    actions.append(f"WARNING skill pack published; post-publication cleanup failed: {error}")
+                else:
+                    actions.append(f"FAILED skill installation: {error}; retain safe additions and resolve in follow-up")
     else:
         actions.append("SKIP skill downloads; use follow-up to confirm existing packs or install missing ones")
     operations, adapter_actions = adapter_plan(root, environments, adapter_state, home=home)
     actions.extend(adapter_actions if active else ["WOULD " + a if a.startswith(("ADD ", "REMOVE ")) else a for a in adapter_actions])
     if active:
-        apply_adapters(operations)
+        apply_adapters(operations, provenance, root=root, root_identity=root_identity)
     actions.append("REUSE Superpowers if enabled; otherwise verify a supported installation for each active environment; never assume plugin portability")
     followup = root / "INSTALL-FOLLOWUP.md"
     prompt = f"""# Agent Canvas installation follow-up
@@ -566,16 +919,23 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
 >
 > Preview remaining changes, apply agreed safe additions and merges, and verify the touched files and links. Do not run legacy governance scripts or create new approval machinery. Report what is resolved and what still needs my input. Update this follow-up file with the outcome so another session does not repeat finished work. Missing integrations must be reported honestly; continue independent work.
 """
-    root.mkdir(parents=True, exist_ok=True)
+    if supervised:
+        if active:
+            adapter_state["supervised"] = provision_supervised(root, supervisor_state_dir, root_identity=root_identity)
+            actions.append("REGISTER supervised project in host-owned state")
+        else:
+            actions.append("WOULD REGISTER supervised project in host-owned state")
     if followup.exists():
         actions.append("KEEP INSTALL-FOLLOWUP.md unchanged; rescan live files when running its prompt")
     else:
-        with followup.open("x") as out:
-            out.write(prompt)
+        write_regular_text(root, followup, prompt, create=True, root_identity=root_identity)
         actions.append("ADD INSTALL-FOLLOWUP.md (ready-to-run conflict-resolution prompt)")
     if active and prior_state is None:
         state = dict(schema_version=1, package_version=digest(files), options=options,
-                     baselines={}, pending={}, resolutions=[], adapters=adapter_state["adapters"])
+                     baselines={}, pending={}, resolutions=[], adapters=adapter_state["adapters"],
+                     provenance=provenance)
+        if "supervised" in adapter_state:
+            state["supervised"] = adapter_state["supervised"]
         for name, incoming in files.items():
             local = (root / name).read_text()
             if local == incoming:
@@ -583,11 +943,11 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
             else:
                 state["baselines"][name] = None
                 state["pending"][name] = dict(incoming=incoming)
-        save_state(root, state)
-        upgrade_followup(root, ["TRACKING: package baseline saved; reconcile any pending files"], state["pending"], source=source, state=state)
+        save_state(root, state, root_identity=root_identity)
+        upgrade_followup(root, ["TRACKING: package baseline saved; reconcile any pending files"], state["pending"], source=source, state=state, root_identity=root_identity)
     elif active and prior_state != adapter_state:
-        save_state(root, adapter_state)
-        upgrade_followup(root, adapter_actions, adapter_state["pending"], source=source, state=adapter_state)
+        save_state(root, adapter_state, root_identity=root_identity)
+        upgrade_followup(root, adapter_actions, adapter_state["pending"], source=source, state=adapter_state, root_identity=root_identity)
     return active, actions
 
 
@@ -599,6 +959,8 @@ def main():
     parser.add_argument("--resolve", action="append", default=[], metavar="FILE", help="record current contents as the resolution of a pending managed file")
     parser.add_argument("--reason", default="", help="why the pending conflict was resolved this way")
     parser.add_argument("--skills", action="store_true", help="download pinned Osmani pack; only if no existing skills were detected and you have checked app plugins")
+    parser.add_argument("--supervised", action="store_true", help="register this project with the host-owned final-delivery supervisor")
+    parser.add_argument("--supervisor-state-dir", type=Path, help="host-owned state directory; must be outside the project")
     parser.add_argument("--workspace")
     parser.add_argument("--environment", choices=("local", "dev", "production"), help="initial environment; default local")
     parser.add_argument("--repo-role", choices=("application", "toolkit-authoring"), help="initial role; default application")
@@ -608,6 +970,8 @@ def main():
         parser.error("--upgrade does not download skills; reconcile skill versions separately")
     if args.upgrade and any(value is not None for value in (args.workspace, args.environment, args.repo_role, args.slack_channel)):
         parser.error("upgrades reuse recorded installation options; edit project settings directly instead of passing initial-install options")
+    if args.supervisor_state_dir and not args.supervised:
+        parser.error("--supervisor-state-dir requires --supervised")
     if (args.resolve or args.reason) and not args.upgrade:
         parser.error("--resolve and --reason require --upgrade")
     if args.resolve and not args.apply:
@@ -615,11 +979,13 @@ def main():
     try:
         if args.upgrade:
             active, actions = upgrade(args.target, apply=args.apply, resolve=args.resolve,
-                                      reason=args.reason, source=SOURCE)
+                                      reason=args.reason, source=SOURCE, supervised=args.supervised,
+                                      supervisor_state_dir=args.supervisor_state_dir)
         else:
             active, actions = install(args.target, apply=args.apply, skills=args.skills,
                                       workspace=args.workspace, environment=args.environment or "local",
-                                      role=args.repo_role or "application", slack=args.slack_channel or "")
+                                      role=args.repo_role or "application", slack=args.slack_channel or "",
+                                      supervised=args.supervised, supervisor_state_dir=args.supervisor_state_dir)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Installer stopped: {error}\nEarlier changes may remain; inspect the project before retrying.\n")
     print("Safe changes applied." if active else "PREVIEW: only INSTALL-FOLLOWUP.md is updated; use --apply for safe changes.")
