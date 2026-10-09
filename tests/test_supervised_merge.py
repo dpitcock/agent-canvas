@@ -1,12 +1,67 @@
 """Regression coverage for main/supervised-continuation interactions."""
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
 from test_supervised import supervisor
 
 
 class SupervisedMergeTests(unittest.TestCase):
+    def test_override_import_serializes_decisions_for_later_tasks(self):
+        for mode, expected in (("pause", "paused"), ("reset", "cancelled")):
+            for decision in ("claim", "recover", "final"):
+                with self.subTest(mode=mode, decision=decision), tempfile.TemporaryDirectory() as tmp:
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    host = supervisor.HostSupervisor(Path(tmp) / "state")
+                    for task_id in ("first", "second"):
+                        host.create_task(task_id, project, [{"id": "work", "operation": "write"}])
+                    entered, proceed, finished = threading.Event(), threading.Event(), threading.Event()
+                    errors, results = [], []
+                    method = "pause" if mode == "pause" else "cancel"
+                    original = getattr(host, method)
+                    def delayed(task_id, **kwargs):
+                        if task_id == "first":
+                            entered.set()
+                            if not proceed.wait(3):
+                                raise RuntimeError("import barrier timed out")
+                        return original(task_id, **kwargs)
+                    def importing():
+                        try:
+                            host.import_owner_override(project, [mode], source_digest="a" * 64)
+                        except Exception as error:
+                            errors.append(error)
+                    def deciding():
+                        try:
+                            if decision == "claim":
+                                result = host.claim_action("second", "work", "attempt", project=project)
+                            elif decision == "recover":
+                                result = host.recover("second", project=project)
+                            else:
+                                result = host.gate_final("second", "attempt", "done", project=project)
+                            results.append(result.kind)
+                        except Exception as error:
+                            errors.append(error)
+                        finally:
+                            finished.set()
+                    with patch.object(host, method, side_effect=delayed):
+                        importer = threading.Thread(target=importing)
+                        importer.start()
+                        self.assertTrue(entered.wait(1))
+                        claimant = threading.Thread(target=deciding)
+                        claimant.start()
+                        try:
+                            self.assertFalse(finished.wait(0.05))
+                        finally:
+                            proceed.set()
+                            importer.join(3)
+                            claimant.join(3)
+                    self.assertFalse(importer.is_alive() or claimant.is_alive())
+                    self.assertEqual(errors, [])
+                    self.assertEqual(results, [expected])
+
     def test_imported_pause_survives_legacy_validation_recovery(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "project"

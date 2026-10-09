@@ -650,8 +650,18 @@ class HostSupervisor:
     def _authorization_message(operation):
         return f"{operation} requires explicit owner authorization in a new authorization revision."
 
+    @contextmanager
+    def _locked_decision(self, task_id, project=None):
+        # Project imports must finish applying to every task before automatic
+        # decisions resume. All callers acquire project -> task -> interrupt.
+        task_path = self._task_path(task_id, project)
+        registered = self._read(task_path.parents[1] / "registration.json")["project"]
+        with self._locked_project(registered):
+            with self._locked_task(task_id, project=registered) as task, self._locked_interrupt(task_id, registered) as path:
+                yield task, path
+
     def claim_action(self, task_id, action_id, attempt_id, *, project=None):
-        with self._locked_task(task_id, project=project) as task, self._locked_interrupt(task_id, project) as path:
+        with self._locked_decision(task_id, project) as (task, path):
             self._apply_pending_interrupt(task, path)
             if task["status"] != "active":
                 return Decision(task["status"])
@@ -910,7 +920,7 @@ class HostSupervisor:
         return True, receipts
 
     def gate_final(self, task_id, attempt_id, content, *, project=None):
-        with self._locked_task(task_id, project=project) as task, self._locked_interrupt(task_id, project) as interrupt_path:
+        with self._locked_decision(task_id, project) as (task, interrupt_path):
             # All automatic decisions serialize with interrupt publication. No untrusted
             # code or long-running validators execute while these locks are held.
             interruption = self._read(interrupt_path)["status"] if interrupt_path.exists() else None
@@ -966,7 +976,7 @@ class HostSupervisor:
         return self.task(task_id, project=project)["visible_messages"]
 
     def recover(self, task_id, *, project=None):
-        with self._locked_task(task_id, project=project) as task, self._locked_interrupt(task_id, project) as path:
+        with self._locked_decision(task_id, project) as (task, path):
             self._apply_pending_interrupt(task, path)
             if task["status"] == "validating":
                 attempt_id = task.pop("validation_attempt", None)
