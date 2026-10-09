@@ -36,6 +36,10 @@ contain data that an untrusted validator—or another host user able to discover
 the temporary path—must not read.  It remains a host-owned, read-only container
 mount; the executor deletes it after execution.
 
+Declared input paths are limited to 64 components, including the filename.
+Deeper paths are rejected before their directory chain is staged, keeping
+recursive cleanup bounded; any earlier staged inputs are cleaned up on rejection.
+
 The returned receipt binds the action and attempt identifiers, staged-input
 digest, exact command, pinned image, canonical absolute runtime path, selected
 local daemon endpoint (`runtime_endpoint`), observed runtime version, status,

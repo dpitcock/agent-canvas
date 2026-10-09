@@ -76,6 +76,8 @@ def _safe_relative(path):
     if not isinstance(path, str) or not path or path.startswith("/"):
         raise InputRejected("input paths must be nonempty relative paths")
     parts = path.split("/")
+    if len(parts) > 64:
+        raise InputRejected("input path depth exceeds 64 components")
     if any(part in {"", ".", ".."} for part in parts):
         raise InputRejected("input paths may not contain empty, dot, or parent components")
     return tuple(parts)

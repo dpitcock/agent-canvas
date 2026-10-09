@@ -144,6 +144,8 @@ The output labels work as **ADD**, **WOULD ADD**, **REUSE**, **SKIP**, or **DECI
 
 Managed text updates are prepared and synced in the destination directory before atomic publication, preserving the original when preparation fails. Adapter operations undo completed link changes if a later operation in that batch fails; unused ignore entries may remain. Installation as a whole is not a crash-recoverable transaction: forced termination or a later installation-record failure can still require manual reconciliation. Atomic file replacement does not promise directory-entry durability across power loss.
 
+A published skill pack can also remain without saved provenance if a later adapter, follow-up, or state-save step fails. A retry preserves that pack rather than automatically adopting it. Verify its source and revision and reconcile provenance manually; automatic recovery from this failure window is deferred for local use.
+
 Use installation and upgrades in a trusted local workspace without concurrent directory replacement. Some project reads still validate paths before opening them rather than pinning every ancestor; a same-account process swapping an ancestor can redirect such reads. Protection against malicious host-account control is outside the local-development trust model.
 
 ### Finish the conflicts with your agent
