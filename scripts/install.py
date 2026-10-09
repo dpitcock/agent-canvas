@@ -30,6 +30,75 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+OWNER_OVERRIDE_MODES = {"pause", "bypass-review", "reset"}
+OWNER_OVERRIDE_MAX_BYTES = 65536
+
+
+def root_owner_override(root, *, expected_identity=None):
+    """Parse only a regular .owner-override at this target's root."""
+    # Pin each directory component without following symlinks, then open the
+    # leaf relative to the pinned root. Path checks followed by open are racy.
+    root = Path(os.path.abspath(root))
+    initial = os.stat(root, follow_symlinks=False)
+    if not stat.S_ISDIR(initial.st_mode):
+        raise ValueError("Project root identity must be a directory")
+    expected_identity = expected_identity or {"device": initial.st_dev, "inode": initial.st_ino}
+    directory = os.open(root.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in root.parts[1:]:
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=directory)
+            os.close(directory)
+            directory = child
+        opened = os.fstat(directory)
+        if expected_identity != {"device": opened.st_dev, "inode": opened.st_ino}:
+            raise ValueError("Project root identity changed during override import")
+        try:
+            descriptor = os.open(".owner-override", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                 dir_fd=directory)
+        except FileNotFoundError:
+            return None
+    except OSError as error:
+        raise ValueError("Owner Override must be a regular file, not a symlink") from error
+    finally:
+        os.close(directory)
+    with os.fdopen(descriptor, "rb") as source_file:
+        info = os.fstat(source_file.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("Owner Override must be a regular file at the project root")
+        if info.st_nlink != 1:
+            raise ValueError("Owner Override must not be a shared hard-linked file")
+        if info.st_size > OWNER_OVERRIDE_MAX_BYTES:
+            raise ValueError("Owner Override exceeds the 64 KiB size limit")
+        source = source_file.read(OWNER_OVERRIDE_MAX_BYTES + 1)
+        if len(source) > OWNER_OVERRIDE_MAX_BYTES:
+            raise ValueError("Owner Override exceeds the 64 KiB size limit")
+    assignment, legacy = None, []
+    for raw in source.decode("utf-8").splitlines():
+        quote, kept = None, []
+        for char in raw:
+            if char in {"'", '"'}:
+                quote = None if quote == char else (char if quote is None else quote)
+            if char == "#" and quote is None:
+                break
+            kept.append(char)
+        line = "".join(kept).strip()
+        if not line:
+            continue
+        match = re.fullmatch(r"OWNER_OVERRIDE\s*=\s*(.*)", line)
+        if match:
+            assignment = match.group(1).strip()
+        else:
+            legacy.append(line)
+    value = assignment if assignment is not None else ",".join(legacy)
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    modes = sorted({part.strip() for part in value.split(",") if part.strip()})
+    if any(mode not in OWNER_OVERRIDE_MODES for mode in modes):
+        raise ValueError("Owner Override contains an unknown mode")
+    return {"modes": modes, "source_digest": hashlib.sha256(source).hexdigest()}
+
+
 def provision_supervised(root, state_dir, *, root_identity=None):
     """Register a project in host state; never treat project files as authority."""
     root = Path(root).resolve()
@@ -51,8 +120,18 @@ def provision_supervised(root, state_dir, *, root_identity=None):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     with pinned_parent(root, root / ".registration", root_identity=root_identity):
-        registration = module.HostSupervisor(state_dir).provision(root, expected_identity=root_identity)
-    return {"enabled": True, "state_dir": str(state_dir), "registration_digest": digest(registration)}
+        host = module.HostSupervisor(state_dir)
+        registration = host.provision(root, expected_identity=root_identity)
+        override = root_owner_override(root, expected_identity=registration["identity"])
+        if override is None and registration.get("owner_override", {}).get("import_complete") is False:
+            # An owner-run retry after deleting the file must finish recovery.
+            # Completed snapshots remain unchanged when the file is absent.
+            override = {"modes": [], "source_digest": hashlib.sha256(b"").hexdigest(),
+                        "expected_incomplete": registration["owner_override"]}
+        if override is not None:
+            registration = host.import_owner_override(root, **override)
+    return {"enabled": True, "state_dir": str(state_dir), "registration_digest": digest(registration),
+            "owner_override_imported": override is not None}
 
 
 ADAPTERS = {"codex": ".agents/skills", "cline": ".cline/skills"}
@@ -583,6 +662,8 @@ def upgrade(target, *, apply=False, resolve=(), reason="", source=SOURCE, home=N
             supervised_record = provision_supervised(root, supervisor_state_dir, root_identity=root_identity)
             state["supervised"] = supervised_record
             actions = ["REGISTER supervised project in host-owned state"]
+            if supervised_record["owner_override_imported"]:
+                actions.append("IMPORT target-root .owner-override snapshot into host-owned state")
         else:
             actions = ["WOULD REGISTER supervised project in host-owned state"]
     else:
@@ -923,6 +1004,8 @@ Toolkit source: `{source}`. Re-read current files; this inventory is only a snap
         if active:
             adapter_state["supervised"] = provision_supervised(root, supervisor_state_dir, root_identity=root_identity)
             actions.append("REGISTER supervised project in host-owned state")
+            if adapter_state["supervised"]["owner_override_imported"]:
+                actions.append("IMPORT target-root .owner-override snapshot into host-owned state")
         else:
             actions.append("WOULD REGISTER supervised project in host-owned state")
     if followup.exists():

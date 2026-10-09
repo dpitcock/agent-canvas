@@ -201,9 +201,11 @@ Codex App Server ── events ──> custom renderer ──> HostSupervisor
 
 The project workspace holds normal project files and a non-authoritative installation record. The host directory holds the authority: immutable authorization snapshots, per-project task/action graphs, validator receipts, side-effect leases and reconciliation outcomes, blockers, and an append-only audit log. A project file claiming completion changes none of those records.
 
-The renderer forwards ordinary progress events but buffers `item/agentMessage/delta` content. At `turn/completed`, it asks the supervisor whether the final content may be released. If host-owned actions remain, the candidate final stays hidden and the supervisor supplies the next action for a continuation. If no independent action remains but an owner decision is missing, it releases only that precise blocker.
+The renderer forwards matching progress events but buffers agent-message content. The host binds each renderer to the thread and turn IDs returned by `turn/start`; unrelated or unidentified events cannot reach its gate. A successful `turn/completed` asks whether final content may be released. If host-owned actions remain, the candidate stays hidden and the supervisor supplies the next action. Each bound renderer is single-use, including after failed turns or gate exceptions; recovery starts a fresh bound renderer.
 
 One host state directory can supervise several sibling projects. Each operation is scoped by project identity, so separate projects may both use `task-1` without sharing evidence, visible messages, or audit events. A task lookup without a project identity is rejected if it would be ambiguous.
+
+Reuse the exact absolute project path stored in the registration. Replacing the root directory or using a legacy registration without its device/inode identity fails closed; host lookups do not dynamically resolve aliases to another registration.
 
 #### Set up a sibling project
 
@@ -225,6 +227,10 @@ python3 scripts/install.py /path/to/sibling-project --upgrade --apply --supervis
 ```
 
 Registration creates or reuses the project’s host-owned registration; it does not create a task, grant new agent permissions, start a turn, alter global credentials, or modify the Codex desktop app. The custom client must start each supervised task with the project identity and route every App Server turn through its renderer. It creates the host task with its authorized actions and validator definitions, then renders a final response only after the supervisor returns a release decision.
+
+Required validation remains fail-closed in this POC: the gate returns `validation_unavailable` and does not launch project validators. The Docker executor merged separately is not yet wired into the supervisor. No validation-backed completion is claimed.
+
+During an applied supervised install or upgrade, the installer may import the target root's regular, unshared `.owner-override` file into a host-owned snapshot. Later workspace edits do not change host authority until another owner-run import. `pause` pauses work, `reset` cancels nonterminal tasks while preserving evidence, and `bypass-review` affects PR governance only. The host-only `release_withheld_final` escape hatch requires an owner and reason and records the authorized release; workspace files cannot invoke it.
 
 The default state path is `~/.agent-canvas-supervisor`, but use `--supervisor-state-dir` for a protected host deployment. The installer rejects a state directory inside or enclosing the project. Uninstalling Agent Canvas intentionally preserves host audit state.
 

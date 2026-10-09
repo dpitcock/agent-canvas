@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import selectors
 import signal
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 
 import fcntl
@@ -24,6 +26,7 @@ import fcntl
 DEFAULT_PROHIBITED = ("push", "publish", "pr_create", "merge", "destructive", "credential_change",
                       "config_change", "external_message")
 TERMINAL_STATUSES = frozenset(("complete", "blocked", "cancelled"))
+OWNER_OVERRIDE_MODES = {"pause", "bypass-review", "reset"}
 _VALIDATOR_LAUNCHER = (
     "import os, sys\n"
     "directory = int(sys.argv[1])\n"
@@ -128,7 +131,12 @@ class HostSupervisor:
         return projects
 
     def _project_key(self, project):
-        return hashlib.sha256(str(Path(project).resolve()).encode()).hexdigest()
+        # A symlink replacement must not redirect lookup to another registration.
+        return hashlib.sha256(str(self._project_path(project)).encode()).hexdigest()
+
+    @staticmethod
+    def _project_path(project):
+        return Path(os.path.abspath(Path(project).expanduser()))
 
     @staticmethod
     def _validate_task_id(task_id):
@@ -139,7 +147,9 @@ class HostSupervisor:
 
     @staticmethod
     def _project_identity(project):
-        status = Path(project).stat()
+        status = Path(project).lstat()
+        if not stat.S_ISDIR(status.st_mode):
+            raise ValueError("Project root identity must be a real directory")
         return {"device": status.st_dev, "inode": status.st_ino}
 
     @staticmethod
@@ -191,7 +201,8 @@ class HostSupervisor:
 
     def _registered_project(self, project):
         """Return a registered project only while its original directory still exists."""
-        project = Path(project).resolve()
+        project = self._project_path(project)
+        identity = self._project_identity(project)
         if not project.is_dir():
             raise ValueError("Supervised project must be an existing directory")
         registration = self._registration(project)
@@ -200,7 +211,7 @@ class HostSupervisor:
         current = self._read(registration)
         if current.get("project") != str(project):
             raise ValueError("Host registration project mismatch")
-        if current.get("identity") != self._project_identity(project):
+        if current.get("identity") != identity:
             raise ValueError("Host registration project directory identity mismatch")
         return project
 
@@ -300,22 +311,44 @@ class HostSupervisor:
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"Host state is unreadable: {path}") from error
 
-    def provision(self, project, *, expected_identity=None):
-        project = Path(project).resolve()
+    def _check_project_location(self, project, *, expected_identity=None):
+        project = self._project_path(project)
+        identity = self._project_identity(project)
+        if expected_identity is not None and (identity["device"], identity["inode"]) != expected_identity:
+            raise ValueError("Project directory changed during installation")
         if not project.is_dir():
             raise ValueError("Supervised project must be an existing directory")
         try:
-            self.root.relative_to(project)
+            self.root.relative_to(project.resolve())
         except ValueError:
             pass
         else:
             raise ValueError("Supervisor state directory must be outside the project workspace")
         try:
-            project.relative_to(self.root)
+            project.resolve().relative_to(self.root)
         except ValueError:
             pass
         else:
             raise ValueError("Supervisor state directory must be outside the project workspace")
+        return project
+
+    @contextmanager
+    def _locked_project(self, project, *, expected_identity=None):
+        project = self._check_project_location(project, expected_identity=expected_identity)
+        path = self._state_file(self._project_dir(project, create=True) / "project.lock", description="project lock")
+        with path.open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def provision(self, project, *, expected_identity=None):
+        with self._locked_project(project, expected_identity=expected_identity):
+            return self._provision_locked(project, expected_identity=expected_identity)
+
+    def _provision_locked(self, project, *, expected_identity=None):
+        project = self._check_project_location(project)
         identity = self._project_identity(project)
         if expected_identity is not None and (identity["device"], identity["inode"]) != expected_identity:
             raise ValueError("Project directory changed during installation")
@@ -332,11 +365,50 @@ class HostSupervisor:
         self._write(registration, value)
         return value
 
+    def import_owner_override(self, project, modes, *, source_digest, expected_incomplete=None):
+        """Import an owner-provided snapshot; never reread workspace overrides here."""
+        if not isinstance(modes, (list, tuple, set)) or any(mode not in OWNER_OVERRIDE_MODES for mode in modes):
+            raise ValueError("Unknown owner override mode")
+        if not isinstance(source_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", source_digest):
+            raise ValueError("Owner override snapshot requires a SHA-256 source digest")
+        project = self._project_path(project)
+        with self._locked_project(project):
+            current = self._provision_locked(project)
+            if expected_incomplete is not None:
+                observed = current.get("owner_override", {})
+                if observed.get("import_complete") is not False:
+                    return current
+                if observed != expected_incomplete:
+                    raise ValueError("Owner override import changed; retry recovery from the current snapshot")
+            normalized = sorted(set(modes))
+            current["owner_override"] = {"modes": normalized, "source_digest": source_digest,
+                                         "imported_at": _now(), "generation": uuid.uuid4().hex,
+                                         "import_complete": False}
+            self._write(self._registration(project), current)
+            self._event(None, "owner_override_imported", project=project, modes=normalized, source_digest=source_digest)
+            tasks = self._tasks_dir(project, create=True)
+            for path in sorted(tasks.glob("*.json")):
+                if path.name.endswith(".interrupt.json"):
+                    continue
+                task = self._read(path)
+                if task["status"] in TERMINAL_STATUSES:
+                    continue
+                if "reset" in normalized:
+                    self.cancel(path.stem, project=project)
+                    self._event(path.stem, "owner_override_reset", project=project)
+                elif "pause" in normalized and task["status"] != "paused":
+                    self.pause(path.stem, project=project)
+                    self._event(path.stem, "owner_override_paused", project=project)
+            current["owner_override"]["import_complete"] = True
+            self._write(self._registration(project), current)
+            return current
+
     def _project_for_task(self, task_id, project=None):
         return self._task_path(task_id, project).parents[1]
 
     def _event_path(self, task_id, project=None):
-        return self._state_file(self._project_for_task(task_id, project) / "audit.jsonl", description="audit log")
+        directory = self._project_dir(project) if task_id is None else self._project_for_task(task_id, project)
+        return self._state_file(directory / "audit.jsonl", description="audit log")
 
     @contextmanager
     def _locked_audit(self, task_id, project=None):
@@ -406,6 +478,7 @@ class HostSupervisor:
                     raise ValueError(f"Host audit is unreadable: {source.name}") from error
             if task.get("release_event"):
                 events.append(task["release_event"])
+            events.extend(task.get("prior_release_events", []))
             if task.get("creation_event"):
                 events.append(task["creation_event"])
             return sorted(events, key=lambda event: event["at"])
@@ -436,6 +509,11 @@ class HostSupervisor:
 
     def create_task(self, task_id, project, actions, *, validators=(), blockers=(), permitted_operations=("read", "write", "delegate")):
         self._validate_task_id(task_id)
+        with self._locked_project(project):
+            registration = self._provision_locked(project)
+            return self._create_task_locked(task_id, project, registration, actions, validators, blockers, permitted_operations)
+
+    def _create_task_locked(self, task_id, project, registration, actions, validators, blockers, permitted_operations):
         actions = list(actions)
         validators = list(validators)
         self._validate_validator_ids(validators)
@@ -457,7 +535,6 @@ class HostSupervisor:
         prohibited = sorted(set(permitted_operations).intersection(DEFAULT_PROHIBITED))
         if prohibited:
             raise ValueError("task authorization includes prohibited operations: " + ", ".join(prohibited))
-        registration = self.provision(project)
         path = self._state_file(self._tasks_dir(project, create=True) / f"{task_id}.json", description="task state")
         action_map = {}
         for action in actions:
@@ -482,11 +559,14 @@ class HostSupervisor:
             authorization = {"revision": 1, "permitted_operations": sorted(set(permitted_operations)),
                              "prohibited_operations": list(DEFAULT_PROHIBITED)}
             authorization["digest"] = _digest(authorization)
-            task = {"schema_version": 1, "task_id": task_id, "project": registration["project"], "status": "active",
+            task = {"schema_version": 1, "task_id": task_id, "project": registration["project"],
+                    "status": "paused" if "pause" in registration.get("owner_override", {}).get("modes", []) else "active",
                     "authorization": authorization, "actions": action_map, "validators": list(validators),
                     "blockers": list(blockers), "evidence": {"validators": {}}, "visible_messages": []}
             task["creation_event"] = {"at": _now(), "type": "task_created", "task_id": task_id,
                                       "authorization_digest": authorization["digest"]}
+            if task["status"] == "paused":
+                task["creation_event"]["owner_override"] = "pause"
             self._write(path, task)
             return task
 
@@ -496,12 +576,15 @@ class HostSupervisor:
     def _save_task(self, task):
         self._write(self._task_path(task["task_id"], task["project"]), task)
 
-    def _commit_release(self, task, attempt_id, message, *, blocker=False):
+    def _commit_release(self, task, attempt_id, message, *, blocker=False, blocker_id=None,
+                        event_type=None, release_details=None):
         """Commit release authorization, message and audit evidence together.
 
         This records a host decision, not an acknowledgement that a UI rendered
         it. A client crash after this commit can recover the visible message.
         """
+        if task.get("release_event"):
+            task.setdefault("prior_release_events", []).append(task["release_event"])
         task["release_event"] = {
             "at": _now(), "task_id": task["task_id"],
             "type": "blocker_release_committed" if blocker else "final_release_committed",
@@ -509,7 +592,13 @@ class HostSupervisor:
             "content_digest": hashlib.sha256(message.encode()).hexdigest(),
         }
         if blocker:
-            task["release_event"]["blocker_id"] = task["blockers"][0].get("id")
+            task["release_event"]["blocker_id"] = blocker_id if blocker_id is not None else task["blockers"][0].get("id")
+        else:
+            task.pop("withheld_final", None)
+        if event_type is not None:
+            task["release_event"]["type"] = event_type
+        if release_details:
+            task["release_event"].update(release_details)
         task["visible_messages"].append(message)
         task["status"] = "blocked" if blocker else "complete"
         durability_confirmed = True
@@ -520,6 +609,7 @@ class HostSupervisor:
             # never a stale or unrelated terminal message.
             committed = self.task(task["task_id"], project=task["project"])
             if (committed.get("release_event") != task["release_event"]
+                    or committed.get("prior_release_events") != task.get("prior_release_events")
                     or committed.get("status") != task["status"]
                     or committed.get("visible_messages") != task["visible_messages"]):
                 raise
@@ -527,16 +617,76 @@ class HostSupervisor:
         return Decision("blocker" if blocker else "complete", release=True, message=message,
                         durability_confirmed=durability_confirmed)
 
+    def _interrupt_path(self, task_id, project=None):
+        path = self._task_path(task_id, project)
+        return self._state_file(path.with_name(path.stem + ".interrupt.json"), description="task interrupt")
+
+    @contextmanager
+    def _locked_interrupt(self, task_id, project=None):
+        path = self._interrupt_path(task_id, project)
+        lock_path = self._state_file(path.with_name(path.name + ".lock"), description="interrupt lock")
+        with lock_path.open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield path
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _request_interrupt(self, task_id, status, *, project=None):
+        with self._locked_interrupt(task_id, project) as path:
+            if path.exists() and self._read(path).get("status") == "cancelled" and status == "paused":
+                return
+            self._write(path, {"status": status, "requested_at": _now()})
+
+    def _clear_interrupt(self, task_id, *, project=None):
+        with self._locked_interrupt(task_id, project) as path:
+            path.unlink(missing_ok=True)
+
+    def _interrupt_status(self, task_id, *, project=None):
+        with self._locked_interrupt(task_id, project) as path:
+            if not path.exists():
+                return None
+            value = self._read(path)
+            status = value.get("status")
+            return status if status in {"paused", "cancelled"} else None
+
     def _remaining(self, task):
         return [(action_id, action) for action_id, action in task["actions"].items() if action["status"] != "complete"]
 
+    @staticmethod
+    def _operation_allowed(task, operation):
+        return operation not in DEFAULT_PROHIBITED and operation in task["authorization"]["permitted_operations"]
+
+    @staticmethod
+    def _authorization_message(operation):
+        return f"{operation} requires explicit owner authorization in a new authorization revision."
+
+    @contextmanager
+    def _locked_decision(self, task_id, project=None):
+        # Project imports must finish applying to every task before automatic
+        # decisions resume. All callers acquire project -> task -> interrupt.
+        task_path = self._task_path(task_id, project)
+        registered = self._read(task_path.parents[1] / "registration.json")["project"]
+        with self._locked_project(registered):
+            registration = self._read(self._registration(registered))
+            if registration.get("owner_override", {}).get("import_complete") is False:
+                raise ValueError("Owner override import is incomplete; retry the host import before automatic decisions")
+            with self._locked_task(task_id, project=registered) as task, self._locked_interrupt(task_id, registered) as path:
+                yield task, path
+
     def claim_action(self, task_id, action_id, attempt_id, *, project=None):
-        with self._locked_task(task_id, project=project) as task:
+        with self._locked_decision(task_id, project) as (task, path):
+            self._apply_pending_interrupt(task, path)
             if task["status"] != "active":
                 return Decision(task["status"])
             action = task["actions"].get(action_id)
             if not action:
                 raise ValueError(f"Unknown action: {action_id}")
+            operation = action.get("operation")
+            if not self._operation_allowed(task, operation):
+                self._event(task_id, "authorization_blocked", project=task["project"], operation=operation,
+                            action_id=action_id)
+                return Decision("blocker", message=self._authorization_message(operation))
             if action["status"] == "complete":
                 return Decision("complete")
             if action["status"] == "leased":
@@ -784,102 +934,119 @@ class HostSupervisor:
         return True, receipts
 
     def gate_final(self, task_id, attempt_id, content, *, project=None):
-        with self._locked_task(task_id, project=project) as task:
+        with self._locked_decision(task_id, project) as (task, interrupt_path):
+            # All automatic decisions serialize with interrupt publication. No untrusted
+            # code or long-running validators execute while these locks are held.
+            interruption = self._read(interrupt_path)["status"] if interrupt_path.exists() else None
             self._event(task_id, "final_attempt", project=task["project"], attempt_id=attempt_id, content_digest=hashlib.sha256(content.encode()).hexdigest())
-            if task["status"] in {"complete", "blocked"}:
-                return Decision(task["status"])
-            if task["status"] in {"paused", "cancelled"}:
+            if task["status"] in TERMINAL_STATUSES | {"paused"}:
+                if task["status"] == "paused" and interruption == "cancelled":
+                    task["status"] = "cancelled"
+                    self._save_task(task)
+                    self._event(task_id, "cancelled", project=task["project"], source="final_interrupt")
+                    return Decision("cancelled", message="Automatic continuation is disabled until an explicit resume.")
                 return Decision(task["status"], message="Automatic continuation is disabled until an explicit resume.")
-            if task["status"] == "validating":
-                return Decision("validating", message="Host validation is already in progress.")
+            task["withheld_final"] = {"attempt_id": attempt_id, "content": content,
+                                      "content_digest": hashlib.sha256(content.encode()).hexdigest(),
+                                      "withheld_at": _now()}
+            if interruption:
+                task["status"] = interruption
+                self._save_task(task)
+                self._event(task_id, interruption, project=task["project"], source="final_interrupt")
+                return Decision(interruption, message="Automatic continuation is disabled until an explicit resume.")
             remaining = self._remaining(task)
-            if remaining:
-                action_id, action = remaining[0]
+            authorized = [(action_id, action) for action_id, action in remaining
+                          if self._operation_allowed(task, action.get("operation"))]
+            if authorized:
+                action_id, action = authorized[0]
+                self._save_task(task)
                 self._event(task_id, "continuation_queued", project=task["project"], action_id=action_id)
                 return Decision("continue", next_action={"id": action_id, **{k: v for k, v in action.items() if k not in {"attempts", "evidence", "status"}}})
+            if remaining:
+                action_id, action = remaining[0]
+                operation = action.get("operation")
+                message = self._authorization_message(operation)
+                self._event(task_id, "authorization_blocked", project=task["project"], operation=operation,
+                            action_id=action_id)
+                return self._commit_release(task, attempt_id, message, blocker=True, blocker_id=action_id)
             if task["blockers"]:
                 blocker = task["blockers"][0]
                 message = blocker.get("owner_action", "Owner authorization is required.")
                 return self._commit_release(task, attempt_id, message, blocker=True)
-            if not task["validators"]:
-                return self._commit_release(task, attempt_id, content)
-            self._event(task_id, "validation_started", project=task["project"], attempt_id=attempt_id)
-            task["status"] = "validating"
-            task["validation_attempt"] = attempt_id
-            try:
+            if task["validators"]:
+                self._validate_validator_ids(task["validators"])
+                for validator in task["validators"]:
+                    self._validate_validator_definition(validator)
+                message = ("Owner action required: connect an isolated container validator runner, "
+                           "then retry validation. Local validator execution is disabled.")
+                task["validation_blocker"] = {"reason": "isolated_runner_unavailable",
+                                              "owner_action": message}
                 self._save_task(task)
-            except StateCommitUncertainError:
-                # A visible claim belongs to this caller, which must either
-                # execute it or enter the recovery handler below. Do not leave
-                # a persisted validating state with no validator running.
-                committed = self.task(task_id, project=task["project"])
-                if (committed.get("status") != "validating"
-                        or committed.get("validation_attempt") != attempt_id):
-                    raise
-
-        try:
-            valid, receipts = self._validate(task)
-            with self._locked_task(task_id, project=project) as current:
-                if current["status"] != "validating" or current.get("validation_attempt") != attempt_id:
-                    return Decision(current["status"], message="Automatic continuation is disabled until an explicit resume.")
-                current["evidence"]["validators"].update(receipts)
-                for validator_id, receipt in receipts.items():
-                    self._event(task_id, "validator_received", project=current["project"], validator_id=validator_id, receipt=receipt)
-                current.pop("validation_attempt", None)
-                if not valid:
-                    self._event(task_id, "continuation_queued", project=current["project"], reason="validator_failed")
-                    current["status"] = "active"
-                    self._save_task(current)
-                    return Decision("continue", message="Host validator failed; repair the reported action.")
-                return self._commit_release(current, attempt_id, content)
-        except Exception:
-            # Validation and delivery-audit failures both release this attempt's
-            # claim, so the renderer can retry without explicit recovery.
-            with self._locked_task(task_id, project=project) as current:
-                if current["status"] == "validating" and current.get("validation_attempt") == attempt_id:
-                    current["status"] = "active"
-                    current.pop("validation_attempt", None)
-                    self._save_task(current)
-                    self._event(task_id, "validation_aborted", project=current["project"], attempt_id=attempt_id)
-            raise
+                self._event(task_id, "validation_unavailable", project=task["project"])
+                return Decision("validation_unavailable", message=message)
+            return self._commit_release(task, attempt_id, content)
 
     def visible_messages(self, task_id, *, project=None):
         return self.task(task_id, project=project)["visible_messages"]
 
     def recover(self, task_id, *, project=None):
-        with self._locked_task(task_id, project=project) as task:
+        with self._locked_decision(task_id, project) as (task, path):
+            self._apply_pending_interrupt(task, path)
             if task["status"] == "validating":
                 attempt_id = task.pop("validation_attempt", None)
                 task["status"] = "active"
                 self._save_task(task)
                 self._event(task_id, "validation_recovered", project=task["project"], attempt_id=attempt_id)
-                return Decision("active", message="Abandoned host validation was recovered; final delivery may be retried.")
+                return Decision("active", message="Abandoned validation was recovered; final delivery may be retried.")
             remaining = self._remaining(task)
             if task["status"] != "active" or not remaining:
                 return Decision(task["status"])
-            action_id, action = remaining[0]
+            authorized = [(action_id, action) for action_id, action in remaining
+                          if self._operation_allowed(task, action.get("operation"))]
+            if not authorized:
+                operation = remaining[0][1].get("operation")
+                self._event(task_id, "authorization_blocked", project=task["project"], operation=operation)
+                return Decision("blocker", message=self._authorization_message(operation))
+            action_id, action = authorized[0]
             self._event(task_id, "recovered", project=task["project"], action_id=action_id)
             return Decision("continue", next_action={"id": action_id, **{k: v for k, v in action.items() if k not in {"attempts", "evidence", "status"}}})
 
     def pause(self, task_id, *, project=None):
+        self._request_interrupt(task_id, "paused", project=project)
         with self._locked_task(task_id, project=project) as task:
             if task["status"] in TERMINAL_STATUSES:
+                self._clear_interrupt(task_id, project=task["project"])
+                self._event(task_id, "terminal_transition_ignored", project=task["project"], requested="pause")
+                return
+            if task["status"] == "paused":
                 return
             task["status"] = "paused"
             self._save_task(task)
             self._event(task_id, "paused", project=task["project"])
 
     def resume(self, task_id, *, project=None):
-        with self._locked_task(task_id, project=project) as task:
+        # Serialize explicit resume with imports using project -> task -> interrupt.
+        with self._locked_decision(task_id, project) as (task, interrupt_path):
+            pending = self._read(interrupt_path).get("status") if interrupt_path.exists() else None
             if task["status"] != "paused":
+                if task["status"] in TERMINAL_STATUSES:
+                    raise ValueError("A terminal task cannot resume")
+                if pending == "paused":
+                    raise ValueError("A pause transition is pending")
                 raise ValueError("Only a paused task can resume")
+            if pending == "cancelled":
+                raise ValueError("A cancellation is pending")
+            interrupt_path.unlink(missing_ok=True)
             task["status"] = "active"
             self._save_task(task)
             self._event(task_id, "resumed", project=task["project"])
 
     def cancel(self, task_id, *, project=None):
+        self._request_interrupt(task_id, "cancelled", project=project)
         with self._locked_task(task_id, project=project) as task:
             if task["status"] in TERMINAL_STATUSES:
+                self._clear_interrupt(task_id, project=task["project"])
+                self._event(task_id, "terminal_transition_ignored", project=task["project"], requested="cancel")
                 return
             task["status"] = "cancelled"
             self._save_task(task)
@@ -892,3 +1059,27 @@ class HostSupervisor:
         message = f"{operation} requires explicit owner authorization in a new authorization revision."
         self._event(task_id, "authorization_blocked", project=task["project"], operation=operation)
         return Decision("blocker", message=message)
+
+    def release_withheld_final(self, task_id, *, owner, reason, project=None):
+        """Release exactly one stored candidate through a host-only owner action."""
+        if not isinstance(owner, str) or not owner.strip() or not isinstance(reason, str) or not reason.strip():
+            raise ValueError("Owner release requires a nonempty owner and reason")
+        with self._locked_task(task_id, project=project) as task:
+            withheld = task.get("withheld_final")
+            if not isinstance(withheld, dict) or not isinstance(withheld.get("content"), str):
+                raise ValueError("No withheld final is available for owner release")
+            content = withheld["content"]
+            return self._commit_release(
+                task, withheld.get("attempt_id"), content, event_type="owner_override_final_released",
+                release_details={"owner": owner.strip(), "reason": reason.strip()},
+            )
+
+    def _apply_pending_interrupt(self, task, path):
+        """Caller holds task and interrupt locks, in that order."""
+        if task["status"] not in TERMINAL_STATUSES and path.exists():
+            status = self._read(path)["status"]
+            if status not in {"paused", "cancelled"}:
+                raise ValueError("Invalid host interrupt")
+            task["status"] = status
+            self._save_task(task)
+            self._event(task["task_id"], status, project=task["project"], source="pending_interrupt")

@@ -41,10 +41,22 @@ class SupervisedRenderer:
         self._completed_messages = []
         self._completed_turn_ids = set()
         self._completed_turn_lock = threading.Lock()
+        self._consume_lock = threading.Lock()
+        self._closed = False
 
     def consume(self, event):
+        with self._consume_lock:
+            return self._consume(event)
+
+    def _consume(self, event):
+        if self._closed:
+            return []
         if self._limit_exceeded:
             return self._limit_error()
+        if self.thread_id is not None and (
+            not isinstance(event, dict) or not self._matches_bound_turn(event)
+        ):
+            return []
         if not isinstance(event, dict):
             return [{"kind": "progress", "event": event}]
         method = event.get("method")
@@ -59,6 +71,8 @@ class SupervisedRenderer:
             return self._limit_error() if self._limit_exceeded else []
         if self._complete_agent_message(event):
             return self._limit_error() if self._limit_exceeded else []
+        if self.thread_id is not None and method == "item/commandExecution/outputDelta":
+            return [{"kind": "progress", "event": event}]
         if isinstance(method, str) and method.startswith("item/"):
             # Other response-item types may also carry assistant content, but
             # only completed agent messages have a safe gated representation.
@@ -74,6 +88,10 @@ class SupervisedRenderer:
                 return []
             if not self._remember_completed_turn(turn_id):
                 return self._limit_error()
+        # Production renderers belong to one host-started turn. A new turn or
+        # retry after a host exception must get a fresh renderer binding.
+        if self.thread_id is not None:
+            self._closed = True
         if self._turn_status(event) != "completed":
             self._reset_messages()
             return [{"kind": "progress", "event": self._sanitized_turn_completion(event)}]
@@ -86,8 +104,11 @@ class SupervisedRenderer:
                 self.task_id, str(uuid.uuid4()), final_message, project=self.project
             )
         except Exception:
-            with self._completed_turn_lock:
-                self._completed_turn_ids.discard(turn_id)
+            if self.thread_id is None:
+                with self._completed_turn_lock:
+                    self._completed_turn_ids.discard(turn_id)
+            else:
+                self._reset_messages()
             raise
         self._reset_messages()
         if decision.release:

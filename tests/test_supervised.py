@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 
@@ -37,6 +38,17 @@ def complete_from_another_process(state_dir, project, start, action_id):
     start.wait()
     host = supervisor.HostSupervisor(state_dir)
     host.complete_action("task-1", action_id, evidence={"worker": action_id}, project=project)
+
+
+def claim_from_process(state_dir, project, result):
+    host = supervisor.HostSupervisor(state_dir)
+    result.put(host.claim_action("task-1", "effect", "other-attempt", project=project).kind)
+
+
+def pause_from_process(state_dir, project, result):
+    host = supervisor.HostSupervisor(state_dir)
+    host.pause("task-1", project=project)
+    result.put("paused")
 
 
 class SupervisedTasks(unittest.TestCase):
@@ -165,14 +177,17 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(self.host.visible_messages("task-1"), [])
         self.assertEqual(self.host.task("task-1")["status"], "active")
 
-    def test_distinct_validators_retain_each_receipt_and_audit_event(self):
+    def test_multiple_required_validators_fail_closed_without_receipts(self):
         self.host.create_task("task-1", self.project, [], validators=[
             {"id": "first", "command": ["true"]}, {"id": "second", "command": ["true"]},
         ])
-        self.assertTrue(self.host.gate_final("task-1", "attempt", "finished").release)
-        self.assertEqual(set(self.host.task("task-1")["evidence"]["validators"]), {"first", "second"})
-        events = [e for e in self.host.audit("task-1") if e["type"] == "validator_received"]
-        self.assertEqual([e["validator_id"] for e in events], ["first", "second"])
+        decision = self.host.gate_final("task-1", "attempt", "finished")
+        self.assertEqual(decision.kind, "validation_unavailable")
+        self.assertFalse(decision.release)
+        self.assertEqual(self.host.task("task-1")["evidence"]["validators"], {})
+        events = [e["type"] for e in self.host.audit("task-1")]
+        self.assertIn("validation_unavailable", events)
+        self.assertNotIn("validator_received", events)
 
     def test_task_id_reuse_rejects_a_different_durable_definition(self):
         actions = [{"id": "write-doc", "operation": "write"}]
@@ -330,7 +345,6 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(recovered.claim_action("task-1", "write-doc", "lease-2").kind, "reconcile")
 
     def test_restart_recovers_abandoned_validation_for_a_fresh_final_attempt(self):
-        """A process crash after persisting validation must not require a manual resume."""
         self.task(validators=[{"id": "check", "command": [sys.executable, "-c", "print('ok')"], "timeout_s": 2}])
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
         with self.host._locked_task("task-1") as task:
@@ -345,21 +359,21 @@ class SupervisedTasks(unittest.TestCase):
         self.assertEqual(restarted.task("task-1")["status"], "active")
         self.assertNotIn("validation_attempt", restarted.task("task-1"))
         decision = restarted.gate_final("task-1", "fresh-attempt", "finished")
-        self.assertTrue(decision.release)
-        self.assertEqual(decision.kind, "complete")
+        self.assertFalse(decision.release)
+        self.assertEqual(decision.kind, "validation_unavailable")
+        self.assertEqual(self.host.task("task-1")["evidence"]["validators"], {})
+        self.assertEqual(self.host.visible_messages("task-1"), [])
 
-    def test_valid_completion_runs_fresh_host_validator_then_releases_buffer(self):
+    def test_completion_needing_validation_keeps_the_final_withheld(self):
         self.task(validators=[{"id": "check", "command": [sys.executable, "-c", "print('ok')"], "timeout_s": 2}])
         self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
         decision = self.host.gate_final("task-1", "attempt-1", "finished")
-        self.assertTrue(decision.release)
-        self.assertEqual(self.host.visible_messages("task-1"), ["finished"])
-        receipt = self.host.task("task-1")["evidence"]["validators"]["check"]
-        self.assertEqual(receipt["exit_status"], 0)
-        self.assertIn("digest", receipt)
+        self.assertFalse(decision.release)
+        self.assertEqual(decision.kind, "validation_unavailable")
+        self.assertEqual(self.host.task("task-1")["evidence"]["validators"], {})
+        self.assertEqual(self.host.visible_messages("task-1"), [])
 
-    def test_host_validator_executes_from_the_registered_project(self):
-        """Relative validator paths must resolve from the task's registered project."""
+    def test_gate_does_not_execute_project_relative_validator_inputs(self):
         (self.project / "validator-input.txt").write_text("project-owned input\n")
         self.task(validators=[{
             "id": "check-project-cwd",
@@ -370,13 +384,12 @@ class SupervisedTasks(unittest.TestCase):
 
         decision = self.host.gate_final("task-1", "attempt-1", "finished")
 
-        self.assertTrue(decision.release)
-        receipt = self.host.task("task-1")["evidence"]["validators"]["check-project-cwd"]
-        self.assertEqual(receipt["exit_status"], 0)
-        self.assertEqual(receipt["output"], "project-owned input\n")
+        self.assertFalse(decision.release)
+        self.assertEqual(decision.kind, "validation_unavailable")
+        self.assertEqual(self.host.task("task-1")["evidence"]["validators"], {})
+        self.assertEqual(self.host.visible_messages("task-1"), [])
 
-    def test_validator_receipt_hashes_a_project_relative_executable(self):
-        """The receipt must identify the binary executed after changing to the project."""
+    def test_gate_does_not_run_a_project_relative_executable(self):
         check = self.project / "check"
         check.write_text("#!/bin/sh\nexit 0\n")
         check.chmod(0o700)
@@ -389,9 +402,10 @@ class SupervisedTasks(unittest.TestCase):
 
         decision = self.host.gate_final("task-1", "attempt-1", "finished")
 
-        self.assertTrue(decision.release)
-        receipt = self.host.task("task-1")["evidence"]["validators"]["project-check"]
-        self.assertEqual(receipt["binary_digest"], hashlib.sha256(check.read_bytes()).hexdigest())
+        self.assertFalse(decision.release)
+        self.assertEqual(decision.kind, "validation_unavailable")
+        self.assertEqual(self.host.task("task-1")["evidence"]["validators"], {})
+        self.assertEqual(self.host.visible_messages("task-1"), [])
 
     def test_validator_receipt_hashes_the_project_executable_snapshot_it_runs(self):
         """Rewriting a validator after launch must not change the executed-binary receipt."""
@@ -422,8 +436,7 @@ class SupervisedTasks(unittest.TestCase):
         self.assertIn("original", receipt["output"])
         self.assertEqual(receipt["binary_digest"], hashlib.sha256(original).hexdigest())
 
-    def test_validator_receipt_hashes_bare_executable_from_relative_path_entry(self):
-        """A bare command must be hashed as execvp resolves it after entering the project."""
+    def test_gate_does_not_run_bare_executable_from_relative_path(self):
         check = self.project / "check"
         check.write_text("#!/bin/sh\nexit 0\n")
         check.chmod(0o700)
@@ -437,9 +450,10 @@ class SupervisedTasks(unittest.TestCase):
         with patch.dict(os.environ, {"PATH": f".{os.pathsep}{os.environ['PATH']}"}):
             decision = self.host.gate_final("task-1", "attempt-1", "finished")
 
-        self.assertTrue(decision.release)
-        receipt = self.host.task("task-1")["evidence"]["validators"]["project-check-from-path"]
-        self.assertEqual(receipt["binary_digest"], hashlib.sha256(check.read_bytes()).hexdigest())
+        self.assertFalse(decision.release)
+        self.assertEqual(decision.kind, "validation_unavailable")
+        self.assertEqual(self.host.task("task-1")["evidence"]["validators"], {})
+        self.assertEqual(self.host.visible_messages("task-1"), [])
 
     def test_host_validator_remains_in_registered_directory_if_project_path_is_replaced(self):
         """A path replacement just before spawn must not validate the substitute project."""
@@ -484,10 +498,7 @@ class SupervisedTasks(unittest.TestCase):
     def test_delivery_audit_failure_can_retry_without_losing_or_duplicating_output(self):
         cases = (
             ("plain", [], [], "final_attempt", "complete", "finished"),
-            ("validated", [{"id": "check", "command": ["true"]}], [], "validator_received", "complete", "finished"),
             ("blocker", [], [{"id": "choice", "owner_action": "Choose a region."}], "final_attempt", "blocker", "Choose a region."),
-            ("validation-start", [{"id": "check", "command": ["true"]}], [], "validation_started", "complete", "finished"),
-            ("validation-receipt", [{"id": "check", "command": ["true"]}], [], "validator_received", "complete", "finished"),
         )
         for task_id, validators, blockers, failed_event, decision_kind, message in cases:
             with self.subTest(task_id=task_id):
@@ -521,7 +532,6 @@ class SupervisedTasks(unittest.TestCase):
     def test_failed_terminal_state_write_does_not_audit_a_successful_release(self):
         for task_id, validators, blockers, message in (
             ("plain", [], [], "finished"),
-            ("validated", [{"id": "check", "command": ["true"]}], [], "finished"),
             ("blocker", [], [{"id": "choice", "owner_action": "Choose."}], "Choose."),
         ):
             with self.subTest(task_id=task_id):
@@ -620,7 +630,7 @@ class SupervisedTasks(unittest.TestCase):
                 self.assertEqual(self.host.task(task_id)["status"], expected_status)
                 self.host.cancel(task_id)
                 self.assertEqual(self.host.task(task_id)["status"], expected_status)
-                with self.assertRaisesRegex(ValueError, "Only a paused task can resume"):
+                with self.assertRaisesRegex(ValueError, "terminal task cannot resume|Only a paused task can resume"):
                     self.host.resume(task_id)
 
     def test_pause_cannot_make_a_cancelled_task_resumable(self):
@@ -630,52 +640,21 @@ class SupervisedTasks(unittest.TestCase):
         self.host.pause("task-1")
 
         self.assertEqual(self.host.task("task-1")["status"], "cancelled")
-        with self.assertRaisesRegex(ValueError, "Only a paused task can resume"):
+        with self.assertRaisesRegex(ValueError, "terminal task cannot resume|Only a paused task can resume"):
             self.host.resume("task-1")
 
-    def test_pause_and_cancel_preempt_a_running_validator_without_releasing_the_final(self):
+    def test_pause_and_cancel_stop_validation_unavailable_tasks(self):
         for transition, expected_status in ((self.host.pause, "paused"), (self.host.cancel, "cancelled")):
             with self.subTest(transition=expected_status):
                 task_id = f"{expected_status}-validator"
-                validator_started = threading.Event()
-                allow_validator_to_finish = threading.Event()
-                transitioned = threading.Event()
-                result = []
-
-                def blocking_validator(_validator, *, project=None, project_descriptor=None):
-                    validator_started.set()
-                    self.assertTrue(allow_validator_to_finish.wait(timeout=5))
-                    return {"exit_status": 0}
-
-                self.host.create_task(task_id, self.project, [{"id": "write-doc", "operation": "write"}],
+                self.host.create_task(task_id, self.project, [],
                                       validators=[{"id": "check", "command": ["unused"]}])
-                self.host.complete_action(task_id, "write-doc", evidence={"receipt": "host-observed"})
-                with patch.object(self.host, "_validator_receipt", side_effect=blocking_validator):
-                    worker = threading.Thread(target=lambda: result.append(
-                        self.host.gate_final(task_id, "attempt-1", "finished")
-                    ))
-                    worker.start()
-                    self.assertTrue(validator_started.wait(timeout=5))
-
-                    def apply_transition():
-                        transition(task_id)
-                        transitioned.set()
-
-                    transition_worker = threading.Thread(target=apply_transition)
-                    transition_worker.start()
-                    try:
-                        preempted = transitioned.wait(timeout=1)
-                    finally:
-                        allow_validator_to_finish.set()
-                    worker.join(timeout=5)
-                    transition_worker.join(timeout=5)
-
-                self.assertTrue(preempted)
-                self.assertFalse(worker.is_alive())
-                self.assertFalse(transition_worker.is_alive())
-                self.assertEqual(self.host.task(task_id)["status"], expected_status)
-                self.assertEqual(result[0].kind, expected_status)
-                self.assertFalse(result[0].release)
+                self.assertEqual(self.host.gate_final(task_id, "attempt-1", "finished").kind,
+                                 "validation_unavailable")
+                transition(task_id)
+                decision = self.host.gate_final(task_id, "attempt-2", "finished")
+                self.assertEqual(decision.kind, expected_status)
+                self.assertFalse(decision.release)
                 self.assertEqual(self.host.visible_messages(task_id), [])
 
     def test_crash_after_dispatch_requires_reconciliation_not_duplicate_dispatch(self):
@@ -1361,6 +1340,226 @@ class SupervisedTasks(unittest.TestCase):
                 self.assertNotIn("do not release", str(output))
                 self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit(task_id)])
 
+    def test_host_owner_can_release_a_specific_withheld_candidate(self):
+        self.task()
+        self.assertEqual(self.host.gate_final("task-1", "attempt-1", "I am done").kind, "continue")
+        released = self.host.release_withheld_final("task-1", owner="Dennis", reason="Emergency handoff")
+        self.assertTrue(released.release)
+        self.assertEqual(released.message, "I am done")
+        self.assertEqual(self.host.visible_messages("task-1"), ["I am done"])
+        events = [event["type"] for event in self.host.audit("task-1")]
+        self.assertIn("owner_override_final_released", events)
+
+
+    def test_validation_fails_closed_without_executing_or_snapshotting(self):
+        marker = self.project / "validator-ran"
+        self.task(validators=[{"id": "check", "command": [
+            sys.executable, "-c", "from pathlib import Path; Path('validator-ran').touch()"]}])
+        self.host.complete_action("task-1", "write-doc", evidence={"host": "observed"})
+        decision = self.host.gate_final("task-1", "attempt-1", "finished")
+        self.assertEqual(decision.kind, "validation_unavailable")
+        self.assertFalse(decision.release)
+        self.assertIn("container", decision.message)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.host.visible_messages("task-1"), [])
+        self.assertEqual(self.host.task("task-1")["evidence"]["validators"], {})
+        self.assertEqual(list(self.host.root.glob("validator-*")), [])
+        restarted = supervisor.HostSupervisor(self.host.root)
+        self.assertEqual(restarted.gate_final("task-1", "retry", "finished").kind,
+                         "validation_unavailable")
+
+
+    def test_missing_runner_does_not_block_independent_work(self):
+        self.task(validators=[{"id": "check", "command": ["./check"]}])
+        self.assertEqual(self.host.gate_final("task-1", "attempt-1", "done").kind, "continue")
+
+
+    def test_legacy_renderer_uses_last_message_and_explicit_final_wins(self):
+        for phases in ((None, None), ("commentary", "final_answer"),
+                       ("final_answer", None)):
+            with self.subTest(phases=phases):
+                host = supervisor.HostSupervisor(self.base / ("host-" + str(phases)))
+                host.create_task("render", self.project, [])
+                renderer = client.SupervisedRenderer(host, "render", thread_id="thread-1", turn_id="turn-1")
+                for phase, text in zip(phases, ("first", "last")):
+                    renderer.consume({"method": "item/completed", "params": {
+                        "threadId": "thread-1", "turnId": "turn-1",
+                        "item": {"id": text, "type": "agentMessage", "phase": phase, "text": text}}})
+                result = renderer.consume({"method": "turn/completed", "params": {
+                    "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}})
+                expected = "first" if phases[0] == "final_answer" else "last"
+                self.assertEqual(result[0]["content"], expected)
+
+
+    def test_pending_interrupt_prevents_every_automatic_decision(self):
+        for mode in ("paused", "cancelled"):
+            for case in ("action", "unauthorized", "blocker", "final", "validator"):
+                with self.subTest(mode=mode, case=case):
+                    task_id = mode + "-" + case
+                    actions = [{"id": "a", "operation": "write"}]
+                    self.host.create_task(task_id, self.project, actions,
+                        validators=[{"id": "v", "command": ["./check"]}] if case == "validator" else [],
+                        blockers=[{"owner_action": "Choose region"}] if case == "blocker" else [])
+                    if case == "unauthorized":
+                        task = self.host.task(task_id)
+                        task["actions"]["a"]["operation"] = "merge"
+                        self.host._save_task(task)  # Legacy pending unauthorized action.
+                    if case in ("blocker", "final", "validator"):
+                        self.host.complete_action(task_id, "a", evidence={"host": True})
+                    self.host._request_interrupt(task_id, mode)
+                    decision = self.host.gate_final(task_id, "try", "done")
+                    self.assertEqual(decision.kind, mode)
+                    self.assertFalse(decision.release)
+                    self.assertEqual(self.host.visible_messages(task_id), [])
+
+
+    def test_pause_publication_is_serialized_with_blocker_decision(self):
+        self.task(blockers=[{"owner_action": "Choose region"}])
+        self.host.complete_action("task-1", "write-doc", evidence={"host": True})
+        started, published = threading.Event(), threading.Event()
+        threads = []
+        original = self.host._remaining
+
+        def publish():
+            started.set()
+            self.host._request_interrupt("task-1", "paused")
+            published.set()
+
+        def remaining(task):
+            thread = threading.Thread(target=publish)
+            threads.append(thread)
+            thread.start()
+            self.assertTrue(started.wait(1))
+            # Publication must wait for the complete decision transaction.
+            self.assertFalse(published.wait(0.05))
+            return original(task)
+
+        try:
+            with mock.patch.object(self.host, "_remaining", side_effect=remaining):
+                decision = self.host.gate_final("task-1", "attempt-1", "done")
+            self.assertEqual(decision.kind, "blocker")
+        finally:
+            for thread in threads:
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+        self.assertTrue(published.is_set())
+
+
+    def test_pending_interrupt_prevents_dispatch_and_recovery(self):
+        for mode in ("paused", "cancelled"):
+            for operation in ("claim", "recover"):
+                with self.subTest(mode=mode, operation=operation):
+                    task_id = mode + operation
+                    self.host.create_task(task_id, self.project, [{"id": "effect", "operation": "write"}])
+                    self.host._request_interrupt(task_id, mode)
+                    if operation == "claim":
+                        decision = self.host.claim_action(task_id, "effect", "attempt")
+                    else:
+                        decision = self.host.recover(task_id)
+                    self.assertEqual(decision.kind, mode)
+                    task = self.host.task(task_id)
+                    self.assertEqual(task["actions"]["effect"]["attempts"], [])
+                    self.assertEqual(task["status"], mode)
+
+
+    def test_recovery_prefers_authorized_work_before_authorization_blocker(self):
+        task = self.task(actions=[{"id": "forbidden", "operation": "write"},
+                                  {"id": "allowed", "operation": "write"}])
+        task["actions"]["forbidden"]["operation"] = "push"
+        self.host._save_task(task)  # Simulate a legacy task requiring owner authorization.
+        self.assertEqual(self.host.recover("task-1").next_action["id"], "allowed")
+        self.host.complete_action("task-1", "allowed", evidence={"host": True})
+        decision = self.host.recover("task-1")
+        self.assertEqual(decision.kind, "blocker")
+        self.assertIn("push", decision.message)
+
+
+    def test_resume_does_not_clear_a_pending_pause_request(self):
+        self.task()
+        self.host._request_interrupt("task-1", "paused")
+        with self.assertRaisesRegex(ValueError, "pending"):
+            self.host.resume("task-1")
+        self.assertEqual(self.host.gate_final("task-1", "attempt-1", "finished").kind, "paused")
+
+
+    def test_resume_waiting_for_task_lock_does_not_block_gate_interrupt_check(self):
+        self.task()
+        self.host.pause("task-1")
+        resumed = threading.Thread(target=lambda: self.host.resume("task-1"))
+        with self.host._locked_task("task-1"):
+            resumed.start()
+            time.sleep(0.05)
+            observed = {}
+            checker = threading.Thread(target=lambda: observed.setdefault(
+                "status", self.host._interrupt_status("task-1")))
+            checker.start()
+            checker.join(timeout=0.5)
+            self.assertFalse(checker.is_alive())
+            self.assertEqual(observed["status"], "paused")
+        resumed.join(timeout=1)
+        self.assertFalse(resumed.is_alive())
+
+
+    def test_resume_cannot_clear_a_pending_cancellation(self):
+        self.task()
+        self.host.pause("task-1")
+        self.host._request_interrupt("task-1", "cancelled")
+        with self.assertRaisesRegex(ValueError, "cancellation"):
+            self.host.resume("task-1")
+        decision = self.host.gate_final("task-1", "attempt-1", "finished")
+        self.assertEqual(decision.kind, "cancelled")
+        self.assertFalse(decision.release)
+
+
+    def test_pause_cannot_overwrite_a_pending_cancellation(self):
+        self.task()
+        self.host.pause("task-1")
+        self.host._request_interrupt("task-1", "cancelled")
+        self.host._request_interrupt("task-1", "paused")
+        with self.assertRaisesRegex(ValueError, "cancellation"):
+            self.host.resume("task-1")
+        decision = self.host.gate_final("task-1", "attempt-1", "finished")
+        self.assertEqual(decision.kind, "cancelled")
+        self.assertFalse(decision.release)
+
+
+    def test_unauthorized_action_cannot_be_leased_or_dispatched(self):
+        task = self.task(actions=[{"id": "merge-release", "operation": "write"}])
+        task["actions"]["merge-release"]["operation"] = "merge"
+        self.host._save_task(task)  # Simulate a legacy task requiring owner authorization.
+        decision = self.host.claim_action("task-1", "merge-release", "attempt-1")
+        self.assertEqual(decision.kind, "blocker")
+        self.assertEqual(self.host.task("task-1")["actions"]["merge-release"]["status"], "pending")
+        self.assertEqual(self.host.gate_final("task-1", "final-1", "done").kind, "blocker")
+        events = self.host.audit("task-1")
+        self.assertIn("authorization_blocked", [event["type"] for event in events])
+        self.assertNotIn("action_dispatched", [event["type"] for event in events])
+
+
+    def test_renderer_does_not_gate_failed_or_interrupted_turns(self):
+        self.task()
+        for status in ("failed", "interrupted"):
+            renderer = client.SupervisedRenderer(self.host, "task-1", thread_id="thread-1", turn_id="turn-1")
+            renderer.consume({"method": "item/agentMessage/delta", "params": {"threadId": "thread-1", "turnId": "turn-1", "delta": "partial final"}})
+            result = renderer.consume({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": status}}})
+            self.assertEqual(result[0]["kind"], "progress")
+            self.assertFalse(any(item["kind"] == "final" for item in result))
+        self.assertEqual(self.host.visible_messages("task-1"), [])
+        self.assertNotIn("final_attempt", [event["type"] for event in self.host.audit("task-1")])
+
+
+    def test_renderer_releases_only_the_buffered_completed_agent_message(self):
+        self.task()
+        self.host.complete_action("task-1", "write-doc", evidence={"receipt": "host-observed"})
+        renderer = client.SupervisedRenderer(self.host, "task-1", thread_id="thread-1", turn_id="turn-1")
+        renderer.consume({"method": "item/agentMessage/delta", "params": {"threadId": "thread-1", "turnId": "turn-1", "delta": "streamed duplicate"}})
+        self.assertEqual(renderer.consume({"method": "item/completed", "params": {
+            "threadId": "thread-1", "turnId": "turn-1", "item": {"id": "final", "type": "agentMessage", "text": "authoritative final"}}}), [])
+        released = renderer.consume({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}})
+        self.assertEqual(released, [{"kind": "final", "content": "authoritative final", "decision": "complete"}])
+
+
+
 
 class SupervisedInstallation(unittest.TestCase):
     def test_install_and_upgrade_register_only_with_explicit_supervised_option(self):
@@ -1371,7 +1570,7 @@ class SupervisedInstallation(unittest.TestCase):
             installer.install(project, source=installer.SOURCE, home=base / "home", supervised=True,
                               supervisor_state_dir=host_state)
             registration = supervisor.HostSupervisor(host_state).provision(project)
-            self.assertEqual(registration["project"], str(project.resolve()))
+            self.assertEqual(registration["project"], str(project.absolute()))
             self.assertTrue(installer.read_state(project)["supervised"]["enabled"])
             self.assertFalse((project / ".agent-canvas" / "supervisor.json").exists())
 
@@ -1385,6 +1584,115 @@ class SupervisedInstallation(unittest.TestCase):
                 installer.install(base / "nested", source=installer.SOURCE, home=base / "home", supervised=True,
                                   supervisor_state_dir=base)
 
+    def test_override_read_is_pinned_when_project_root_is_swapped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            (project / ".owner-override").write_text("OWNER_OVERRIDE=pause")
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / ".owner-override").write_text("OWNER_OVERRIDE=reset")
+            actual_open = installer.os.open
+            def swap(path, flags, *args, **kwargs):
+                if Path(path).name == ".owner-override":
+                    project.rename(base / "original")
+                    project.symlink_to(outside, target_is_directory=True)
+                return actual_open(path, flags, *args, **kwargs)
+            with mock.patch.object(installer.os, "open", side_effect=swap):
+                result = installer.root_owner_override(project)
+            self.assertEqual(result["modes"], ["pause"])
+
+
+    def test_override_swap_at_open_cannot_follow_an_external_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            override = project / ".owner-override"
+            override.write_text("OWNER_OVERRIDE=pause")
+            outside = base / "outside"
+            outside.write_text("OWNER_OVERRIDE=reset")
+            actual_open = installer.os.open
+            def swap(path, flags, *args, **kwargs):
+                if Path(path).name == ".owner-override":
+                    override.unlink()
+                    override.symlink_to(outside)
+                return actual_open(path, flags, *args, **kwargs)
+            with mock.patch.object(installer.os, "open", side_effect=swap):
+                with self.assertRaisesRegex(ValueError, "regular|symlink"):
+                    installer.root_owner_override(project)
+
+
+    def test_supervised_install_imports_a_root_owner_override_as_a_host_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            override = project / ".owner-override"
+            override.write_text('OWNER_OVERRIDE="pause,bypass-review" # host import\n')
+            state_dir = base / "host-state"
+
+            installer.install(project, source=installer.SOURCE, home=base / "home", apply=True,
+                              supervised=True, supervisor_state_dir=state_dir)
+
+            host = supervisor.HostSupervisor(state_dir)
+            registration = host.provision(project)
+            self.assertEqual(registration["owner_override"]["modes"], ["bypass-review", "pause"])
+            self.assertEqual(registration["owner_override"]["source_digest"],
+                             supervisor.hashlib.sha256(override.read_bytes()).hexdigest())
+            override.write_text("OWNER_OVERRIDE=\n")
+            self.assertEqual(host.provision(project)["owner_override"]["modes"], ["bypass-review", "pause"])
+            task = host.create_task("task-1", project, [{"id": "write-doc", "operation": "write"}])
+            self.assertEqual(task["status"], "paused")
+
+
+    def test_supervised_upgrade_imports_only_the_target_root_owner_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            state_dir = base / "host-state"
+            installer.install(project, source=installer.SOURCE, home=base / "home")
+            (project / ".owner-override").write_text("reset\n")
+
+            installer.upgrade(project, source=installer.SOURCE, home=base / "home", apply=True,
+                              supervised=True, supervisor_state_dir=state_dir)
+
+            registration = supervisor.HostSupervisor(state_dir).provision(project)
+            self.assertEqual(registration["owner_override"]["modes"], ["reset"])
+
+
+    def test_imported_reset_cancels_existing_nonterminal_host_tasks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            state_dir = base / "host-state"
+            installer.install(project, source=installer.SOURCE, home=base / "home", supervised=True,
+                              supervisor_state_dir=state_dir)
+            host = supervisor.HostSupervisor(state_dir)
+            host.create_task("task-1", project, [{"id": "write-doc", "operation": "write"}])
+            (project / ".owner-override").write_text("OWNER_OVERRIDE=reset\n")
+
+            installer.upgrade(project, source=installer.SOURCE, home=base / "home", apply=True,
+                              supervised=True, supervisor_state_dir=state_dir)
+
+            self.assertEqual(host.task("task-1", project=project)["status"], "cancelled")
+            self.assertIn("owner_override_reset", [event["type"] for event in host.audit("task-1", project=project)])
+
+
+    def test_supervised_install_rejects_a_symlinked_owner_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            outside = base / "outside-override"
+            outside.write_text("OWNER_OVERRIDE=pause\n")
+            (project / ".owner-override").symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                installer.install(project, source=installer.SOURCE, home=base / "home", apply=True,
+                                  supervised=True, supervisor_state_dir=base / "host-state")
+
+
 
 class MultipleProjects(unittest.TestCase):
     def test_unqualified_lookup_skips_registered_project_without_tasks_yet(self):
@@ -1397,7 +1705,7 @@ class MultipleProjects(unittest.TestCase):
             host.create_task("task-1", alpha, [{"id": "one", "operation": "write"}])
             host.provision(beta)
 
-            self.assertEqual(host.task("task-1")["project"], str(alpha.resolve()))
+            self.assertEqual(host.task("task-1")["project"], str(alpha.absolute()))
 
     def test_unqualified_lookup_rejects_malformed_existing_tasks_directory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1440,6 +1748,124 @@ class MultipleProjects(unittest.TestCase):
             host.create_task("task-1", beta, [{"id": "two", "operation": "write"}])
             with self.assertRaisesRegex(ValueError, "ambiguous"):
                 host.task("task-1")
+
+    def test_concurrent_task_creation_is_serialized_before_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.provision(project)
+            lock_path = host._project_dir(project) / "tasks" / "task-1.lock"
+            lock_path.parent.mkdir(parents=True)
+            result = {}
+            with lock_path.open("a", encoding="utf-8") as lock:
+                supervisor.fcntl.flock(lock.fileno(), supervisor.fcntl.LOCK_EX)
+                creator = threading.Thread(target=lambda: result.setdefault(
+                    "task", host.create_task("task-1", project, [{"id": "effect", "operation": "write"}])))
+                creator.start()
+                time.sleep(0.05)
+                self.assertNotIn("task", result)
+            creator.join(timeout=1)
+            self.assertFalse(creator.is_alive())
+            self.assertEqual(result["task"]["actions"]["effect"]["status"], "pending")
+            self.assertEqual(host.claim_action("task-1", "effect", "first", project=project).kind, "dispatch")
+            self.assertEqual(host.claim_action("task-1", "effect", "second", project=project).kind, "reconcile")
+
+    def test_task_id_path_traversal_is_rejected_before_project_lookup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", project, [{"id": "one", "operation": "write"}])
+            with self.assertRaisesRegex(ValueError, "task_id"):
+                host.task("../task-1", project=project)
+
+
+    def test_host_state_inside_or_enclosing_workspace_is_rejected_by_supervisor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            with self.assertRaisesRegex(ValueError, "outside"):
+                supervisor.HostSupervisor(project / "host-state").provision(project)
+            with self.assertRaisesRegex(ValueError, "outside"):
+                supervisor.HostSupervisor(base).provision(project)
+
+
+    def test_interprocess_lease_lock_allows_only_one_side_effect_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", project, [{"id": "effect", "operation": "write", "side_effect": True}])
+            context = multiprocessing.get_context("fork")
+            result = context.Queue()
+            with host._locked_task("task-1", project=project) as task:
+                child = context.Process(target=claim_from_process, args=(base / "host-state", project, result))
+                child.start()
+                self.assertTrue(result.empty())
+            child.join(timeout=2)
+            self.assertEqual(child.exitcode, 0)
+            self.assertEqual(result.get(timeout=1), "dispatch")
+            self.assertEqual(host.claim_action("task-1", "effect", "later-attempt", project=project).kind, "reconcile")
+
+
+    def test_terminal_final_or_blocker_is_not_released_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", project, [{"id": "done", "operation": "write"}])
+            host.complete_action("task-1", "done", evidence={"host": "observed"})
+            self.assertTrue(host.gate_final("task-1", "first", "finished", project=project).release)
+            duplicate = host.gate_final("task-1", "second", "finished again", project=project)
+            self.assertFalse(duplicate.release)
+            self.assertEqual(host.visible_messages("task-1", project=project), ["finished"])
+
+
+    def test_pause_and_resume_cannot_reopen_a_terminal_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", project, [{"id": "done", "operation": "write"}])
+            host.complete_action("task-1", "done", evidence={"host": "observed"})
+            self.assertTrue(host.gate_final("task-1", "first", "finished", project=project).release)
+            host.pause("task-1", project=project)
+            with self.assertRaisesRegex(ValueError, "terminal"):
+                host.resume("task-1", project=project)
+            host.cancel("task-1", project=project)
+            self.assertEqual(host.task("task-1", project=project)["status"], "complete")
+            self.assertFalse(host.gate_final("task-1", "second", "duplicate", project=project).release)
+
+
+    def test_pause_uses_the_same_lock_as_final_delivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / "project"
+            project.mkdir()
+            host = supervisor.HostSupervisor(base / "host-state")
+            host.create_task("task-1", project, [{"id": "done", "operation": "write"}])
+            host.complete_action("task-1", "done", evidence={"host": "observed"})
+            context = multiprocessing.get_context("fork")
+            result = context.Queue()
+            with host._locked_task("task-1", project=project):
+                child = context.Process(target=pause_from_process, args=(base / "host-state", project, result))
+                child.start()
+                self.assertTrue(result.empty())
+            child.join(timeout=2)
+            self.assertEqual(child.exitcode, 0)
+            self.assertEqual(result.get(timeout=1), "paused")
+            decision = host.gate_final("task-1", "after-pause", "finished", project=project)
+            self.assertEqual(decision.kind, "paused")
+            self.assertFalse(decision.release)
+
+
 
 
 if __name__ == "__main__":
