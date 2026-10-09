@@ -64,7 +64,7 @@ A **project** is the whole goal. A **phase** is a big stage. An **epic** is a us
 
 For smaller projects, skip phases: **Project → Epic → Task**. Routine fixes may need only a short task description. Detail only the current phase, or current epic when there are no phases. Expand future work when you reach it. Finishing one phase does not create another approval gate.
 
-Each active epic says what must work, what checks will prove it, and what must be true before merging. There are no planning approvals. The PR review coordinator selects relevant reviewers; QA, when selected, checks the declared behavior and test evidence.
+Each active epic says what must work, what checks will prove it, and what must be true before merging. There are no planning approvals. The PR review coordinator assigns Staff and QA, plus accessibility for frontend changes and additional specialists when warranted; QA checks the declared behavior and test evidence.
 
 ## How much review?
 
@@ -72,9 +72,9 @@ First consider scope and risk: Tier 1 is small and low risk; Tier 2 is bounded b
 
 | Target environment | Normal review expectation |
 | --- | --- |
-| `local` — your machine | Direct commits without a PR need no reviewers; PRs need one approval. |
-| `dev` — development environment | One approval from a coordinator-selected reviewer. |
-| `production` — live use | One approval; coordinator selects coverage based on risk. |
+| `local` — your machine | Direct commits without a PR need no reviewers; PRs follow the two-stage review workflow. |
+| `dev` — development environment | Two-stage PR workflow; review depth reflects development risk. |
+| `production` — live use | Two-stage PR workflow; add specialists for production risk. |
 
 Authentication, secrets, database schema, payments, and user data raise the work to Tier 3 even locally. Bring relevant expertise to the PR. You can always open a PR before approval.
 
@@ -108,9 +108,23 @@ Every code review skill, including Osmani and Superpowers, adds inline comments 
 
 The developer owns follow-up: read outstanding comments from all review rounds on the PR, verify and fix valid findings, reply in the original threads with commit/test evidence, and resolve addressed threads using the developer's identity. Already-fixed findings can be resolved with evidence; disputed or unfinished findings stay open with an explanation. This also governs Superpowers' receiving-code-review skill. Resolving a thread does not supply reviewer approval.
 
-The developer dispatches a separate [PR review coordinator](agents/review-coordinator.md) on the existing review events. It selects one lead (Code Reviewer, Staff, AppSec, or QA) based on the diff's dominant risk, adding specialists only for distinct material concerns. Exposed ports can require AppSec; complex integration tests can require QA. This policy applies equally to this toolkit and installed projects.
+The developer dispatches a separate [PR review coordinator](agents/review-coordinator.md) for the internal review stage. Staff and QA are required; frontend changes also require accessibility. The coordinator assigns distinct scopes and adds specialists such as AppSec for material security concerns. This policy applies equally to this toolkit and installed projects.
 
-Only **one approval total** is required, from any selected reviewer App. Every requested review must finish, with no outstanding request for changes or unresolved blocking findings, before merging. The coordinator selects and delegates; fresh reviewer agents inspect the work and publish verdicts through their Apps; the developer fixes findings and merges after CI completes. One approval cannot override another reviewer's objection. Governance repair remains exempt.
+The numeric GitHub approval minimum remains **one**, but it does not replace the required internal role passes or the completed Codex stage. Every requested review must finish without an outstanding request for changes or unresolved blocking finding. Fresh reviewer agents inspect the work and publish verdicts through their Apps; the developer fixes findings and merges only when authorized and CI permits. One approval cannot override another reviewer's objection. Governance construction and repair remain exempt: this policy does not review or gate its own repair.
+
+### Sequential review loop
+
+The canonical rules are in [AGENTS.md](AGENTS.md#two-stage-pr-review-workflow); keep one existing task/automation record rather than a separate review ledger.
+
+1. Implement and verify the original changes, then open the PR. Run Staff and QA, plus accessibility for frontend changes. Collect every review on the same immutable head before changing code.
+2. Fix valid concerns in new commits, verify, push, and reply/resolve the original threads with evidence. Re-request affected internal reviewers until each required role has passed; reuse unaffected evidence.
+3. With internal reviews complete, post one `@codex review` comment identifying the full current head SHA. Reuse an existing request or pending review for that SHA. Never overlap internal reviews with pending Codex work or edit/push the reviewed code while reviews are pending.
+4. Schedule the first check for **10 minutes after the request**, then check every **5 minutes** until Codex explicitly completes for that SHA. Use the host's scheduling/wakeup mechanism; silence, a reaction alone, an old result, or elapsed time is not a pass. Resume from the saved request/time/head, inspect local changes and remote state, and avoid duplicate requests. Unavailable or failed review access is a blocker, not a clean review.
+5. Assess all findings against the actual code and declared scope/trust model. Fix valid in-scope **P1/P2** findings in that run, with regression tests and focused verification. Fix **P3** only when small, low-risk, and in scope; document other P3 deferrals. Escalate P0 immediately. Explain irrelevant, duplicate, already-fixed, or accepted-limit findings with evidence rather than silently discarding them.
+6. Commit and push fixes, reply/resolve addressed threads, then request Codex once for the new head and repeat the 10-minute/5-minute cycle. Do not restart internal reviews for every Codex fix; return to an affected internal reviewer only if the fix materially invalidates its scope or approval, and never while Codex is pending.
+7. Finish when the exact current head has completed Codex review with no actionable in-scope P1/P2 or selected P3 left. Record remaining irrelevant/accepted findings and deferred P3s; disputed or unfinished threads stay open. No code change means no identical re-request just to repeat dispositions. Report the SHA and verification/CI status, and disable that PR's monitor; also disable it if the PR closes or merges. Completion does not authorize an automatic merge.
+
+The developer handles routine fixes, commits, pushes, replies, resolutions, and re-requests within the owner's authorized scope without requiring a response every round. Scheduled monitoring stays quiet on pending/unchanged state and ordinary iterations; notify on completion, failure, or an owner decision. Material scope/design choices, unsafe actions, access blockers, and the same fix failing three times require owner attention. The intentional loop has no two-round cutoff. These are agent instructions, not an installed background service: an active PR needs a host-supported monitor, and missing integrations must be reported rather than simulated.
 
 For this toolkit, internal docs, tests, scripts, and tooling use the light **authoring lane**. Templates, adopter policy, distributed bootstrap, and CI configuration use the **shipped lane**: versioned changes reviewed at the PR. A bootstrap script shipped to others stays shipped even if it lives in `scripts/`.
 
@@ -391,7 +405,7 @@ agentic_envs:
   codex: true
   cline: true
   claude_code: false # Reserved; adapter not yet implemented.
-# One approval per PR; coordinator selects the relevant reviewer(s).
+# Numeric GitHub minimum; required role passes and the Codex loop still apply.
 approvals_required: 1
 target_environment: local
 repo_role: toolkit-authoring
@@ -400,7 +414,7 @@ slack_channel_name: ws-agent-canvas
 
 - **workspace:** your project name.
 - **agentic_envs:** assistants to configure for this project. This package supports Codex and Cline; `claude_code: false` reserves a future adapter. The list does not identify the assistant currently speaking.
-- **approvals_required:** `1` approval per PR from any coordinator-selected reviewer App. Specialist coverage does not add approval quotas. Existing role maps require reconciliation during upgrade; the installer preserves project customizations.
+- **approvals_required:** `1` is the numeric GitHub approval minimum, not a substitute for Staff/QA (and accessibility when applicable) passes and the completed Codex loop. Existing role maps require reconciliation during upgrade; the installer preserves project customizations.
 - **target_environment:** `local`, `dev`, or `production`, based on the intended use of the change—not merely where the agent runs.
 - **repo_role:** `toolkit-authoring` describes this repository. For an application, use a descriptive value such as `application` and adapt the toolkit-specific lane wording in `AGENTS.md` to your product. This is agent-readable configuration, not a new validated schema.
 - **slack_channel_name:** one project channel shared by all assistants, such as `ws-my-project`. Leave it empty if unknown. Each authorized post identifies its actual environment and role. Existing channel values are preserved; editing this setting does not create or rename a Slack channel.
@@ -543,11 +557,11 @@ This is a convention the agent reads under `AGENTS.md`, not an operating-system 
 
 Overrides need no governance approval. Record the mode and timestamp in the commit trailer or PR description; skipped checks must never be reported as passed. Existing platform access controls still apply.
 
-If a PR exceeds two review rounds, the same fix is attempted three times, process work outweighs the deliverable, or approvals block repairing approvals, the agent stops and offers one ranked choice: **bypass and finish**, **simplify the rule**, or **continue**.
+If the same fix fails three times, process-artifact work outweighs the deliverable, or approvals block repairing approvals, the agent stops and offers one ranked choice: **bypass and finish**, **simplify the rule**, or **continue**. The intentional two-stage loop is not limited to two review rounds; ordinary fix/review iterations and scheduled waits do not trigger this circuit breaker.
 
 ## Slack and reviewer connections
 
-Authorized Slack posts use **Agent Alert**, go to the shared project channel, and start with the actual environment and role: `[codex][Developer]` or `[cline][Staff Engineer]`. If the running environment is unknown, clarify it; do not guess from `agentic_envs`. A step taking over 15 minutes gets a heartbeat and status report; it is not silently abandoned or killed merely for taking time.
+Authorized Slack posts use **Agent Alert**, go to the shared project channel, and start with the actual environment and role: `[codex][Developer]` or `[cline][Staff Engineer]`. If the running environment is unknown, clarify it; do not guess from `agentic_envs`. Active work taking over 15 minutes gets a heartbeat and status report; it is not abandoned or killed merely for taking time. Scheduled Codex polling instead stays quiet when unchanged.
 
 Continue through the authorized scope without requesting routine confirmation. Commit each completed task after focused verification, then continue to the next task within that scope. Open a PR when the authorized epic is complete. A passing test, a commit, or a completed task is progress evidence—not completion of the authorized scope. After each such step, reconcile the canonical task record and immediately begin its next unfinished, authorized task. Do not end a run with a status-only response; progress updates belong in commentary/heartbeats and must be followed by work. If no next task is recorded while scope remains, record one concrete next action before ending. This is an agent behavior rule, not a response-delivery lock: when the host lets an agent emit a final response directly, repository instructions and task-state checks can only audit violations. Genuine prevention requires a host-owned final-submission operation that reads active task state and rejects delivery while work remains. End the turn only when the authorized scope is complete or progress requires owner guidance, authorization, or resolution of a blocker; continue independent work while blocked work waits. Progress updates do not require a response. Task completion and commits are not stop points within an authorized epic.
 
@@ -575,6 +589,7 @@ Use the discovered `gh_identity_review_as_app` tool to submit the fresh reviewer
 | Code Reviewer | `reviewer` |
 | AppSec | `appsec` |
 | QA | `qa` |
+| Accessibility | `a11y` |
 
 Use only coordinator-selected roles. Finding additional App identities does not add review requirements. The coordinator prompt is installed and upgraded as a managed file, and AGENTS.md directs the developer to dispatch it with the available subagent tools; no plugin registration or background service is needed. If discovery finds no tool, report that discovery result; if a call fails, report its actual error. Record missing setup in `INSTALL-FOLLOWUP.md` and continue independent work.
 
@@ -586,7 +601,7 @@ AGENTS.md                              # Your workflow and overrides
 README.md                              # Setup and usage
 POSTMORTEM.txt                         # Historical explanation only
 config/workspace-config.yml            # Project settings
-agents/review-coordinator.md            # PR reviewer selection and delegation
+agents/review-coordinator.md            # Internal PR review assignments and Codex handoff
 .github/CODEOWNERS                     # Ownership example
 .gitignore                            # Local installation exclusions
 skills/addyosmani-agent-skills.ref      # Selected upstream version
