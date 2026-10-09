@@ -21,8 +21,9 @@ Add another role only for a material concern the lead does not adequately cover.
 
 Use the running environment's supported subagent tools to dispatch fresh, read-only reviewer contexts. Do not forward the developer's entire conversation or implement fixes yourself. Provide each reviewer the PR/base/head, relevant requirements, assigned scope, diff access, and verification evidence. Ask for:
 
-- An actual `approve` or `request_changes` verdict tied to the reviewed SHA, with a concise rationale and verification limitations.
-- Actionable inline findings with severity, explanation, repository-relative path, line, and diff side; multiline ranges include their start line and side.
+- A complete pass through the assigned scope before publishing: reviewers must inspect the whole relevant diff and context and report all supported findings, not stop after the first blocking issue.
+- An actual `approve` or `request_changes` verdict tied to the reviewed SHA, with a concise, plain-language rationale and any verification limitations.
+- Actionable inline findings with severity, repository-relative path, line, and diff side; state the issue plainly, why it matters, and the requested change where useful. Multiline ranges include their start line and side.
 - Broader unanchorable concerns in the summary. No invented findings or filler comments.
 
 Discover `gh_identity` / `gh-identity` tools, including deferred tools, before declaring App submission unavailable. Publish each actual reviewer verdict using `gh_identity_review_as_app` with the matching `app_role`, reviewed `commit_id`, summary `body`, and inline `comments` in the same review. The tool submits a review; it does not perform one. Validate anchors against the reviewed diff and correct rejected anchors without silently dropping findings. Do not retrieve tokens or change Git identity just to submit reviews.
@@ -33,6 +34,6 @@ If nested delegation is unsupported, return the precise reviewer assignments to 
 
 Return selected roles and rationale, reviewed SHA, completed/pending assignments, published review links or submission failures, and unresolved blocking findings. Use existing evidence rather than creating another report file.
 
-One valid approval from any selected App meets the count, but every requested review must finish, with no outstanding request for changes or unresolved blocking finding. Never declare readiness while a specialist is pending. An approving bot cannot cancel another bot's objection. The developer owns fixes, focused verification, thread replies/resolution, and re-requesting affected reviewers when needed. Thread resolution alone does not clear a request-changes verdict.
+One valid approval from any selected App meets the count, but every requested review must finish, with no outstanding request for changes or unresolved blocking finding. Never declare readiness while a specialist is pending. An approving bot cannot cancel another bot's objection. The developer owns fixes, focused verification, thread replies/resolution, and re-requesting affected reviewers when needed. On a changed head, the affected reviewer makes a fresh pass over the affected scope, including the fixes and their surrounding interactions, rather than only confirming its prior comments. Thread resolution alone does not clear a request-changes verdict.
 
 The developer must recheck the current head, all CI checks/statuses, and review validity before merging. A changed head invalidates your readiness snapshot; reuse still-valid evidence and reassess the affected scope without restarting every review. Do not merge or change GitHub settings. GitHub's required approval count should be one; report conflicting branch protection, CODEOWNERS requirements, or legacy role-based config for reconciliation rather than silently modifying them. Respect the project's two-review-round circuit breaker.

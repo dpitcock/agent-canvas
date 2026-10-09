@@ -1,9 +1,13 @@
 """Offline upgrade behavior tests: temporary files, no network or subprocesses."""
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("upgrade_installer", Path(__file__).resolve().parents[1] / "scripts/install.py")
 installer = importlib.util.module_from_spec(spec)
@@ -15,6 +19,130 @@ def snapshot(root):
 
 
 class UpgradeSmoke(unittest.TestCase):
+    def test_existing_file_mutations_reject_hardlinks_to_external_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "project"
+            root.mkdir()
+            external = base / "external"
+            external.write_text("external contents\n")
+            for operation in ("ignore", "replace"):
+                with self.subTest(operation=operation):
+                    path = root / operation
+                    os.link(external, path)
+                    with self.assertRaisesRegex(ValueError, "Cannot safely update"):
+                        if operation == "ignore":
+                            installer.add_gitignore_entries(root, path, ["/new-entry"])
+                        else:
+                            _, identity = installer.regular_text_snapshot(root, path)
+                            installer.write_regular_text(root, path, "replacement", identity=identity)
+                    self.assertEqual(external.read_text(), "external contents\n")
+                    path.unlink()
+
+    def test_writer_rejects_hardlink_created_after_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "project"
+            root.mkdir()
+            path = root / "managed"
+            path.write_text("original")
+            _, identity = installer.regular_text_snapshot(root, path)
+            external = base / "external"
+            os.link(path, external)
+            with self.assertRaisesRegex(ValueError, "Cannot safely update"):
+                installer.write_regular_text(root, path, "changed", identity=identity)
+            self.assertEqual(external.read_text(), "original")
+
+    def test_read_state_does_not_follow_a_state_file_replaced_after_validation(self):
+        """A replacement symlink cannot change the state read after validation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            state_path = root / installer.STATE
+            state_path.parent.mkdir(parents=True)
+            original = {
+                "schema_version": 1,
+                "options": {"workspace": "original", "environment": "local", "role": "application", "slack": ""},
+                "baselines": {}, "pending": {}, "resolutions": [],
+            }
+            replacement = {**original, "options": {**original["options"], "workspace": "replacement"}}
+            state_path.write_text(json.dumps(original))
+            external = root / "replacement.json"
+            external.write_text(json.dumps(replacement))
+
+            original_lstat = Path.lstat
+
+            def replace_after_validation(path, *args, **kwargs):
+                result = original_lstat(path, *args, **kwargs)
+                if path == state_path:
+                    state_path.unlink()
+                    state_path.symlink_to(external)
+                return result
+
+            with patch.object(Path, "lstat", replace_after_validation):
+                state = installer.read_state(root)
+
+            self.assertEqual(state["options"]["workspace"], "original")
+
+    def test_install_rejects_fifo_state_without_reading_it(self):
+        """A FIFO state file must not block an install before it is rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            state_path = root / installer.STATE
+            state_path.parent.mkdir(parents=True)
+            os.mkfifo(state_path)
+
+            original_read_text = Path.read_text
+
+            def read_text(path, *args, **kwargs):
+                if path == state_path:
+                    raise AssertionError("state FIFO was read")
+                return original_read_text(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", read_text):
+                with self.assertRaisesRegex(ValueError, "non-regular .agent-canvas/state.json"):
+                    installer.install(root)
+
+    def test_optimized_python_rejects_invalid_saved_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            state_path = root / installer.STATE
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(json.dumps({"schema_version": 999}))
+            program = f'''\
+import importlib.util
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("installer", {str(Path(__file__).resolve().parents[1] / "scripts/install.py")!r})
+installer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(installer)
+try:
+    installer.read_state(Path({str(root)!r}))
+except ValueError:
+    pass
+else:
+    raise SystemExit("invalid state was accepted")
+'''
+            run = subprocess.run([sys.executable, "-O", "-c", program], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+
+    def test_upgrade_records_provenance_for_new_managed_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = self.source(base)
+            target = base / "project"
+            installer.install(target, source=source, home=base / "home", apply=True)
+
+            introduced = ".owner-override.example"
+            (target / introduced).unlink()
+            state = installer.read_state(target)
+            state["baselines"].pop(introduced)
+            state["provenance"]["managed_files"].remove(introduced)
+            installer.save_state(target, state)
+
+            installer.upgrade(target, source=source, apply=True)
+
+            self.assertTrue((target / introduced).is_file())
+            self.assertIn(introduced, installer.read_state(target)["provenance"]["managed_files"])
+
     def test_reverted_preview_refreshes_handoff_without_changing_project(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

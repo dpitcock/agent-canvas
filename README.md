@@ -80,6 +80,28 @@ Authentication, secrets, database schema, payments, and user data raise the work
 
 Reviews attach to PR opening, marking ready, or an explicit re-request. They do not fire on every commit or completed task. Marking an unchanged PR ready does not require repeating a valid review. Reviewers work read-only and return a verdict; the developer merges.
 
+## Writing a clear PR
+
+Start with one sentence explaining the outcome in everyday language. Then use a short scope list for the behavior that changed and a verification list for checks that actually ran. A reader should understand the change without reading the commit history or knowing internal task IDs.
+
+```markdown
+The game keeps a usable host when the current host leaves or cannot respond.
+
+## Scope
+- Continue the session when the host voluntarily transfers control.
+- Recommend the player who should start a rematch.
+- Remove an unavailable player who is not the current player.
+
+## Verification
+- Focused engine tests: 186 passed.
+- Focused UI tests: 102 passed.
+- Typecheck and formatting check completed in Docker.
+
+The local pre-commit hook was skipped because it verifies host dependencies. Docker is the project's authoritative verifier.
+```
+
+Use normal Markdown line breaks—never literal `\\n`. Keep bullets concrete, define or omit unexplained jargon, and state limitations plainly. Review summaries and inline comments follow the same rule: say what is wrong, why it matters, and what should change, without ceremonial language.
+
 Before merging in GitHub, the developer checks all CI check runs and commit statuses for the current PR head, including optional checks. Pending, queued, waiting, running, failed, errored, timed-out, or cancelled checks block the merge, as do missing required checks or an incomplete status response. Recheck the SHA and results immediately before merging and bind the merge to that SHA where supported. Review approval and `bypass-review` do not waive CI completion; do not force a merge past CI. These are agent behavior rules. Enforcing the same restriction in GitHub requires branch protection or rulesets with the repository's actual CI checks required.
 
 Every code review skill, including Osmani and Superpowers, adds inline comments for actionable, line-specific findings alongside its overall summary and verdict. Reviewer handoffs include the reviewed commit SHA and request exact diff locations and severity for each finding. Publish those comments with the summary in one `gh_identity_review_as_app` call, anchored to that SHA. Keep broader findings in the summary; clean reviews need no filler comments. Invalid inline anchors must be corrected, not silently omitted. This shared rule lives in `AGENTS.md` so it applies across skill upgrades without editing pinned upstream skills or plugin caches.
@@ -119,6 +141,12 @@ python3 scripts/install.py /path/to/existing-project --apply
 ```
 
 The output labels work as **ADD**, **WOULD ADD**, **REUSE**, **SKIP**, or **DECIDE**. Normal installation with `--apply` adds missing files and ignore entries; it never replaces an existing AGENTS.md, config, version reference, or skill. Missing fields in an existing config are left for the follow-up merge, so project-specific settings remain intact. Differing files are recorded as pending conflicts. CODEOWNERS, other agents, hooks, CI, Git history, and application code are untouched. Replacing package defaults later requires the explicit `--upgrade` mode below.
+
+Managed text updates are prepared and synced in the destination directory before atomic publication, preserving the original when preparation fails. Adapter operations undo completed link changes if a later operation in that batch fails; unused ignore entries may remain. Installation as a whole is not a crash-recoverable transaction: forced termination or a later installation-record failure can still require manual reconciliation. Atomic file replacement does not promise directory-entry durability across power loss.
+
+A published skill pack can also remain without saved provenance if a later adapter, follow-up, or state-save step fails. A retry preserves that pack rather than automatically adopting it. Verify its source and revision and reconcile provenance manually; automatic recovery from this failure window is deferred for local use.
+
+Use installation and upgrades in a trusted local workspace without concurrent directory replacement. Some project reads still validate paths before opening them rather than pinning every ancestor; a same-account process swapping an ancestor can redirect such reads. Protection against malicious host-account control is outside the local-development trust model.
 
 ### Finish the conflicts with your agent
 
@@ -173,13 +201,11 @@ Codex App Server ── events ──> custom renderer ──> HostSupervisor
 
 The project workspace holds normal project files and a non-authoritative installation record. The host directory holds the authority: immutable authorization snapshots, per-project task/action graphs, validator receipts, side-effect leases and reconciliation outcomes, blockers, and an append-only audit log. A project file claiming completion changes none of those records.
 
-The renderer forwards ordinary progress events but buffers `item/agentMessage/delta` content and completed agent-message items. It asks the supervisor whether final content may be released only for a `turn/completed` event whose status is `completed`; failed or interrupted turns retain no candidate final and recover from host state. If host-owned actions remain, the candidate final stays hidden and the supervisor supplies the next action for a continuation. If no independent action remains but an owner decision is missing, it releases only that precise blocker.
+The renderer forwards matching progress events but buffers agent-message content. The host binds each renderer to the thread and turn IDs returned by `turn/start`; unrelated or unidentified events cannot reach its gate. A successful `turn/completed` asks whether final content may be released. If host-owned actions remain, the candidate stays hidden and the supervisor supplies the next action. Each bound renderer is single-use, including after failed turns or gate exceptions; recovery starts a fresh bound renderer.
 
 One host state directory can supervise several sibling projects. Each operation is scoped by project identity, so separate projects may both use `task-1` without sharing evidence, visible messages, or audit events. A task lookup without a project identity is rejected if it would be ambiguous.
 
-Use the exact absolute project path stored in the registration (the installer canonicalizes its target before registration). Host lookups do not re-resolve aliases: registration binds that path to the root directory's device/inode, and replacement or legacy registrations without that identity fail closed pending owner migration. Public provisioning and override import share a project lock.
-
-Each `SupervisedRenderer` requires `thread_id` and `turn_id` obtained by the host from `turn/start`. It ignores unrelated or unidentified events and becomes unusable after completion, failure, or a gate exception. A continuation needs a fresh renderer bound to its new turn.
+Reuse the exact absolute project path stored in the registration. Replacing the root directory or using a legacy registration without its device/inode identity fails closed; host lookups do not dynamically resolve aliases to another registration.
 
 #### Set up a sibling project
 
@@ -202,25 +228,56 @@ python3 scripts/install.py /path/to/sibling-project --upgrade --apply --supervis
 
 Registration creates or reuses the project’s host-owned registration; it does not create a task, grant new agent permissions, start a turn, alter global credentials, or modify the Codex desktop app. The custom client must start each supervised task with the project identity and route every App Server turn through its renderer. It creates the host task with its authorized actions and validator definitions, then renders a final response only after the supervisor returns a release decision.
 
-Required validation currently fails closed: after independent work completes, the host returns `validation_unavailable` and withholds the final response. This POC does not execute project validators or copy their runtime trees under the supervisor account. The [container runner follow-up (#8)](https://github.com/dpitcock/agent-canvas/issues/8) will enable validation only after isolation and bounded-input tests pass.
+Required validation remains fail-closed in this POC: the gate returns `validation_unavailable` and does not launch project validators. The Docker executor merged separately is not yet wired into the supervisor. No validation-backed completion is claimed.
 
-#### Owner escape hatch in supervised projects
-
-During an applied `--supervised` install or upgrade, the installer reads only a regular `.owner-override` at the target project’s root and imports an immutable snapshot into host-owned state. It does not follow symlinks, read parent/sibling/home overrides, or watch the file after installation. Edit the root file and run the same applied supervised upgrade again from the protected host context to import a new snapshot; an agent changing the workspace file alone cannot change host behavior.
-
-The installer pins directory descriptors, verifies the opened root against its host registration, rejects hard-linked override files as shared files, and bounds override input to 64 KiB (including growth during reading).
-
-| Root `.owner-override` mode | Host-supervised behavior |
-| --- | --- |
-| `pause` | Existing active supervised tasks are paused; tasks created while the imported snapshot remains active begin paused. An explicit host resume is required. |
-| `reset` | Existing nonterminal supervised tasks are cancelled, retaining their audit history and implementation work. Start a new host task with a new authorization snapshot. |
-| `bypass-review` | Remains a PR-governance choice only; it never permits a coding agent to release a final message. |
-
-For an emergency release, the host client may use `HostSupervisor.release_withheld_final(task_id, owner=..., reason=..., project=...)`. It releases exactly the host-stored candidate final, records the owner, reason, attempt ID, and digest in the audit log, and consumes that candidate. This is deliberately unavailable from a workspace task file or agent-editable configuration.
+During an applied supervised install or upgrade, the installer may import the target root's regular, unshared `.owner-override` file into a host-owned snapshot. Later workspace edits do not change host authority until another owner-run import. `pause` pauses work, `reset` cancels nonterminal tasks while preserving evidence, and `bypass-review` affects PR governance only. The host-only `release_withheld_final` escape hatch requires an owner and reason and records the authorized release; workspace files cannot invoke it.
 
 The default state path is `~/.agent-canvas-supervisor`, but use `--supervisor-state-dir` for a protected host deployment. The installer rejects a state directory inside or enclosing the project. Uninstalling Agent Canvas intentionally preserves host audit state.
 
 This is not enforcement for sessions opened directly in the existing Codex desktop app: that UI does not currently use the custom renderer. The POC validates the host gate against App Server-shaped events, not a live model turn. See [the supervised-mode design](docs/supervised-mode.md) for the full limitation and upstream capability list.
+
+## Trial another agent framework or start over
+
+Agent Canvas is designed to be removable, so a project can trial another agent framework without rebuilding the application or its plans. Both removal tools show a preview first and make no changes until you add `--apply`.
+
+### Remove only Agent Canvas
+
+Use the official uninstaller when you want to remove this package and leave the rest of the project alone:
+
+```sh
+python3 scripts/uninstall.py /path/to/project
+python3 scripts/uninstall.py /path/to/project --apply
+```
+
+The default `preserve` mode removes the package's own ignore entries and marked follow-up section from regular files with only one hard link. It retains discovery links, managed files, the installation record, and the skill pack, even when unchanged: verification cannot safely bind a later pathname deletion to the verified object. Preview and apply both report these retained paths as `PRESERVE`; use `remove-all` for their cleanup. Project notes and preexisting or modified files remain preserved.
+
+To deliberately remove every known Agent Canvas path, including edits to its managed files, use `remove-all`:
+
+```sh
+python3 scripts/uninstall.py /path/to/project --mode remove-all --apply
+```
+
+`remove-all` deletes the complete Agent Canvas follow-up file as well as managed settings, installed skill links/packs, and the installation record. It still does not touch application code, Git history, or unrelated project files.
+
+Parent directories not explicitly listed for removal are retained even when empty; apply does not silently prune shared `agents/`, `skills/`, or `config/` directories beyond the preview.
+
+Removal uses no-follow directory descriptors to prevent ancestor symlinks from redirecting cleanup outside the project. Recursive cleanup requires Python 3.11+ on a platform with symlink-safe, descriptor-relative `shutil.rmtree`; unsupported operations fail closed rather than falling back to pathname deletion.
+
+Even without readable installation history, `remove-all` removes the three exact fixed ignore entries (`/.owner-override`, `/.agents/skills/addy-*/`, and `/skills/addyosmani-agent-skills/`). It preserves unrelated ignore text and dynamic Cline entries without recorded ownership.
+
+### Clear agent and governance setup: `agent-nuke`
+
+For a clean framework trial, use the broader reset tool:
+
+```sh
+python3 scripts/agent-nuke.py /path/to/project
+python3 scripts/agent-nuke.py /path/to/project --apply
+```
+
+`agent-nuke` clears common repository-level agent, governance, and workflow locations—including agent instruction files, dot-agent configuration directories, and workflow metadata. It preserves project plans, epics, tasks, and specs, including `plans/`, `epics/`, `tasks/`, and `docs/superpowers/specs/`. Plan-like names inside agent-owned directories such as `.agents/skills/writing-plans/` are removed with that setup.
+
+Shared application directories (`agents/`, `skills/`, `rules/`, and `commands/`) are preserved except for the exact Agent Canvas files `agents/review-coordinator.md` and `skills/addyosmani-agent-skills.ref`. The shared `skills/addyosmani-agent-skills/` payload is preserved; reset detaches its dot-agent setup. Use the official uninstaller's `--mode remove-all` for complete Agent Canvas package removal. Review the preview carefully: reset is intentionally broader than the official uninstaller in the agent and workflow locations it clears.
+
 To include Osmani on a machine/project without an existing installation:
 
 ```sh
@@ -492,11 +549,13 @@ If a PR exceeds two review rounds, the same fix is attempted three times, proces
 
 Authorized Slack posts use **Agent Alert**, go to the shared project channel, and start with the actual environment and role: `[codex][Developer]` or `[cline][Staff Engineer]`. If the running environment is unknown, clarify it; do not guess from `agentic_envs`. A step taking over 15 minutes gets a heartbeat and status report; it is not silently abandoned or killed merely for taking time.
 
-Continue through the authorized scope without requesting routine confirmation. Commit each completed task after focused verification, then continue to the next task within that scope. Open a PR when the authorized epic is complete. End the turn only when the authorized scope is complete or progress requires owner guidance, authorization, or resolution of a blocker; continue independent work while blocked work waits. Progress updates do not require a response. Task completion and commits are not stop points within an authorized epic.
+Continue through the authorized scope without requesting routine confirmation. Commit each completed task after focused verification, then continue to the next task within that scope. Open a PR when the authorized epic is complete. A passing test, a commit, or a completed task is progress evidence—not completion of the authorized scope. After each such step, reconcile the canonical task record and immediately begin its next unfinished, authorized task. Do not end a run with a status-only response; progress updates belong in commentary/heartbeats and must be followed by work. If no next task is recorded while scope remains, record one concrete next action before ending. This is an agent behavior rule, not a response-delivery lock: when the host lets an agent emit a final response directly, repository instructions and task-state checks can only audit violations. Genuine prevention requires a host-owned final-submission operation that reads active task state and rejects delivery while work remains. End the turn only when the authorized scope is complete or progress requires owner guidance, authorization, or resolution of a blocker; continue independent work while blocked work waits. Progress updates do not require a response. Task completion and commits are not stop points within an authorized epic.
 
 Use the available Slack plugin or connector, including the ChatGPT Slack connector when working there. If the configured channel is missing, ask the owner before creating it. If Slack access or channel details are missing, put the setup action in `INSTALL-FOLLOWUP.md` and continue working. Slack setup never blocks development.
 
 The Slack connection and `dpitcock-*` reviewer Apps must be configured separately. These files do not deploy either integration. If a needed connection is unavailable, report it honestly in chat and continue independent work. Do not invent a channel, send as someone else, or build a control plane to finish setup.
+
+Reviewers finish a complete pass through their assigned scope before publishing: they inspect the whole relevant diff and context and report every supported finding, rather than stopping at the first blocker. When fixes change the PR head, the affected reviewer re-reviews the fix and surrounding affected scope for remaining or newly introduced issues; it does not only confirm that its original comment was addressed.
 
 ### Finding and using the reviewer tool
 
