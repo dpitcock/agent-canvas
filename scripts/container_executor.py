@@ -431,15 +431,17 @@ class ExecutionRequest:
             raise ConfigurationError("image digest must be a lower-case sha256")
         if not isinstance(self.command, (list, tuple)) or not self.command or not all(isinstance(value, str) and value for value in self.command):
             raise ConfigurationError("command must be a nonempty argument vector")
-        if not isinstance(self.timeout_s, int) or not 0 < self.timeout_s <= 300:
+        if isinstance(self.timeout_s, bool) or not isinstance(self.timeout_s, int) or not 0 < self.timeout_s <= 300:
             raise ConfigurationError("timeout must be between one and 300 seconds")
-        if not isinstance(self.max_output_bytes, int) or not 0 <= self.max_output_bytes <= 1_048_576:
+        if isinstance(self.max_output_bytes, bool) or not isinstance(self.max_output_bytes, int) or not 0 <= self.max_output_bytes <= 1_048_576:
             raise ConfigurationError("output limit must be between zero and one MiB")
-        if not isinstance(self.pids, int) or not 1 <= self.pids <= 256:
+        if isinstance(self.pids, bool) or not isinstance(self.pids, int) or not 1 <= self.pids <= 256:
             raise ConfigurationError("process limit must be between one and 256")
         memory = re.fullmatch(r"([1-9][0-9]*)([mMgG])", self.memory) if isinstance(self.memory, str) else None
         if not memory or not 16 <= int(memory.group(1)) * (1024 if memory.group(2).lower() == "g" else 1) <= 1024:
             raise ConfigurationError("memory limit must be between 16m and 1g")
+        if isinstance(self.cpus, bool):
+            raise ConfigurationError("CPU limit must be numeric, not boolean")
         try:
             cpus = float(self.cpus)
         except (TypeError, ValueError) as error:
